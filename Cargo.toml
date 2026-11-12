@@ -20,7 +20,7 @@ serde_json = "1"
 thiserror = "2"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"
-base64 = "0.22"
+base64 = "0.23"
 chrono = { version = "0.4", features = ["serde"] }
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
