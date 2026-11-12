@@ -21,3 +21,4 @@ tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "macros"] }
+chrono.workspace = true
