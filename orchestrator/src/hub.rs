@@ -59,6 +59,16 @@ impl Default for HubConfig {
     }
 }
 
+/// A random 64-bit nonce.
+///
+/// A timestamp-based nonce collides when two dispatches happen in the same
+/// second, which is exactly what RT-06 caught.
+fn random_nonce() -> u64 {
+    let mut bytes = [0u8; 8];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut bytes);
+    u64::from_le_bytes(bytes)
+}
+
 /// Result of dispatching a prompt to a device.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DispatchResult {
@@ -264,7 +274,7 @@ impl Hub {
             }
         };
 
-        let task_id = TaskId::new(format!("task-{}", Utc::now().timestamp()));
+        let task_id = TaskId::new(format!("task-{}", uuid::Uuid::new_v4().simple()));
 
         // Build the signed tool call. The risk tier is declared by the tool
         // registry on the agent side; here we look it up from the same rules
@@ -281,7 +291,7 @@ impl Hub {
             args,
             risk_tier: risk,
             target_device: device_id.clone(),
-            nonce: Utc::now().timestamp() as u64,
+            nonce: random_nonce(),
         };
 
         // Policy check happens before anything is sent.

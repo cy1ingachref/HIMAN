@@ -63,6 +63,15 @@ impl WsTransport {
         }
     }
 
+    /// Wrap an already-connected stream (used by tests).
+    pub fn from_stream(
+        stream: tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ) -> Self {
+        Self::from_socket(stream)
+    }
+
     /// Send a message. Takes the sink lock only for the duration of the write.
     pub async fn send_message(&self, msg: &WireMessage) -> Result<(), TransportError> {
         let json = serde_json::to_string(msg)?;
