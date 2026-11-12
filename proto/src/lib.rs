@@ -15,11 +15,13 @@
 pub mod device;
 pub mod envelope;
 pub mod error;
+pub mod registry;
 pub mod signing;
 pub mod task;
 
 pub use device::{DeviceClass, DeviceId, DeviceInfo};
 pub use envelope::{Payload, WireMessage, WireMeta};
 pub use error::{ProtoError, ProtoResult};
+pub use registry::KeyRegistry;
 pub use signing::{KeyBundle, SigningKey, VerifyingKey};
 pub use task::{HandoffToken, RiskTier, TaskId, TaskState, ToolCall, ToolName};

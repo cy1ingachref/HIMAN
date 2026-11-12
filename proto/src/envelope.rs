@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::device::{DeviceId, DeviceInfo};
 use crate::error::{ProtoError, ProtoResult};
-use crate::signing::VerifyingKey;
+use crate::signing::{SigningKey, VerifyingKey};
 use crate::task::{HandoffToken, TaskId, TaskState, ToolCall, ToolName};
 
 /// Envelope metadata, present on every message.
@@ -98,19 +98,29 @@ impl WireMessage {
         Ok(out)
     }
 
-    pub fn verify(&self) -> ProtoResult<()> {
-        let vk = VerifyingKey::from_b64(self.meta.from.as_str())
-            .map_err(|_| ProtoError::BadKey("sender key not registered locally".into()))?;
-        let _ = vk; // placeholder; real verify uses the registry in the orchestrator
-                    // NOTE: this method is superseded by `verify_with` which takes a key.
-        Err(ProtoError::BadSignature("use verify_with(key)".into()))
+    /// Sign a message. The sender is taken from `meta.from`, so the caller
+    /// must own that identity's key.
+    pub fn sign(meta: WireMeta, payload: Payload, key: &SigningKey) -> ProtoResult<Self> {
+        let input = Self::signing_input(&meta, &payload)?;
+        let signature = key.sign(&input);
+        Ok(Self {
+            meta,
+            payload,
+            signature,
+        })
     }
 
-    /// Verify against a known key. This is the real entry point; `verify`
-    /// exists only to make the API obvious at the call site.
+    /// Verify against a known key. This is the real entry point.
     pub fn verify_with(&self, key: &VerifyingKey) -> ProtoResult<()> {
         let input = Self::signing_input(&self.meta, &self.payload)?;
         key.verify(&input, &self.signature)
+    }
+
+    /// Reject implausible timestamps. Not a security control on its own —
+    /// the signature already covers `ts` — but it drops replayed messages
+    /// cheaply before they reach the policy engine.
+    pub fn is_stale(&self, now_unix: i64, max_skew_secs: i64) -> bool {
+        (now_unix - self.meta.ts).abs() > max_skew_secs
     }
 }
 
@@ -119,6 +129,7 @@ mod tests {
     use super::*;
     use crate::device::DeviceClass;
     use crate::signing::SigningKey;
+    use crate::task::RiskTier;
 
     fn sample_message() -> (WireMessage, SigningKey) {
         let sk = SigningKey::generate();
@@ -135,20 +146,12 @@ mod tests {
             to: "orchestrator".into(),
         };
         let payload = Payload::Hello(info);
-        let input = WireMessage::signing_input(&meta, &payload).unwrap();
-        let signature = sk.sign(&input);
-        (
-            WireMessage {
-                meta,
-                payload,
-                signature,
-            },
-            sk,
-        )
+        let msg = WireMessage::sign(meta, payload, &sk).unwrap();
+        (msg, sk)
     }
 
     #[test]
-    fn verifies_with_correct_key() {
+    fn sign_then_verify_succeeds() {
         let (msg, sk) = sample_message();
         assert!(msg.verify_with(&sk.verifying_key()).is_ok());
     }
@@ -175,6 +178,21 @@ mod tests {
     }
 
     #[test]
+    fn tampered_sender_fails() {
+        // Spoofing `from` breaks the signature even if the payload is intact.
+        let (mut msg, sk) = sample_message();
+        msg.meta.from = DeviceId::new("phone-1");
+        assert!(msg.verify_with(&sk.verifying_key()).is_err());
+    }
+
+    #[test]
+    fn tampered_signature_fails() {
+        let (mut msg, sk) = sample_message();
+        msg.signature = SigningKey::generate().sign(b"other");
+        assert!(msg.verify_with(&sk.verifying_key()).is_err());
+    }
+
+    #[test]
     fn serialized_roundtrip_preserves_signature() {
         let (msg, sk) = sample_message();
         let json = serde_json::to_string(&msg).unwrap();
@@ -190,5 +208,13 @@ mod tests {
             serde_json::to_vec(&a).unwrap(),
             serde_json::to_vec(&b).unwrap()
         );
+    }
+
+    #[test]
+    fn stale_detection_uses_absolute_skew() {
+        let (msg, _) = sample_message();
+        assert!(msg.is_stale(1_700_000_000 + 601, 600));
+        assert!(msg.is_stale(1_700_000_000 - 601, 600));
+        assert!(!msg.is_stale(1_700_000_000 + 599, 600));
     }
 }
