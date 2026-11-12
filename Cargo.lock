@@ -347,7 +347,6 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "hex",
- "himan-agent-core",
  "himan-proto",
  "serde",
  "serde_json",

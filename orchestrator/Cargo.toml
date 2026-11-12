@@ -10,7 +10,6 @@ authors.workspace = true
 
 [dependencies]
 himan-proto = { path = "../proto" }
-himan-agent-core = { path = "../agent-core" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
