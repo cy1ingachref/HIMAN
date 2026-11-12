@@ -329,7 +329,6 @@ async fn rt03_identity_takeover_is_rejected() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore = "RT-04 pending: orchestrator key pinning not implemented"]
 async fn rt04_fake_orchestrator_is_rejected() {
     use futures_util::{SinkExt, StreamExt};
 
@@ -372,6 +371,9 @@ async fn rt04_fake_orchestrator_is_rejected() {
     });
 
     let key = SigningKey::generate();
+    // Pin a key that is NOT the fake server's key, so the fake Welcome must
+    // be rejected as not pinned.
+    let pinned = SigningKey::generate();
     let (transport, _resp) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
         .await
         .expect("connect");
@@ -379,7 +381,9 @@ async fn rt04_fake_orchestrator_is_rejected() {
         std::sync::Arc::new(himan_agent_core::WsTransport::from_stream(transport)),
         8,
     );
-    let mut client = himan_agent_pc::AgentClient::new(DeviceId::new("pc-1"), key, conn);
+    let mut client = himan_agent_pc::AgentClient::new(DeviceId::new("pc-1"), key, conn)
+        .with_pinned_orchestrator_key(&pinned.verifying_key().to_b64())
+        .expect("pinned key");
     let result = tokio::time::timeout(Duration::from_secs(5), client.register()).await;
 
     server.abort();
@@ -388,7 +392,7 @@ async fn rt04_fake_orchestrator_is_rejected() {
         Ok(Err(e)) => {
             let msg = e.to_string().to_lowercase();
             assert!(
-                msg.contains("pinned") || msg.contains("orchestrator key"),
+                msg.contains("pinned"),
                 "RT-04 expected a pinned-key error, got: {e}"
             );
         }

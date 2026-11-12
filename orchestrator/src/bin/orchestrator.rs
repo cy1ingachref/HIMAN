@@ -9,7 +9,17 @@ async fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(8787);
 
-    let hub = Hub::new(HubConfig::default());
+    // The orchestrator key is persisted so it survives restarts. Agents pin
+    // this public key; regenerating it would invalidate every pinned agent.
+    let orchestrator_key = match himan_orchestrator::load_or_generate_orchestrator_key() {
+        Ok(k) => k,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to load the orchestrator key");
+            std::process::exit(1);
+        }
+    };
+
+    let hub = Hub::with_key(HubConfig::default(), orchestrator_key);
     let hub = match himan_orchestrator::server::load_enrollment(hub) {
         Ok(h) => h,
         Err(e) => {

@@ -13,13 +13,14 @@ async fn main() {
     // Modes:
     //   himan-agent-pc                      local demo loop (no network)
     //   himan-agent-pc --ws <url>           connect to an orchestrator
+    //   himan-agent-pc --ws <url> --orchestrator-key <b64>
     //   himan-agent-pc keygen --out <file>  write a new key, print its public key
     if args.len() >= 2 && args[1] == "keygen" {
         run_keygen(&args);
         return;
     }
     if args.len() >= 3 && args[1] == "--ws" {
-        run_ws(&args[2]).await;
+        run_ws(&args).await;
         return;
     }
 
@@ -80,7 +81,21 @@ fn run_keygen(args: &[String]) {
     }
 }
 
-async fn run_ws(url: &str) {
+async fn run_ws(args: &[String]) {
+    let url = &args[2];
+
+    // The orchestrator's public key, pinned out of band. A Welcome is accepted
+    // only if it is signed by this key. Without pinning, any server can sign
+    // its own Welcome and impersonate the orchestrator.
+    let pinned = std::env::var("HIMAN_ORCH_KEY")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| {
+            args.iter()
+                .position(|a| a == "--orchestrator-key")
+                .and_then(|i| args.get(i + 1).cloned())
+        });
+
     let device = DeviceId::new("pc-1");
     let key = match himan_agent_pc::load_or_generate() {
         Ok(k) => k,
@@ -92,7 +107,7 @@ async fn run_ws(url: &str) {
 
     tracing::info!(%device, url, "connecting to orchestrator");
 
-    let client = match himan_agent_pc::client::connect_ws(device, key, url).await {
+    let mut client = match himan_agent_pc::connect_ws(device, key, url).await {
         Ok(c) => c,
         Err(e) => {
             tracing::error!(error = %e, "connection failed");
@@ -100,7 +115,22 @@ async fn run_ws(url: &str) {
         }
     };
 
-    let mut client = client;
+    if let Some(pinned_b64) = pinned {
+        client = match client.with_pinned_orchestrator_key(&pinned_b64) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(error = %e, "invalid --orchestrator-key");
+                std::process::exit(1);
+            }
+        };
+        tracing::info!("orchestrator key pinned");
+    } else {
+        tracing::warn!(
+            "no orchestrator key pinned: HIMAN_ORCH_KEY or --orchestrator-key not set, \
+             any server can impersonate the orchestrator"
+        );
+    }
+
     match client.register().await {
         Ok(info) => tracing::info!(
             device = %info.id,

@@ -81,7 +81,12 @@ pub struct DispatchResult {
 }
 
 impl Hub {
-    pub fn new(config: HubConfig) -> Arc<Self> {
+    /// Create a hub with the given signing key.
+    ///
+    /// The key is supplied by the caller (normally loaded from
+    /// `HIMAN_ORCH_KEY_FILE`) so it survives restarts and stays consistent
+    /// with the keys agents have pinned.
+    pub fn with_key(config: HubConfig, orchestrator_key: SigningKey) -> Arc<Self> {
         let policy = PolicyEngine::default();
         Arc::new(Self {
             agents: Mutex::new(HashMap::new()),
@@ -90,10 +95,15 @@ impl Hub {
             presence: Mutex::new(PresenceManager::new(PolicyEngine::default())),
             store: Mutex::new(StateStore::new()),
             audit: Mutex::new(AuditLog::new()),
-            orchestrator_key: SigningKey::generate(),
+            orchestrator_key,
             config,
             enrollment: None,
         })
+    }
+
+    /// Create a hub with a freshly generated key.
+    pub fn new(config: HubConfig) -> Arc<Self> {
+        Self::with_key(config, SigningKey::generate())
     }
 
     /// Attach an enrollment file. Devices not listed are rejected.

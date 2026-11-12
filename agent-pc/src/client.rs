@@ -23,6 +23,9 @@ pub enum RegisterError {
     #[error("welcome nonce mismatch: the reply does not belong to this handshake")]
     NonceMismatch,
 
+    #[error("welcome is signed by a different key than the pinned orchestrator key")]
+    NotPinnedKey,
+
     #[error("welcome signature invalid: {0}")]
     BadSignature(String),
 
@@ -39,6 +42,12 @@ pub struct AgentClient {
     key: SigningKey,
     conn: Connection,
     seq: u64,
+    /// The orchestrator's public key, pinned out of band.
+    ///
+    /// A Welcome is accepted only if its embedded key equals this AND the
+    /// signature verifies with it. Without pinning, any server can sign its
+    /// own Welcome and impersonate the orchestrator.
+    pinned_orchestrator_key: Option<VerifyingKey>,
 }
 
 impl AgentClient {
@@ -48,7 +57,19 @@ impl AgentClient {
             key,
             conn,
             seq: 0,
+            pinned_orchestrator_key: None,
         }
+    }
+
+    /// Pin the orchestrator's public key (base64).
+    ///
+    /// Once set, a Welcome from any other key is rejected.
+    pub fn with_pinned_orchestrator_key(
+        mut self,
+        key_b64: &str,
+    ) -> Result<Self, himan_proto::ProtoError> {
+        self.pinned_orchestrator_key = Some(VerifyingKey::from_b64(key_b64)?);
+        Ok(self)
     }
 
     /// Sign and send a message.
@@ -127,9 +148,22 @@ impl AgentClient {
             return Err(RegisterError::NonceMismatch);
         }
 
-        // The Welcome carries the orchestrator's key, and is signed by it. An
-        // attacker who reflects our own Hello cannot produce a valid signature
-        // over a Welcome, so this check alone defeats the reflection attack.
+        // Three checks, each with its own error so the failure is diagnosable:
+        //   1. the embedded key must equal the pinned key
+        //   2. the signature must verify with that key
+        //   3. the nonce must match this handshake
+        if let Some(pinned) = &self.pinned_orchestrator_key {
+            if orchestrator_key != pinned.to_b64() {
+                warn!(
+                    expected = %pinned.to_b64(),
+                    "welcome advertises a key that is not the pinned orchestrator key"
+                );
+                return Err(RegisterError::NotPinnedKey);
+            }
+        }
+
+        // The Welcome is signed by the key it advertises. Verify against the
+        // pinned key when one is set, otherwise against the advertised key.
         let vk = VerifyingKey::from_b64(&orchestrator_key)
             .map_err(|e| RegisterError::BadSignature(e.to_string()))?;
         msg.verify_with(&vk)
