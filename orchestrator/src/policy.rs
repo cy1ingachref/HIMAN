@@ -114,12 +114,7 @@ mod tests {
     use serde_json::json;
 
     fn device(id: &str, class: DeviceClass) -> DeviceInfo {
-        DeviceInfo {
-            id: DeviceId::new(id),
-            class,
-            label: id.to_owned(),
-            verifying_key: "unused".into(),
-        }
+        DeviceInfo::new(DeviceId::new(id), class, id.to_owned(), "unused")
     }
 
     fn call(tool: &str, tier: RiskTier) -> ToolCall {

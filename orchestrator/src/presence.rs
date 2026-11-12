@@ -123,12 +123,7 @@ mod tests {
     use himan_proto::DeviceClass;
 
     fn info(id: &str) -> DeviceInfo {
-        DeviceInfo {
-            id: DeviceId::new(id),
-            class: DeviceClass::Pc,
-            label: id.to_owned(),
-            verifying_key: "unused".into(),
-        }
+        DeviceInfo::new(DeviceId::new(id), DeviceClass::Pc, id.to_owned(), "unused")
     }
 
     fn manager() -> PresenceManager {

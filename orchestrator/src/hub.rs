@@ -402,12 +402,12 @@ mod tests {
     async fn hub_with(device_id: &str) -> (Arc<Hub>, SigningKey) {
         let hub = Hub::new(HubConfig::default());
         let sk = SigningKey::generate();
-        let dev = DeviceInfo {
-            id: DeviceId::new(device_id),
-            class: DeviceClass::Pc,
-            label: device_id.to_owned(),
-            verifying_key: sk.verifying_key().to_b64(),
-        };
+        let dev = DeviceInfo::new(
+            DeviceId::new(device_id),
+            DeviceClass::Pc,
+            device_id.to_owned(),
+            sk.verifying_key().to_b64(),
+        );
         hub.keys
             .lock()
             .await
@@ -432,12 +432,12 @@ mod tests {
     async fn register_accepts_signed_hello() {
         let hub = Hub::new(HubConfig::default());
         let sk = SigningKey::generate();
-        let dev = DeviceInfo {
-            id: DeviceId::new("pc-1"),
-            class: DeviceClass::Pc,
-            label: "PC".into(),
-            verifying_key: sk.verifying_key().to_b64(),
-        };
+        let dev = DeviceInfo::new(
+            DeviceId::new("pc-1"),
+            DeviceClass::Pc,
+            "PC",
+            sk.verifying_key().to_b64(),
+        );
         let hello = WireMessage::sign(
             WireMeta {
                 seq: 1,
@@ -460,12 +460,12 @@ mod tests {
         let hub = Hub::new(HubConfig::default());
         let sk = SigningKey::generate();
         let other = SigningKey::generate();
-        let dev = DeviceInfo {
-            id: DeviceId::new("pc-1"),
-            class: DeviceClass::Pc,
-            label: "PC".into(),
-            verifying_key: other.verifying_key().to_b64(), // claims a different key
-        };
+        let dev = DeviceInfo::new(
+            DeviceId::new("pc-1"),
+            DeviceClass::Pc,
+            "PC",
+            other.verifying_key().to_b64(), // claims a different key
+        );
         let hello = WireMessage::sign(
             WireMeta {
                 seq: 1,

@@ -3,11 +3,10 @@
 //! Thin wrapper over `tokio-tungstenite` with `rustls`. Messages cross as
 //! JSON text frames, one `WireMessage` per frame.
 
-use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-use crate::transport::{Connection, Sender, Shutdown, TransportError};
+use crate::transport::{Connection, Shutdown, TransportError};
 use himan_proto::WireMessage;
 
 /// A WebSocket connection to an orchestrator.
@@ -77,28 +76,12 @@ impl WsTransport {
     }
 }
 
-/// Adapter so `WsTransport` satisfies the `Sender` trait used by
-/// `Connection`.
-pub struct WsSender {
-    inner: std::sync::Arc<WsTransport>,
-}
-
-impl WsSender {
-    pub fn new(inner: std::sync::Arc<WsTransport>) -> Self {
-        Self { inner }
-    }
-}
-
-#[async_trait]
-impl Sender for WsSender {
-    async fn send(&self, msg: WireMessage) -> Result<(), TransportError> {
-        self.inner.send_message(&msg).await
-    }
-}
-
 /// Build a `Connection` around a WebSocket by pumping `next_message` into a
-/// channel. This is the bridge that lets the socket transport reuse the same
-/// agent loop as the in-memory duplex.
+/// channel.
+///
+/// The `Sender` impl must go to the socket, not into the receive channel:
+/// routing outgoing messages through the pump would make an agent read its own
+/// messages back, which is exactly the bug this design avoids.
 pub fn connection_from_socket(
     transport: std::sync::Arc<WsTransport>,
     capacity: usize,
@@ -125,7 +108,7 @@ pub fn connection_from_socket(
         }
     });
 
-    Connection::from_parts(tx, rx, shutdown)
+    Connection::from_socket(transport, rx, shutdown)
 }
 
 #[cfg(test)]

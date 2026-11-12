@@ -60,4 +60,26 @@ pub struct DeviceInfo {
     pub label: String,
     /// Ed25519 verifying key, base64url (no padding), of the device's identity.
     pub verifying_key: String,
+    /// Fresh random nonce, base64. Binds this registration attempt to the
+    /// Welcome that must echo it, so a reflected or replayed Hello cannot be
+    /// mistaken for a successful handshake.
+    pub nonce: String,
+}
+
+impl DeviceInfo {
+    /// Build a DeviceInfo with a fresh nonce.
+    pub fn new(
+        id: DeviceId,
+        class: DeviceClass,
+        label: impl Into<String>,
+        verifying_key: impl Into<String>,
+    ) -> Self {
+        Self {
+            id,
+            class,
+            label: label.into(),
+            verifying_key: verifying_key.into(),
+            nonce: crate::generate_nonce(),
+        }
+    }
 }

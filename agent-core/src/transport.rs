@@ -69,12 +69,18 @@ impl Shutdown {
 /// want to reply) but local reads stop.
 #[derive(Clone, Debug)]
 pub struct Connection {
-    sender: mpsc::Sender<WireMessage>,
+    sender: SenderKind,
     receiver: Arc<Mutex<Receiver>>,
     /// Guards the local read side.
     read_shutdown: Arc<Shutdown>,
     /// Guards the send side; dropped sender marks this stopped.
     send_shutdown: Arc<Shutdown>,
+}
+
+#[derive(Clone, Debug)]
+enum SenderKind {
+    Channel(mpsc::Sender<WireMessage>),
+    Socket(Arc<WsTransport>),
 }
 
 impl Connection {
@@ -85,13 +91,13 @@ impl Connection {
         let (b_tx, a_rx) = mpsc::channel::<WireMessage>(capacity);
 
         let a = Connection {
-            sender: a_tx,
+            sender: SenderKind::Channel(a_tx),
             receiver: Arc::new(Mutex::new(a_rx)),
             read_shutdown: Arc::new(Shutdown::default()),
             send_shutdown: Arc::new(Shutdown::default()),
         };
         let b = Connection {
-            sender: b_tx,
+            sender: SenderKind::Channel(b_tx),
             receiver: Arc::new(Mutex::new(b_rx)),
             read_shutdown: Arc::new(Shutdown::default()),
             send_shutdown: Arc::new(Shutdown::default()),
@@ -107,7 +113,25 @@ impl Connection {
         shutdown: Arc<Shutdown>,
     ) -> Self {
         Self {
-            sender,
+            sender: SenderKind::Channel(sender),
+            receiver: Arc::new(Mutex::new(receiver)),
+            read_shutdown: shutdown.clone(),
+            send_shutdown: shutdown,
+        }
+    }
+
+    /// Wrap a socket-backed sender with a channel receiver.
+    ///
+    /// Outgoing messages go straight to the socket; incoming messages are
+    /// pumped into the receiver by the caller. Mixing the two directions
+    /// through one channel would let a peer read its own messages back.
+    pub fn from_socket(
+        transport: Arc<WsTransport>,
+        receiver: Receiver,
+        shutdown: Arc<Shutdown>,
+    ) -> Self {
+        Self {
+            sender: SenderKind::Socket(transport),
             receiver: Arc::new(Mutex::new(receiver)),
             read_shutdown: shutdown.clone(),
             send_shutdown: shutdown,
@@ -115,10 +139,10 @@ impl Connection {
     }
 
     pub async fn send(&self, msg: WireMessage) -> Result<(), TransportError> {
-        self.sender
-            .send(msg)
-            .await
-            .map_err(|_| TransportError::Closed)
+        match &self.sender {
+            SenderKind::Channel(tx) => tx.send(msg).await.map_err(|_| TransportError::Closed),
+            SenderKind::Socket(transport) => transport.send_message(&msg).await,
+        }
     }
 
     /// Read the next message. Returns `None` when the peer is gone or the
@@ -146,8 +170,11 @@ impl Connection {
         self.send_shutdown.stop().await;
     }
 
-    pub fn sender(&self) -> &mpsc::Sender<WireMessage> {
-        &self.sender
+    pub fn sender(&self) -> Option<&mpsc::Sender<WireMessage>> {
+        match &self.sender {
+            SenderKind::Channel(tx) => Some(tx),
+            SenderKind::Socket(_) => None,
+        }
     }
 }
 

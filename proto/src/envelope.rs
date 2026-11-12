@@ -24,9 +24,15 @@ pub struct WireMeta {
 pub enum Payload {
     /// Agent announces itself and its tools.
     Hello(DeviceInfo),
-    /// Orchestrator acknowledges registration.
+    /// Orchestrator acknowledges registration and echoes the Hello nonce.
+    /// Signed by the orchestrator key so the agent can prove it is talking to
+    /// the real orchestrator and not a reflection of its own traffic.
     Welcome {
         device_id: DeviceId,
+        /// Must equal the nonce from the Hello this replies to.
+        nonce: String,
+        /// The orchestrator's verifying key, so the agent can pin it.
+        orchestrator_key: String,
     },
     /// Agent reports a status change (battery, connectivity, load).
     Status {
@@ -81,6 +87,27 @@ pub struct WireMessage {
     pub signature: String,
 }
 
+impl Payload {
+    /// Stable lowercase name of the variant. Used in logs so a single line can
+    /// show whether a reply was a Welcome or an echo.
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            Payload::Hello(_) => "hello",
+            Payload::Welcome { .. } => "welcome",
+            Payload::Status { .. } => "status",
+            Payload::ToolCall(_) => "tool_call",
+            Payload::ToolResult { .. } => "tool_result",
+            Payload::ApprovalRequest { .. } => "approval_request",
+            Payload::ApprovalResponse { .. } => "approval_response",
+            Payload::Handoff(_) => "handoff",
+            Payload::HandoffAck { .. } => "handoff_ack",
+            Payload::Bye { .. } => "bye",
+            Payload::Ping { .. } => "ping",
+            Payload::Pong { .. } => "pong",
+        }
+    }
+}
+
 impl WireMessage {
     /// Build the canonical byte string that is signed.
     ///
@@ -132,12 +159,12 @@ mod tests {
 
     fn sample_message() -> (WireMessage, SigningKey) {
         let sk = SigningKey::generate();
-        let info = DeviceInfo {
-            id: DeviceId::new("pc-1"),
-            class: DeviceClass::Pc,
-            label: "Ashe's PC".into(),
-            verifying_key: sk.verifying_key().to_b64(),
-        };
+        let info = DeviceInfo::new(
+            DeviceId::new("pc-1"),
+            DeviceClass::Pc,
+            "Ashe's PC",
+            sk.verifying_key().to_b64(),
+        );
         let meta = WireMeta {
             seq: 1,
             ts: 1_700_000_000,

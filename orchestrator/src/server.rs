@@ -164,8 +164,8 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
                 Ok(info) => {
                     info!(device = %info.id, "agent connected over ws");
                     registered = Some(info.id.clone());
-                    // Acknowledge with Welcome.
-                    let welcome = match build_welcome(&state.hub, &info.id) {
+                    // Acknowledge with Welcome, echoing the Hello nonce.
+                    let welcome = match build_welcome(&state.hub, &info.id, &info.nonce) {
                         Ok(w) => w,
                         Err(e) => {
                             warn!(error = %e, "failed to build welcome");
@@ -207,11 +207,16 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
 }
 
 /// Build a Welcome message signed by the orchestrator's key.
-fn build_welcome(hub: &Hub, device: &DeviceId) -> Result<WireMessage, ProtoError> {
+///
+/// The nonce is echoed from the Hello so the agent can prove the Welcome
+/// belongs to this registration attempt, not a replay.
+fn build_welcome(hub: &Hub, device: &DeviceId, nonce: &str) -> Result<WireMessage, ProtoError> {
     hub.build_message(
         device.clone(),
         Payload::Welcome {
             device_id: device.clone(),
+            nonce: nonce.to_owned(),
+            orchestrator_key: hub.orchestrator_key_b64(),
         },
     )
 }
@@ -239,7 +244,7 @@ mod tests {
     async fn welcome_is_signed_by_the_hub() {
         let hub = Hub::new(HubConfig::default());
         let device = DeviceId::new("pc-1");
-        let msg = build_welcome(&hub, &device).unwrap();
+        let msg = build_welcome(&hub, &device, "test-nonce").unwrap();
         // Verify with the key the hub advertises, proving the signature is
         // from the same identity agents are told to trust.
         let key = himan_proto::VerifyingKey::from_b64(&hub.orchestrator_key_b64()).unwrap();

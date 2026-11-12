@@ -7,10 +7,31 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use himan_agent_core::transport::Connection;
-use himan_proto::{DeviceId, DeviceInfo, Payload, SigningKey, TaskState, WireMessage, WireMeta};
+use himan_proto::{
+    DeviceId, DeviceInfo, Payload, SigningKey, TaskState, VerifyingKey, WireMessage, WireMeta,
+};
 use tracing::{info, warn};
 
 use crate::tools::registry;
+
+/// Why a registration attempt failed.
+#[derive(Debug, thiserror::Error)]
+pub enum RegisterError {
+    #[error("unexpected reply: got {0}, expected Welcome")]
+    UnexpectedReply(&'static str),
+
+    #[error("welcome nonce mismatch: the reply does not belong to this handshake")]
+    NonceMismatch,
+
+    #[error("welcome signature invalid: {0}")]
+    BadSignature(String),
+
+    #[error("connection closed before Welcome arrived")]
+    Closed,
+
+    #[error("transport error: {0}")]
+    Transport(String),
+}
 
 /// A running agent session.
 pub struct AgentClient {
@@ -46,28 +67,71 @@ impl AgentClient {
             .map_err(|_| himan_proto::ProtoError::Policy("connection closed".into()))
     }
 
-    /// Send Hello and wait for Welcome.
-    pub async fn register(&mut self) -> Result<DeviceInfo, himan_proto::ProtoError> {
-        let info = DeviceInfo {
-            id: self.device_id.clone(),
-            class: himan_proto::DeviceClass::Pc,
-            label: "PC agent".into(),
-            verifying_key: self.key.verifying_key().to_b64(),
-        };
-        self.send(Payload::Hello(info.clone())).await?;
+    /// Send Hello and wait for a Welcome that is bound to this attempt.
+    ///
+    /// Four checks, in order:
+    ///   1. a message arrived at all (connection not closed)
+    ///   2. it is a `Welcome`, not an echo of our own Hello
+    ///   3. its nonce matches the one in our Hello
+    ///   4. its signature verifies against the orchestrator key it advertises
+    ///
+    /// Before this existed, any reply counted as success, so a transport that
+    /// echoed outgoing messages back made registration look complete while the
+    /// orchestrator never saw the agent.
+    pub async fn register(&mut self) -> Result<DeviceInfo, RegisterError> {
+        let info = DeviceInfo::new(
+            self.device_id.clone(),
+            himan_proto::DeviceClass::Pc,
+            "PC agent",
+            self.key.verifying_key().to_b64(),
+        );
+        let nonce = info.nonce.clone();
+        self.send(Payload::Hello(info.clone()))
+            .await
+            .map_err(|e| RegisterError::Transport(e.to_string()))?;
 
-        match self.conn.recv().await {
-            Some(msg) => {
-                // The Welcome must be signed by the orchestrator. Phase 1 the
-                // agent cannot know the orchestrator key in advance, so this
-                // is recorded and checked once the hub advertises it.
-                info!(kind = ?msg.payload, "received reply after Hello");
-                Ok(info)
+        let msg = match self.conn.recv().await {
+            Some(m) => m,
+            None => return Err(RegisterError::Closed),
+        };
+
+        let (device_id, reply_nonce, orchestrator_key) = match &msg.payload {
+            Payload::Welcome {
+                device_id,
+                nonce,
+                orchestrator_key,
+            } => (device_id.clone(), nonce.clone(), orchestrator_key.clone()),
+            other => {
+                let kind = other.kind_name();
+                warn!(got = kind, "registration failed: expected Welcome");
+                return Err(RegisterError::UnexpectedReply(kind));
             }
-            None => Err(himan_proto::ProtoError::Policy(
-                "connection closed before Welcome".into(),
-            )),
+        };
+
+        if device_id != self.device_id {
+            warn!(%device_id, "welcome is for a different device");
+            return Err(RegisterError::UnexpectedReply("welcome-for-other-device"));
         }
+
+        if reply_nonce != nonce {
+            warn!("welcome nonce mismatch: reply does not belong to this handshake");
+            return Err(RegisterError::NonceMismatch);
+        }
+
+        // The Welcome carries the orchestrator's key, and is signed by it. An
+        // attacker who reflects our own Hello cannot produce a valid signature
+        // over a Welcome, so this check alone defeats the reflection attack.
+        let vk = VerifyingKey::from_b64(&orchestrator_key)
+            .map_err(|e| RegisterError::BadSignature(e.to_string()))?;
+        msg.verify_with(&vk)
+            .map_err(|e| RegisterError::BadSignature(e.to_string()))?;
+
+        info!(
+            %device_id,
+            orchestrator_key = %orchestrator_key,
+            "registered with orchestrator"
+        );
+        Ok(info)
     }
 
     /// Run the receive loop until the connection closes.
@@ -209,7 +273,14 @@ mod tests {
             other => panic!("expected Hello, got {other:?}"),
         }
 
-        // Reply Welcome so register() completes.
+        // Reply Welcome, echoing the Hello nonce and signed by the
+        // orchestrator key it advertises.
+        let hello_nonce = match &hello.payload {
+            Payload::Hello(info) => info.nonce.clone(),
+            other => panic!("expected Hello, got {other:?}"),
+        };
+        let orch_key = SigningKey::generate();
+        let orch_vk = orch_key.verifying_key().to_b64();
         let welcome = WireMessage::sign(
             WireMeta {
                 seq: 1,
@@ -219,8 +290,10 @@ mod tests {
             },
             Payload::Welcome {
                 device_id: DeviceId::new("pc-1"),
+                nonce: hello_nonce,
+                orchestrator_key: orch_vk,
             },
-            &SigningKey::generate(),
+            &orch_key,
         )
         .unwrap();
         peer.send(welcome).await.unwrap();
@@ -240,6 +313,139 @@ mod tests {
         let mut client = AgentClient::new(DeviceId::new("pc-1"), key, a);
         drop(b);
         assert!(client.register().await.is_err());
+    }
+
+    /// A transport that loops every outbound message back as inbound.
+    ///
+    /// This is the exact failure mode that produced the original bug: a
+    /// single channel carrying both directions, so the agent read its own
+    /// Hello and reported success. With strict registration this must fail
+    /// loudly instead.
+    #[tokio::test]
+    async fn reflection_echo_is_rejected() {
+        let (loop_tx, mut loop_rx) = tokio::sync::mpsc::channel::<WireMessage>(8);
+        let (in_tx, in_rx) = tokio::sync::mpsc::channel::<WireMessage>(8);
+
+        // Echo task: whatever the agent sends comes straight back to it.
+        tokio::spawn(async move {
+            while let Some(msg) = loop_rx.recv().await {
+                if in_tx.send(msg).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let mut client = AgentClient::new(
+            DeviceId::new("pc-1"),
+            SigningKey::generate(),
+            Connection::from_parts(
+                loop_tx,
+                in_rx,
+                std::sync::Arc::new(himan_agent_core::transport::Shutdown::default()),
+            ),
+        );
+
+        let result = client.register().await;
+        match result {
+            Err(RegisterError::UnexpectedReply(kind)) => {
+                assert_eq!(
+                    kind, "hello",
+                    "the echo of a Hello must be reported as hello"
+                );
+            }
+            other => panic!("expected UnexpectedReply(hello), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn welcome_with_wrong_nonce_is_rejected() {
+        let (a, peer) = Connection::channel(8);
+        let key = SigningKey::generate();
+        let mut client = AgentClient::new(DeviceId::new("pc-1"), key, a);
+
+        let handle = tokio::spawn(async move { client.register().await });
+
+        // Drain the Hello so the peer knows the client started.
+        let _hello = tokio::time::timeout(std::time::Duration::from_secs(2), peer.recv())
+            .await
+            .expect("hello should arrive")
+            .expect("some message");
+
+        // A Welcome with a nonce that does not match the Hello.
+        let orch_key = SigningKey::generate();
+        let welcome = WireMessage::sign(
+            WireMeta {
+                seq: 1,
+                ts: Utc::now().timestamp(),
+                from: DeviceId::new("orchestrator"),
+                to: "pc-1".into(),
+            },
+            Payload::Welcome {
+                device_id: DeviceId::new("pc-1"),
+                nonce: "not-the-hello-nonce".into(),
+                orchestrator_key: orch_key.verifying_key().to_b64(),
+            },
+            &orch_key,
+        )
+        .unwrap();
+        peer.send(welcome).await.unwrap();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("register should finish")
+            .expect("task should not panic");
+        match result {
+            Err(RegisterError::NonceMismatch) => {}
+            other => panic!("expected NonceMismatch, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn welcome_with_a_foreign_signature_is_rejected() {
+        let (a, peer) = Connection::channel(8);
+        let key = SigningKey::generate();
+        let mut client = AgentClient::new(DeviceId::new("pc-1"), key, a);
+
+        let handle = tokio::spawn(async move { client.register().await });
+
+        let hello = tokio::time::timeout(std::time::Duration::from_secs(2), peer.recv())
+            .await
+            .expect("hello should arrive")
+            .expect("some message");
+        let hello_nonce = match &hello.payload {
+            Payload::Hello(info) => info.nonce.clone(),
+            other => panic!("expected Hello, got {other:?}"),
+        };
+
+        // The Welcome claims one orchestrator key but is signed by another, so
+        // verification against the advertised key must fail.
+        let claimed_key = SigningKey::generate();
+        let signer = SigningKey::generate();
+        let welcome = WireMessage::sign(
+            WireMeta {
+                seq: 1,
+                ts: Utc::now().timestamp(),
+                from: DeviceId::new("orchestrator"),
+                to: "pc-1".into(),
+            },
+            Payload::Welcome {
+                device_id: DeviceId::new("pc-1"),
+                nonce: hello_nonce,
+                orchestrator_key: claimed_key.verifying_key().to_b64(),
+            },
+            &signer,
+        )
+        .unwrap();
+        peer.send(welcome).await.unwrap();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("register should finish")
+            .expect("task should not panic");
+        match result {
+            Err(RegisterError::BadSignature(_)) => {}
+            other => panic!("expected BadSignature, got {other:?}"),
+        }
     }
 
     #[tokio::test]

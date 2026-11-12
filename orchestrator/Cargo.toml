@@ -8,6 +8,10 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[[bin]]
+name = "himan-orchestrator"
+path = "src/bin/orchestrator.rs"
+
 [dependencies]
 himan-proto = { path = "../proto" }
 himan-agent-core = { path = "../agent-core" }
