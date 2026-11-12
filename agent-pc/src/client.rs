@@ -36,6 +36,41 @@ pub enum RegisterError {
     Transport(String),
 }
 
+/// A bounded cache of recently seen tool-call nonces.
+///
+/// The agent must not execute the same tool call twice. A `HashSet` alone grows
+/// without bound, so entries are dropped once the cache exceeds `capacity`.
+#[derive(Debug, Default)]
+pub struct NonceCache {
+    seen: std::collections::HashSet<u64>,
+    capacity: usize,
+}
+
+impl NonceCache {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            seen: std::collections::HashSet::new(),
+            capacity: capacity.max(1),
+        }
+    }
+
+    /// Record a nonce. Returns `false` if it was already present.
+    pub fn insert(&mut self, nonce: u64) -> bool {
+        if self.seen.contains(&nonce) {
+            return false;
+        }
+        if self.seen.len() >= self.capacity {
+            // Bounded eviction: clear rather than track insertion order. This
+            // is a replay guard, not a cache; a cleared entry can only allow a
+            // replay after many intervening calls, which the orchestrator's
+            // seq tracker also blocks.
+            self.seen.clear();
+        }
+        self.seen.insert(nonce);
+        true
+    }
+}
+
 /// A running agent session.
 pub struct AgentClient {
     device_id: DeviceId,
@@ -48,6 +83,8 @@ pub struct AgentClient {
     /// signature verifies with it. Without pinning, any server can sign its
     /// own Welcome and impersonate the orchestrator.
     pinned_orchestrator_key: Option<VerifyingKey>,
+    /// Tool calls already executed, so a replayed call is not run twice.
+    seen_nonces: std::sync::Mutex<NonceCache>,
 }
 
 impl AgentClient {
@@ -58,6 +95,7 @@ impl AgentClient {
             conn,
             seq: 0,
             pinned_orchestrator_key: None,
+            seen_nonces: std::sync::Mutex::new(NonceCache::new(1024)),
         }
     }
 
@@ -179,9 +217,13 @@ impl AgentClient {
 
     /// Run the receive loop until the connection closes.
     ///
-    /// Incoming `ToolCall`s are verified (the payload is self-describing; the
-    /// signature is checked by the hub), then executed against the local tool
-    /// registry. Results are sent back as signed `ToolResult`s.
+    /// Incoming `ToolCall`s are checked before anything runs:
+    ///   1. the call targets this device
+    ///   2. the nonce has not been seen before (replay guard)
+    ///   3. the envelope timestamp is recent
+    ///
+    /// Then the tool whitelist is applied. Results are sent back as signed
+    /// `ToolResult`s.
     pub async fn run(&mut self) {
         let tools = registry();
         loop {
@@ -193,68 +235,118 @@ impl AgentClient {
                 }
             };
 
-            match msg.payload {
-                Payload::ToolCall(call) => {
-                    info!(tool = %call.tool, task = %call.task_id, "tool call received");
-
-                    // The whitelist is the security boundary: a call for a
-                    // tool this device does not expose is refused, not run.
-                    let result = match tools.resolve(&call.tool) {
-                        Ok(tool) => match tool.run(&self.device_id, call.args).await {
-                            Ok(output) => output,
-                            Err(e) => {
-                                if self
-                                    .send(Payload::ToolResult {
-                                        task_id: call.task_id,
-                                        state: TaskState::Failed,
-                                        output: e.to_string(),
-                                    })
-                                    .await
-                                    .is_err()
-                                {
-                                    break;
-                                }
-                                continue;
-                            }
-                        },
-                        Err(e) => {
-                            let _ = self
-                                .send(Payload::ToolResult {
-                                    task_id: call.task_id,
-                                    state: TaskState::Failed,
-                                    output: e.to_string(),
-                                })
-                                .await;
-                            continue;
-                        }
-                    };
-
-                    let state = if result.ok {
-                        TaskState::Succeeded
-                    } else {
-                        TaskState::Failed
-                    };
-                    if let Err(e) = self
-                        .send(Payload::ToolResult {
-                            task_id: call.task_id,
-                            state,
-                            output: result.summary,
-                        })
-                        .await
-                    {
-                        warn!(error = %e, "failed to send tool result");
-                        break;
-                    }
-                }
+            let call = match &msg.payload {
+                Payload::ToolCall(call) => call.clone(),
                 Payload::Ping { nonce } => {
-                    if let Err(e) = self.send(Payload::Pong { nonce }).await {
+                    if let Err(e) = self.send(Payload::Pong { nonce: *nonce }).await {
                         warn!(error = %e, "failed to send pong");
                         break;
                     }
+                    continue;
                 }
                 other => {
                     warn!(?other, "unexpected payload from orchestrator");
+                    continue;
                 }
+            };
+
+            info!(tool = %call.tool, task = %call.task_id, "tool call received");
+
+            // 1. Target device check.
+            if call.target_device != self.device_id {
+                warn!(
+                    expected = %self.device_id,
+                    got = %call.target_device,
+                    "tool call targets a different device"
+                );
+                let _ = self
+                    .send(Payload::ToolResult {
+                        task_id: call.task_id,
+                        state: TaskState::Failed,
+                        output: "tool call targets a different device".into(),
+                    })
+                    .await;
+                continue;
+            }
+
+            // 2. Replay guard: the nonce must not have been seen before.
+            let fresh = self
+                .seen_nonces
+                .lock()
+                .map(|mut cache| cache.insert(call.nonce))
+                .unwrap_or(false);
+            if !fresh {
+                warn!(nonce = call.nonce, "replayed tool call rejected");
+                let _ = self
+                    .send(Payload::ToolResult {
+                        task_id: call.task_id,
+                        state: TaskState::Failed,
+                        output: "tool call nonce already seen".into(),
+                    })
+                    .await;
+                continue;
+            }
+
+            // 3. Freshness: reject stale envelopes.
+            if msg.is_stale(chrono::Utc::now().timestamp(), 120) {
+                warn!(task = %call.task_id, "tool call timestamp is stale");
+                let _ = self
+                    .send(Payload::ToolResult {
+                        task_id: call.task_id,
+                        state: TaskState::Failed,
+                        output: "tool call is stale".into(),
+                    })
+                    .await;
+                continue;
+            }
+
+            // The whitelist is the security boundary: a call for a tool this
+            // device does not expose is refused, not run.
+            let result = match tools.resolve(&call.tool) {
+                Ok(tool) => match tool.run(&self.device_id, call.args).await {
+                    Ok(output) => output,
+                    Err(e) => {
+                        if self
+                            .send(Payload::ToolResult {
+                                task_id: call.task_id,
+                                state: TaskState::Failed,
+                                output: e.to_string(),
+                            })
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        continue;
+                    }
+                },
+                Err(e) => {
+                    let _ = self
+                        .send(Payload::ToolResult {
+                            task_id: call.task_id,
+                            state: TaskState::Failed,
+                            output: e.to_string(),
+                        })
+                        .await;
+                    continue;
+                }
+            };
+
+            let state = if result.ok {
+                TaskState::Succeeded
+            } else {
+                TaskState::Failed
+            };
+            if let Err(e) = self
+                .send(Payload::ToolResult {
+                    task_id: call.task_id,
+                    state,
+                    output: result.summary,
+                })
+                .await
+            {
+                warn!(error = %e, "failed to send tool result");
+                break;
             }
         }
     }

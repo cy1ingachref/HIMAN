@@ -68,11 +68,11 @@ impl RawClient {
         }
     }
 
-    /// Send a signed message with the given payload.
-    async fn send(&mut self, payload: Payload) {
+    /// Send a signed message with a specific seq.
+    async fn send_seq(&mut self, seq: u64, payload: Payload) {
         use futures_util::SinkExt;
         let meta = WireMeta {
-            seq: 1,
+            seq,
             ts: chrono::Utc::now().timestamp(),
             from: self.device_id.clone(),
             to: "orchestrator".into(),
@@ -84,6 +84,11 @@ impl RawClient {
             ))
             .await
             .expect("send");
+    }
+
+    /// Send a signed message with the given payload.
+    async fn send(&mut self, payload: Payload) {
+        self.send_seq(1, payload).await;
     }
 
     /// The public key this client registers with.
@@ -411,8 +416,13 @@ async fn rt04_fake_orchestrator_is_rejected() {
 // Status: PENDING. The hub accepts any signed ToolResult regardless of seq.
 // ---------------------------------------------------------------------------
 
+/// A replayed ToolResult must be rejected.
+///
+/// The first message is accepted. Re-sending the same message (same seq)
+/// must be rejected because seq is not newer than the last accepted seq.
+/// A message with a newer seq is accepted, which proves the rule is
+/// ordering and not "reject everything after the first".
 #[tokio::test]
-#[ignore = "RT-05 pending: sequence tracking not implemented"]
 async fn rt05_tool_result_replay_is_rejected() {
     let (hub, port) = spawn_hub().await;
 
@@ -430,7 +440,7 @@ async fn rt05_tool_result_replay_is_rejected() {
         output: "first delivery".into(),
     };
 
-    // First delivery is accepted.
+    // First delivery is accepted (seq 1).
     agent.send(result.clone()).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(
@@ -446,11 +456,30 @@ async fn rt05_tool_result_replay_is_rejected() {
     let events = hub.audit_events().await;
     let rejections = events
         .iter()
-        .filter(|e| e.action == "message_rejected" || e.detail.contains("replay"))
+        .filter(|e| e.action == "message_rejected")
         .count();
     assert!(
         rejections > 0,
         "RT-05 FAILED: a replayed ToolResult was accepted without rejection"
+    );
+
+    // A newer seq is still accepted, so the rule is ordering not a blanket
+    // rejection.
+    agent
+        .send_seq(
+            2,
+            Payload::ToolResult {
+                task_id: task_id.clone(),
+                state: TaskState::Failed,
+                output: "second delivery".into(),
+            },
+        )
+        .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        hub.task(&task_id).await,
+        Some(TaskState::Failed),
+        "RT-05: a newer seq must be accepted"
     );
 }
 

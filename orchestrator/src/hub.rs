@@ -42,6 +42,12 @@ pub struct Hub {
     orchestrator_key: SigningKey,
     config: HubConfig,
     enrollment: Option<EnrollmentFile>,
+    /// Last accepted seq per device session.
+    ///
+    /// A replayed message has a seq the hub has already seen, so this is what
+    /// makes replay detectable. Reset on each new registration because the
+    /// agent's seq counter restarts on reconnect.
+    last_seq: Mutex<HashMap<DeviceId, u64>>,
 }
 
 #[derive(Debug, Clone)]
@@ -55,7 +61,7 @@ pub struct HubConfig {
 impl Default for HubConfig {
     fn default() -> Self {
         Self {
-            max_skew_secs: 600,
+            max_skew_secs: 120,
             agent_queue: 64,
         }
     }
@@ -98,6 +104,7 @@ impl Hub {
             orchestrator_key,
             config,
             enrollment: None,
+            last_seq: Mutex::new(HashMap::new()),
         })
     }
 
@@ -196,6 +203,13 @@ impl Hub {
         let mut presence = self.presence.lock().await;
         presence.register(info.clone());
 
+        // The agent's seq counter restarts on reconnect, so the replay
+        // tracker must restart with it.
+        {
+            let mut last = self.last_seq.lock().await;
+            last.insert(info.id.clone(), 0);
+        }
+
         let mut audit = self.audit.lock().await;
         audit.append(
             "agent_registered".into(),
@@ -219,11 +233,24 @@ impl Hub {
         }
     }
 
+    /// Record a replay rejection. Never includes message contents.
+    fn audit_replay(&self, device: &DeviceId, reason: &str) {
+        let audit = self.audit.try_lock();
+        if let Ok(mut log) = audit {
+            log.append(
+                "message_rejected".into(),
+                device.to_string(),
+                reason.to_owned(),
+            );
+        }
+    }
+
     /// Verify and handle an incoming agent message.
     pub async fn handle_message(&self, msg: WireMessage) -> ProtoResult<Option<WireMessage>> {
         // Reject stale messages cheaply before signature work.
         if msg.is_stale(Utc::now().timestamp(), self.config.max_skew_secs) {
             warn!(from = %msg.meta.from, "stale message rejected");
+            self.audit_replay(&msg.meta.from, "stale timestamp");
             return Err(ProtoError::Policy("message timestamp out of range".into()));
         }
 
@@ -232,6 +259,24 @@ impl Hub {
         drop(keys);
 
         msg.verify_with(&key)?;
+
+        // Replay detection: seq must be strictly greater than the last
+        // accepted seq for this device. A replayed message has the same seq as
+        // the original, so this rejects it.
+        {
+            let mut last = self.last_seq.lock().await;
+            let previous = last.get(&msg.meta.from).copied().unwrap_or(0);
+            if msg.meta.seq <= previous {
+                drop(last);
+                self.audit_replay(&msg.meta.from, "seq <= last accepted seq");
+                warn!(from = %msg.meta.from, seq = msg.meta.seq, previous, "replayed message rejected");
+                return Err(ProtoError::Policy(format!(
+                    "message seq {} is not newer than last accepted seq {}",
+                    msg.meta.seq, previous
+                )));
+            }
+            last.insert(msg.meta.from.clone(), msg.meta.seq);
+        }
 
         match &msg.payload {
             Payload::ToolResult {
