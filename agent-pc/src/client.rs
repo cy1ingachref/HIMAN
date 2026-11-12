@@ -95,6 +95,15 @@ impl AgentClient {
             None => return Err(RegisterError::Closed),
         };
 
+        // Log what arrived, including the kind, so a single line distinguishes
+        // a genuine Welcome from an echo of our own Hello.
+        info!(
+            kind = msg.payload.kind_name(),
+            peer = %msg.meta.from,
+            seq = msg.meta.seq,
+            "received reply after Hello"
+        );
+
         let (device_id, reply_nonce, orchestrator_key) = match &msg.payload {
             Payload::Welcome {
                 device_id,

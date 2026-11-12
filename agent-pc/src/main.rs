@@ -6,7 +6,7 @@ use himan_proto::{DeviceId, SigningKey, TaskId};
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt::init();
+    himan_agent_core::init_logging();
 
     let args: Vec<String> = std::env::args().collect();
 
@@ -53,28 +53,33 @@ async fn main() {
 async fn run_ws(url: &str) {
     let device = DeviceId::new("pc-1");
     // Phase 1: the agent generates a fresh key per run and registers it via
-    // Hello. Phase 3 will restore the key from the Windows keystore/TPM.
+    // Hello. Phase 3 will restore the key from HIMAN_AGENT_KEY_FILE.
     let key = SigningKey::generate();
 
-    println!("connecting to {url} as {device}");
+    tracing::info!(%device, url, "connecting to orchestrator");
+
     let client = match himan_agent_pc::client::connect_ws(device, key, url).await {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("connection failed: {e}");
+            tracing::error!(error = %e, "connection failed");
             std::process::exit(1);
         }
     };
 
     let mut client = client;
     match client.register().await {
-        Ok(info) => println!("registered: {} ({})", info.id, info.class.as_str()),
+        Ok(info) => tracing::info!(
+            device = %info.id,
+            class = info.class.as_str(),
+            "agent registered with orchestrator"
+        ),
         Err(e) => {
-            eprintln!("registration failed: {e}");
+            tracing::error!(error = %e, "registration failed");
             std::process::exit(1);
         }
     }
 
-    println!("agent running, waiting for tool calls");
+    tracing::info!("agent running, waiting for tool calls");
     client.run().await;
-    println!("agent stopped");
+    tracing::info!("agent stopped");
 }

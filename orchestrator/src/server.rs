@@ -162,7 +162,12 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
         if registered.is_none() {
             match state.hub.register(msg, tx.clone()).await {
                 Ok(info) => {
-                    info!(device = %info.id, "agent connected over ws");
+                    info!(
+                        device = %info.id,
+                        class = info.class.as_str(),
+                        nonce = %info.nonce,
+                        "agent connected over ws"
+                    );
                     registered = Some(info.id.clone());
                     // Acknowledge with Welcome, echoing the Hello nonce.
                     let welcome = match build_welcome(&state.hub, &info.id, &info.nonce) {

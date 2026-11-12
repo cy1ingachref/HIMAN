@@ -2,7 +2,7 @@ use himan_orchestrator::{serve, Hub, HubConfig};
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt::init();
+    himan_orchestrator::init_logging();
 
     let port: u16 = std::env::var("HIMAN_PORT")
         .ok()

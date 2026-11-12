@@ -7,11 +7,14 @@
 //!   network, no API key, no Ollama. Swap in a real backend later.
 //! - [`transport`]: the `Connection` abstraction plus an in-memory duplex for
 //!   tests and a real WebSocket transport for production.
+//! - [`logging`]: tracing setup shared by the binaries.
 
 pub mod llm;
+pub mod logging;
 pub mod tool;
 pub mod transport;
 
 pub use llm::{ChatBackend, ChatMessage, ChatRequest, ChatResponse, ScriptedBackend};
+pub use logging::init as init_logging;
 pub use tool::{Tool, ToolError, ToolOutput, ToolRegistry};
 pub use transport::{Connection, TransportError, WsTransport};

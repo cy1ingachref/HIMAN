@@ -16,3 +16,5 @@ pub use policy::{Decision, PolicyConfig, PolicyEngine};
 pub use presence::{PresenceManager, PresenceSnapshot};
 pub use server::{router, serve, AppState};
 pub use state::{StateStore, TaskRecord};
+
+pub use himan_agent_core::init_logging;
