@@ -15,9 +15,6 @@ pub enum ProtoError {
     #[error("invalid base64: {0}")]
     Base64(#[from] base64::DecodeError),
 
-    #[error("invalid hex: {0}")]
-    Hex(#[from] hex::FromHexError),
-
     #[error("message rejected by policy: {0}")]
     Policy(String),
 

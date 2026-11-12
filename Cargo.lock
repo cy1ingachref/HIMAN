@@ -318,7 +318,6 @@ name = "himan-agent-core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "chrono",
  "himan-proto",
  "serde",
  "serde_json",
@@ -332,7 +331,6 @@ name = "himan-agent-pc"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "chrono",
  "himan-agent-core",
  "himan-proto",
  "serde",
@@ -363,13 +361,10 @@ name = "himan-proto"
 version = "0.1.0"
 dependencies = [
  "base64",
- "chrono",
  "ed25519-dalek",
- "hex",
  "rand",
  "serde",
  "serde_json",
- "sha2",
  "thiserror",
  "tokio",
 ]
