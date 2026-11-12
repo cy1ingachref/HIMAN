@@ -1,0 +1,16 @@
+# Build
+target/
+**/target/
+
+# IDE
+.vscode/
+.idea/
+
+# Local env / secrets
+.env
+*.keystore
+
+# Kotlin / Gradle
+.gradle/
+local.properties
+app/android/build/

@@ -1,0 +1,39 @@
+# Dependencies
+/target
+**/*.rs.bk
+
+# Rust build artifacts in app/android
+app/android/**/build/
+app/android/**/.cxx/
+
+# Node / Tauri
+node_modules/
+dist/
+.tauri/
+
+# Kotlin / Gradle
+.gradle/
+local.properties
+
+# Environment and secrets — never commit
+.env
+.env.local
+*.keystore
+*.jks
+*.pem
+*.key
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs and local state
+*.log
+himan.db
+himan.db-shm
+himan.db-wal
