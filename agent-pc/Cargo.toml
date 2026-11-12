@@ -19,6 +19,7 @@ async-trait = "0.1"
 serde.workspace = true
 serde_json.workspace = true
 sysinfo = "0.32"
+chrono.workspace = true
 tokio = { workspace = true, features = ["full"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true

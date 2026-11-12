@@ -440,6 +440,7 @@ name = "himan-agent-pc"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "chrono",
  "himan-agent-core",
  "himan-proto",
  "serde",
