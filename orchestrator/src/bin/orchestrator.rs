@@ -10,12 +10,21 @@ async fn main() {
         .unwrap_or(8787);
 
     let hub = Hub::new(HubConfig::default());
+    let hub = match himan_orchestrator::server::load_enrollment(hub) {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to load device enrollment");
+            std::process::exit(1);
+        }
+    };
+
+    tracing::info!(port, "orchestrator starting");
     println!("orchestrator key: {}", hub.orchestrator_key_b64());
     println!("listening on 127.0.0.1:{port}");
     println!("routes: /health /api/v1/agents /api/v1/audit /api/v1/prompt /ws");
 
     if let Err(e) = serve(hub, port).await {
-        eprintln!("server error: {e}");
+        tracing::error!(error = %e, "server error");
         std::process::exit(1);
     }
 }

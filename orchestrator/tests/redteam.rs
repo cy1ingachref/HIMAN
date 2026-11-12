@@ -86,6 +86,16 @@ impl RawClient {
             .expect("send");
     }
 
+    /// The public key this client registers with.
+    fn verifying_key_b64(&self) -> String {
+        self.key.verifying_key().to_b64()
+    }
+
+    /// The device id this client claims.
+    fn device_id(&self) -> &DeviceId {
+        &self.device_id
+    }
+
     /// Read one frame as a `WireMessage`.
     async fn recv_message(&mut self) -> Option<WireMessage> {
         use futures_util::StreamExt;
@@ -236,6 +246,30 @@ async fn rt02_wrong_nonce_is_rejected() {
     );
 }
 
+/// Spawn the real orchestrator router on an ephemeral port, with enrollment
+/// loaded from a JSON file.
+async fn spawn_hub_with_enrollment(enrollment_json: &str) -> (std::sync::Arc<Hub>, u16) {
+    // The file is read fully into memory here, so the tempdir can be dropped
+    // as soon as loading finishes.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("enrolled.json");
+    std::fs::write(&path, enrollment_json).expect("write enrollment");
+    let file = himan_orchestrator::EnrollmentFile::load(&path).expect("load enrollment");
+    drop(dir);
+
+    let hub = Hub::new(HubConfig::default()).with_enrollment(file);
+    let app = router(hub.clone(), HubConfig::default());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    wait_for_port(port).await;
+    (hub, port)
+}
+
 // ---------------------------------------------------------------------------
 // RT-03: identity takeover
 //
@@ -248,7 +282,6 @@ async fn rt02_wrong_nonce_is_rejected() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore = "RT-03 pending: enrollment not implemented"]
 async fn rt03_identity_takeover_is_rejected() {
     let (hub, port) = spawn_hub().await;
 
@@ -281,7 +314,7 @@ async fn rt03_identity_takeover_is_rejected() {
     let agents = hub.agents().await;
     assert_eq!(agents.len(), 1, "RT-03: exactly one session must remain");
     assert_eq!(agents[0].id.as_str(), "pc-1");
-    assert_eq!(agents[0].verifying_key, real.key.verifying_key().to_b64());
+    assert_eq!(agents[0].verifying_key, real.verifying_key_b64());
 }
 
 // ---------------------------------------------------------------------------
@@ -523,4 +556,85 @@ async fn rt08_silent_connection_is_closed() {
         .await
         .expect("RT-08 FAILED: silent connection was not closed within 8s");
     assert!(closed, "RT-08 FAILED: silent connection stayed open");
+}
+
+// ---------------------------------------------------------------------------
+// Enrollment checks that back RT-03
+//
+// RT-03 exercises the session takeover path. These two tests exercise the
+// enrollment file itself: an unknown device, and a device whose key does not
+// match the enrolled key.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn enrollment_rejects_an_unknown_device() {
+    let key = SigningKey::generate();
+    let enrollment = format!(r#"{{"pc-1":"{}"}}"#, key.verifying_key().to_b64());
+    let (hub, port) = spawn_hub_with_enrollment(&enrollment).await;
+
+    let mut stranger = RawClient::connect(port, "phone-1").await;
+    stranger.send(hello("phone-1", &stranger.key)).await;
+
+    // No Welcome: the registration must be refused.
+    let outcome = tokio::time::timeout(Duration::from_secs(3), stranger.recv_message()).await;
+    assert!(
+        !matches!(outcome, Ok(Some(_))),
+        "enrollment accepted a device that is not in the file"
+    );
+
+    // The rejection must be audited, without key material.
+    let events = hub.audit_events().await;
+    let rejection = events
+        .iter()
+        .find(|e| e.action == "registration_rejected")
+        .expect("rejection must be audited");
+    assert_eq!(rejection.actor, stranger.device_id().as_str());
+    assert!(
+        !rejection.detail.contains("=="),
+        "audit detail must not contain key material: {}",
+        rejection.detail
+    );
+}
+
+#[tokio::test]
+async fn enrollment_rejects_a_key_mismatch() {
+    let enrolled = SigningKey::generate();
+    let attacker = SigningKey::generate();
+    let enrollment = format!(r#"{{"pc-1":"{}"}}"#, enrolled.verifying_key().to_b64());
+    let (hub, port) = spawn_hub_with_enrollment(&enrollment).await;
+
+    let mut client = RawClient::connect(port, "pc-1").await;
+    // The Hello must claim the attacker's key, not the client's own key.
+    client.send(hello("pc-1", &attacker)).await;
+
+    let outcome = tokio::time::timeout(Duration::from_secs(3), client.recv_message()).await;
+    assert!(
+        !matches!(outcome, Ok(Some(_))),
+        "enrollment accepted a Hello signed by a key that is not enrolled"
+    );
+
+    assert!(
+        hub.agents().await.is_empty(),
+        "a key mismatch must not create a session"
+    );
+}
+
+#[tokio::test]
+async fn enrollment_accepts_a_matching_key() {
+    let key = SigningKey::generate();
+    let enrollment = format!(r#"{{"pc-1":"{}"}}"#, key.verifying_key().to_b64());
+    let (hub, port) = spawn_hub_with_enrollment(&enrollment).await;
+
+    // The client must sign with the enrolled key, which in a real deployment
+    // is the same key it loaded from its key file.
+    let mut client = RawClient::connect(port, "pc-1").await;
+    client.key = key.clone();
+    client.send(hello("pc-1", &key)).await;
+
+    let welcome = tokio::time::timeout(Duration::from_secs(5), client.recv_message())
+        .await
+        .expect("welcome should arrive")
+        .expect("welcome");
+    assert!(matches!(welcome.payload, Payload::Welcome { .. }));
+    assert_eq!(hub.agents().await.len(), 1);
 }

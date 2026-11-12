@@ -71,6 +71,17 @@ pub fn router(hub: Arc<Hub>, _config: HubConfig) -> Router {
         .with_state(state)
 }
 
+/// Load the enrollment file from `HIMAN_ENROLLED_FILE` and attach it.
+///
+/// Returns an error when the variable is set but the file cannot be read or
+/// parsed: a broken enrollment file must not silently disable enrollment.
+pub fn load_enrollment(hub: Arc<Hub>) -> Result<Arc<Hub>, crate::enrollment::EnrollmentError> {
+    match crate::enrollment::load_from_env()? {
+        Some(file) => Ok(hub.with_enrollment(file)),
+        None => Ok(hub),
+    }
+}
+
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
     let agents = state.hub.agents().await;
     Json(HealthResponse {

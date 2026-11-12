@@ -4,6 +4,7 @@
 //! the WebSocket hub lands.
 
 pub mod audit;
+pub mod enrollment;
 pub mod hub;
 pub mod policy;
 pub mod presence;
@@ -11,6 +12,7 @@ pub mod server;
 pub mod state;
 
 pub use audit::{AuditEvent, AuditLog};
+pub use enrollment::{check_enrollment, EnrollmentDecision, EnrollmentError, EnrollmentFile};
 pub use hub::{DispatchResult, Hub, HubConfig};
 pub use policy::{Decision, PolicyConfig, PolicyEngine};
 pub use presence::{PresenceManager, PresenceSnapshot};

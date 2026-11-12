@@ -20,6 +20,7 @@ use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn};
 
 use crate::audit::AuditLog;
+use crate::enrollment::{check_enrollment, EnrollmentDecision, EnrollmentFile};
 use crate::policy::{Decision, PolicyEngine};
 use crate::presence::PresenceManager;
 use crate::state::StateStore;
@@ -40,6 +41,7 @@ pub struct Hub {
     audit: Mutex<AuditLog>,
     orchestrator_key: SigningKey,
     config: HubConfig,
+    enrollment: Option<EnrollmentFile>,
 }
 
 #[derive(Debug, Clone)]
@@ -90,7 +92,16 @@ impl Hub {
             audit: Mutex::new(AuditLog::new()),
             orchestrator_key: SigningKey::generate(),
             config,
+            enrollment: None,
         })
+    }
+
+    /// Attach an enrollment file. Devices not listed are rejected.
+    pub fn with_enrollment(mut self: Arc<Self>, file: EnrollmentFile) -> Arc<Self> {
+        Arc::get_mut(&mut self)
+            .expect("hub is already shared")
+            .enrollment = Some(file);
+        self
     }
 
     /// The orchestrator's own verifying key, advertised to agents.
@@ -120,10 +131,50 @@ impl Hub {
         let claimed = himan_proto::VerifyingKey::from_b64(&info.verifying_key)?;
         hello.verify_with(&claimed)?;
 
-        let mut keys = self.keys.lock().await;
-        keys.insert(info.id.clone(), claimed);
+        // Enrollment: the device must be listed and the key must match.
+        match check_enrollment(self.enrollment.as_ref(), &info.id, &info.verifying_key) {
+            EnrollmentDecision::Enrolled => {}
+            EnrollmentDecision::UnknownDevice => {
+                self.audit_rejection(&info.id, "device is not enrolled");
+                return Err(ProtoError::Policy("device is not enrolled".to_owned()));
+            }
+            EnrollmentDecision::KeyMismatch => {
+                self.audit_rejection(&info.id, "Hello key does not match enrolled key");
+                return Err(ProtoError::Policy(
+                    "Hello key does not match enrolled key".to_owned(),
+                ));
+            }
+        }
 
+        let mut keys = self.keys.lock().await;
         let mut agents = self.agents.lock().await;
+
+        // Identity takeover: the id is already connected. Accept only if the
+        // reconnecting key is the same enrolled key; otherwise reject and
+        // leave the legitimate session untouched.
+        if let Some(existing) = agents.get(&info.id) {
+            let same_key = existing.device.verifying_key == info.verifying_key;
+            if !same_key {
+                drop(agents);
+                drop(keys);
+                self.audit_rejection(
+                    &info.id,
+                    "a different key attempted to take over a connected device",
+                );
+                warn!(device = %info.id, "rejected registration from a different key");
+                return Err(ProtoError::Policy(
+                    "device id is already connected with a different key".to_owned(),
+                ));
+            }
+
+            // Same key: a legitimate reconnect. Replace the session and close
+            // the old socket so it cannot linger.
+            info!(device = %info.id, "replacing session for a reconnecting device");
+            let old = agents.remove(&info.id);
+            drop(old);
+        }
+
+        keys.insert(info.id.clone(), claimed);
         agents.insert(
             info.id.clone(),
             AgentSession {
@@ -144,6 +195,18 @@ impl Hub {
 
         info!(device = %info.id, class = info.class.as_str(), "agent registered");
         Ok(info)
+    }
+
+    /// Record a registration rejection. Never includes key material.
+    fn audit_rejection(&self, device: &DeviceId, reason: &str) {
+        let audit = self.audit.try_lock();
+        if let Ok(mut log) = audit {
+            log.append(
+                "registration_rejected".into(),
+                device.to_string(),
+                reason.to_owned(),
+            );
+        }
     }
 
     /// Verify and handle an incoming agent message.

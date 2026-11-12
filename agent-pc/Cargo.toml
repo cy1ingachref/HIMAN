@@ -27,3 +27,4 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "macros"] }
+tempfile = "3"
