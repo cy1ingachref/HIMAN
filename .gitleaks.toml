@@ -1,0 +1,22 @@
+# gitleaks configuration.
+#
+# HIMAN never commits key material, but the enrollment example and the docs
+# mention keys. This config makes the scan explicit about what is allowed:
+# the example file contains placeholder base64, not a real key.
+
+title = "HIMAN gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Placeholder keys in documentation and examples"
+paths = [
+    '''docs/enrolled-devices.example.json''',
+    '''docs/REDTEAM.md''',
+    '''docs/PROTOCOL.md''',
+]
+regexes = [
+    # Placeholder base64 in the enrollment example.
+    '''REPLACE_WITH_BASE64_PUBLIC_KEY''',
+]

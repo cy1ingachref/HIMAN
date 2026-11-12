@@ -1,0 +1,27 @@
+# Dependabot keeps the toolchain and CI actions current.
+#
+# Actions are SHA-pinned, so Dependabot bumps the SHA and the version comment
+# together. Without this, a pinned action never updates and the pin becomes a
+# liability rather than a control.
+version: 2
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
+    labels:
+      - "dependencies"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps(ci)"
+    labels:
+      - "dependencies"
+      - "ci"

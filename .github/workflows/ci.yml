@@ -6,6 +6,7 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Least privilege: the workflow only needs to read the repository.
 permissions:
   contents: read
 
@@ -23,16 +24,18 @@ jobs:
     timeout-minutes: 25
 
     steps:
+      # Pinned to a commit SHA, not a floating tag. A compromised or moved tag
+      # would otherwise run arbitrary code in CI with repository access.
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: rustfmt, clippy
 
       - name: Cache cargo registry and build
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -68,13 +71,13 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 
       - name: Cache cargo registry and build
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -89,3 +92,45 @@ jobs:
 
       - name: Run end-to-end test
         run: cargo test -p himan-orchestrator --test e2e -- --nocapture
+
+  # Dependency audit: fail on any known-vulnerable crate.
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+
+      - name: Install cargo-audit
+        run: cargo install --locked cargo-audit
+
+      - name: Audit dependencies
+        run: cargo audit --deny warnings
+
+  # Secret scan: fail if a key or token is committed.
+  secrets:
+    name: secret scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+
+      - name: Scan for secrets
+        run: |
+          # gitleaks is a Go tool, not a crate: install the release binary.
+          curl -sSfL \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.24.3/gitleaks_8.24.3_linux_x64.tar.gz \
+            | tar -xz -C /tmp
+          /tmp/gitleaks detect --source . --verbose --redact --no-git
