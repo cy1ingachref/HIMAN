@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::device::{DeviceId, DeviceInfo};
-use crate::error::{ProtoError, ProtoResult};
+use crate::error::ProtoResult;
 use crate::signing::{SigningKey, VerifyingKey};
 use crate::task::{HandoffToken, TaskId, TaskState, ToolCall, ToolName};
 
@@ -129,7 +129,6 @@ mod tests {
     use super::*;
     use crate::device::DeviceClass;
     use crate::signing::SigningKey;
-    use crate::task::RiskTier;
 
     fn sample_message() -> (WireMessage, SigningKey) {
         let sk = SigningKey::generate();
