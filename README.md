@@ -20,7 +20,7 @@ understandable. The research contribution is making that safe.
 | Device | Role | Shell |
 |---|---|---|
 | Windows PC | orchestrator host + agent + 3D view | Rust (`agent-pc`) + Tauri 2 + Three.js |
-| Android phone (Redmi Note 13) | agent + approvals + 3D view | Native Kotlin + Rust core (JNI) |
+| Android phone | agent + approvals + 3D view | Native Kotlin + Rust core (JNI) |
 | Raspberry Pi / router | optional third device | Rust (`agent-pi`) |
 
 No iOS. No Flutter.
