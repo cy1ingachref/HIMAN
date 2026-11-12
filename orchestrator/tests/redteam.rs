@@ -658,6 +658,43 @@ async fn rt08_silent_connection_is_closed() {
     assert!(closed, "RT-08 FAILED: silent connection stayed open");
 }
 
+/// A registered agent must NOT be disconnected by the handshake timeout.
+///
+/// Regression: the handshake timeout was applied to every read, so an agent
+/// that went quiet for 10s after registering was dropped even though it was
+/// healthy. The idle timeout after registration is much longer.
+#[tokio::test]
+async fn registered_agent_survives_past_the_handshake_timeout() {
+    let (_hub, port) = spawn_hub_with_limits(WsLimits {
+        handshake_timeout_secs: 2,
+        idle_timeout_secs: 60,
+        ..WsLimits::default()
+    })
+    .await;
+
+    let mut agent = RawClient::connect(port, "pc-1").await;
+    agent.send(hello("pc-1", &agent.key)).await;
+    let _welcome = tokio::time::timeout(Duration::from_secs(5), agent.recv_message())
+        .await
+        .expect("welcome")
+        .expect("welcome");
+
+    // Wait well past the handshake timeout. The agent must still be connected.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    // A message after the wait proves the connection survived.
+    agent.send(Payload::Ping { nonce: 1 }).await;
+    let reply = tokio::time::timeout(Duration::from_secs(5), agent.recv_message())
+        .await
+        .expect("the connection should still be open")
+        .expect("a pong should arrive");
+    assert!(
+        matches!(reply.payload, Payload::Pong { .. }),
+        "expected a Pong, got {}",
+        reply.payload.kind_name()
+    );
+}
+
 #[tokio::test]
 async fn rt08_oversized_frame_is_closed() {
     use futures_util::SinkExt;

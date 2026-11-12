@@ -10,24 +10,27 @@ Status of each phase. Mark a phase done only when its exit check passes.
 - [x] Workspace skeleton, 4 crates
 - [ ] Supervisor, deadline, exact PFE duration — still TBD (user side)
 
-## Phase 1: Foundation — IN PROGRESS
+## Phase 1: Foundation — DONE 2026-11-13
 
-- [x] `proto` crate: message types, signing, envelope — 17 tests
-- [x] `agent-core`: Tool trait + registry with whitelist — 7 tests
-- [x] `agent-core`: `ChatBackend` trait + `ScriptedBackend` stub — 9 tests
-- [x] `orchestrator`: policy engine — 10 tests
-- [x] `orchestrator`: presence manager + handoff tokens — 9 tests
-- [x] `orchestrator`: state store — 6 tests
-- [x] `orchestrator`: hash-chained audit log — 7 tests
-- [x] `agent-pc`: real `device_status` + `run_diagnostic` tools — 9 tests
-- [x] `agent-pc`: demo loop prompt → tool call → result (verified by running)
-- [ ] WebSocket hub: orchestrator accepts agent connections
-- [ ] Exit check: a script triggers a tool call end-to-end over the wire
+- [x] `proto` crate: message types, signing, envelope
+- [x] `agent-core`: Tool trait + registry with whitelist
+- [x] `agent-core`: `ChatBackend` trait + `ScriptedBackend` stub
+- [x] `orchestrator`: policy engine
+- [x] `orchestrator`: presence manager + handoff tokens
+- [x] `orchestrator`: state store
+- [x] `orchestrator`: hash-chained audit log
+- [x] `agent-pc`: real `device_status` + `run_diagnostic` tools
+- [x] WebSocket hub: orchestrator accepts agent connections
+- [x] Exit check: a signed tool call works end-to-end over the wire
+      (`orchestrator/tests/integration.rs` + `e2e.rs`)
+- [x] Red-team suite RT-01..RT-08, all passing (`docs/REDTEAM.md`)
+- [x] Logging visible by default (`orchestrator/tests/logging.rs`)
+- [x] CI: fmt, clippy, test, e2e, audit, secret scan
 
 ## Phase 2: Agent loop
 
 - [ ] Tool schemas + registry exposed over the wire
-- [ ] Real LLM backend (Ollama or cloud) behind `ChatBackend`
+- [ ] Real LLM backend behind `ChatBackend`
 - [ ] Task state machine persisted (SQLite)
 - [ ] Exit check: text prompt becomes a tool call and a result, with persistence
 
@@ -37,6 +40,7 @@ Status of each phase. Mark a phase done only when its exit check passes.
 - [ ] Phone tools: `device_status`, `request_approval`, `list_files`,
       `upload_file`, `show_notification`
 - [ ] Presence manager + signed handoff tokens over the wire
+- [ ] Secure mesh (Tailscale/WireGuard/Headscale)
 - [ ] Exit check: task started on PC finishes on phone
 
 ## Phase 4: Character
@@ -47,16 +51,19 @@ Status of each phase. Mark a phase done only when its exit check passes.
 
 ## Phase 5: Security layer
 
-- [ ] Risk tiers enforced end-to-end (not just in the engine)
-- [ ] Signed tool calls verified by the receiving agent
+- [x] Risk tiers enforced end-to-end
+- [x] Signed tool calls verified by the receiving agent
+- [x] Enrollment, key pinning, replay detection, API auth, WS hardening
 - [ ] Keystore-backed approval flow on the phone
 - [ ] Audit log exported to an append-only sink
+- [ ] Mutual TLS for the agent↔orchestrator channel
 
 ## Phase 6: Red team and evaluation
 
-- [ ] Attack suite: prompt injection, token theft, device impersonation,
-      fake character
-- [ ] Measure attack success before and after defenses
+- [x] Attack suite: reflection, nonce, takeover, fake orchestrator, replay,
+      id collision, unauthenticated API, silent/oversized WebSocket
+- [x] Measure attack success before and after defenses (`docs/REDTEAM.md`)
+- [ ] Prompt injection, token theft, fake character
 - [ ] Run demo scenarios repeatedly, record results
 - [ ] Small user study
 

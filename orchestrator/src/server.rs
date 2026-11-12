@@ -195,6 +195,12 @@ async fn prompt(
 pub struct WsLimits {
     /// Seconds allowed for the first message (the Hello).
     pub handshake_timeout_secs: u64,
+    /// Seconds a registered connection may stay silent before being closed.
+    ///
+    /// Must be much larger than the handshake timeout: a healthy agent only
+    /// speaks when dispatched, so a short idle timeout would disconnect every
+    /// working agent.
+    pub idle_timeout_secs: u64,
     /// Maximum accepted text/binary frame size, in bytes.
     pub max_frame_bytes: usize,
     /// Maximum concurrent WebSocket connections.
@@ -207,6 +213,7 @@ impl Default for WsLimits {
     fn default() -> Self {
         Self {
             handshake_timeout_secs: 10,
+            idle_timeout_secs: 300,
             max_frame_bytes: 64 * 1024,
             max_connections: 256,
             max_invalid_messages: 8,
@@ -273,16 +280,24 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
     let limits = state.ws_limits.clone();
 
     loop {
-        // A silent connection must not hold a slot forever.
-        let next = tokio::time::timeout(
-            std::time::Duration::from_secs(limits.handshake_timeout_secs),
-            stream.next(),
-        )
-        .await;
+        // Before registration the connection must speak quickly, otherwise it
+        // is a silent scanner. After registration the agent only speaks when
+        // dispatched, so the idle timeout is much longer.
+        let timeout = if registered.is_some() {
+            limits.idle_timeout_secs
+        } else {
+            limits.handshake_timeout_secs
+        };
+        let next =
+            tokio::time::timeout(std::time::Duration::from_secs(timeout), stream.next()).await;
 
         let frame = match next {
             Err(_) => {
-                tracing::warn!("WebSocket handshake timed out: no message received");
+                tracing::warn!(
+                    timeout_secs = timeout,
+                    registered = registered.is_some(),
+                    "WebSocket connection closed: no message within the timeout"
+                );
                 break;
             }
             Ok(Some(Ok(f))) => f,

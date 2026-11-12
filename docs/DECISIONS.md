@@ -15,13 +15,26 @@ matters more than the prose.
 | 2026-11-12 | Hash-chained in-memory audit log | Tamper evidence is a core claim; the chain is testable now | Plain append-only Vec |
 | 2026-11-12 | `run_diagnostic` marked Destructive even though Phase 1 is read-only | Exercises the approval path honestly instead of pretending it is not needed | Marking it Reversible |
 | 2026-11-12 | Rust toolchain: MSVC host, VS Build Tools 2022 present | Verified `cargo build` links; no MinGW needed | GNU target (no gcc on PATH) |
+| 2026-11-12 | Socket transport splits sink and stream, each with its own lock | One shared mutex let the read pump block `send()` forever; a parked reader must never block a writer | A single mutex, a pump channel |
+| 2026-11-12 | Handshake requires a `Welcome`, nonce-bound and signed | Any reply counting as success made a transport echo look like registration | Accepting the first reply |
+| 2026-11-12 | Nonce-bound Welcome + pinned orchestrator key | A fake orchestrator could otherwise sign its own Welcome | Trusting the key the Welcome advertises |
+| 2026-11-12 | Enrollment file maps device id → public key | Stops identity takeover: without it any key can claim any id | Trust-on-first-use, which is defeated by a race |
+| 2026-11-12 | Agent and orchestrator keys persist to files | A fresh key per run breaks enrollment and pinning | Regenerating per run |
+| 2026-11-12 | Task ids are uuid v4, tool-call nonces are random 64-bit | A timestamp-derived id collides within the same second, breaking the audit trail | Timestamp ids |
+| 2026-11-12 | Per-device `seq` tracker rejects replays | A captured signed `ToolResult` could be replayed | Nonce-only replay protection |
+| 2026-11-12 | HTTP API requires a constant-time bearer token | The API dispatched tool calls to every enrolled device with no auth | No auth, or a timing-vulnerable comparison |
+| 2026-11-12 | WebSocket limits: handshake timeout, frame cap, connection semaphore, invalid-message budget | A silent or oversized connection holds a task and a socket indefinitely | No limits |
+| 2026-11-12 | CI actions pinned by SHA; audit + gitleaks + dependabot | A moved tag would run arbitrary code in CI | Floating tags |
 
 ## Conventions
 
 - Crate names use the `himan-` prefix; binary is `himan-agent-pc`.
 - All user-visible commits use `cy1ingachref` as author.
-- Tests are co-located in `#[cfg(test)]` modules, not `tests/` directories,
-  because the types under test are small and private helpers matter.
+- Unit tests are co-located in `#[cfg(test)]` modules. Integration, red-team
+  and end-to-end tests live in `orchestrator/tests/`, because they exercise
+  public API and real binaries rather than private helpers.
 - Every commit must leave the workspace in a state where
   `cargo test --workspace` and `cargo clippy --workspace --all-targets -- -D warnings`
   both pass.
+- A defense for a red-team finding is not done until the named RT test passes
+  and the before/after output is recorded in `docs/REDTEAM.md`.

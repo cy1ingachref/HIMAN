@@ -1,7 +1,8 @@
 # HIMAN — Protocol specification
 
-Phase 1 version. This is the contract between the orchestrator and device
-agents. Everything here is implemented in `proto/` and tested.
+This is the contract between the orchestrator and device agents. Everything
+here is implemented and tested; `docs/REDTEAM.md` records the attacks each
+defense defeats.
 
 ## Envelope
 
@@ -15,8 +16,8 @@ pub struct WireMessage {
 }
 
 pub struct WireMeta {
-    pub seq: u64,          // monotonic per sender
-    pub ts: i64,           // unix seconds
+    pub seq: u64,          // monotonic per sender, replay-checked
+    pub ts: i64,           // unix seconds, staleness-checked
     pub from: DeviceId,
     pub to: String,        // "orchestrator" or a DeviceId
 }
@@ -34,21 +35,62 @@ canonical_json(meta) || b"|" || canonical_json(payload)
 order preserved). The separator `|` prevents ambiguity between meta and
 payload boundaries.
 
-Verification uses the sender's `verifying_key` from the device registry. A
-message from an unregistered device is rejected before signature verification.
+The `meta` is signed because `seq`, `ts`, `from` and `to` are all
+security-relevant. An attacker who can rewrite `from` can impersonate another
+device; one who can rewrite `seq` can reorder or replay messages.
 
-### Why the meta is signed
+## Registration
 
-`seq`, `ts`, `from` and `to` are all security-relevant. An attacker who can
-rewrite `from` can impersonate another device; one who can rewrite `seq` can
-reorder or replay messages. Signing only the payload would leave those open.
+```
+agent                                    orchestrator
+  │  Hello { DeviceInfo, nonce }           │
+  │ ─────────────────────────────────────► │
+  │                                        │  enroll: id known? key matches?
+  │                                        │  takeover: id already connected?
+  │                                        │  signature verifies?
+  │  Welcome { device_id, nonce,           │
+  │            orchestrator_key }          │
+  │ ◄───────────────────────────────────── │
+  │  pinned_key == orchestrator_key?       │
+  │  signature verifies with pinned_key?   │
+  │  nonce matches this attempt?           │
+```
+
+Every step is enforced, and each failure has its own error:
+
+| Failure | Error | Test |
+|---|---|---|
+| Server echoes our Hello | `UnexpectedReply` | RT-01 |
+| Welcome nonce differs | `NonceMismatch` | RT-02 |
+| Device not in enrollment file | `Policy` | RT-03 |
+| Hello key ≠ enrolled key | `Policy` | RT-03 |
+| Different key on a connected id | `Policy` | RT-03 |
+| Welcome key ≠ pinned key | `NotPinnedKey` | RT-04 |
+| Signature invalid | `BadSignature` | — |
+
+A reconnect with the same enrolled key replaces the session and closes the old
+socket. A reconnect with a different key is rejected and the legitimate
+session is left untouched.
+
+## Replay and ordering
+
+The orchestrator keeps the last accepted `seq` per device. A message whose
+`seq` is not strictly greater is rejected as a replay and audited as
+`message_rejected`. The tracker is reset on registration because the agent's
+counter restarts on reconnect.
+
+Messages whose timestamp is more than `max_skew_secs` (default 120s) from the
+server clock are rejected as stale.
+
+On the agent side, a bounded nonce cache (1024 entries) rejects a tool call
+whose nonce has already been seen, so a replayed call is not executed twice.
 
 ## Payload kinds
 
 | Kind | Direction | Purpose |
 |---|---|---|
 | `Hello` | agent → orchestrator | Register, send `DeviceInfo` + verifying key |
-| `Welcome` | orchestrator → agent | Acknowledge registration |
+| `Welcome` | orchestrator → agent | Acknowledge registration, pin the key |
 | `Status` | agent → orchestrator | Battery, connectivity, load |
 | `ToolCall` | orchestrator → agent | Signed request to run a tool |
 | `ToolResult` | agent → orchestrator | Outcome of a tool call |
@@ -61,20 +103,16 @@ reorder or replay messages. Signing only the payload would leave those open.
 
 Adding a variant is a protocol change and requires updating `Payload`.
 
-## Handoff protocol
+## Agent-side tool call checks
 
-```
-1. Planner or user decides the task should move to another device.
-2. Policy engine evaluates the handoff (target must be registered).
-3. PresenceManager issues a HandoffToken (task, from, to, expiry, nonce).
-4. Orchestrator signs the token and sends it to the target as Payload::Handoff.
-5. Target verifies the signature and checks expiry + nonce, replies HandoffAck.
-6. Orchestrator flips active_device.
-7. Both renderers play the transfer animation, after the ack.
-```
+Before anything runs, the agent checks in order:
 
-Step 7 is deliberately last: the animation must not imply a handoff that has
-not actually been acknowledged.
+1. `target_device` matches this device
+2. the nonce has not been seen before
+3. the envelope timestamp is recent
+
+Then the tool whitelist is applied: a call for a tool this device does not
+expose is refused, not run.
 
 ## Risk tiers
 
@@ -84,28 +122,53 @@ not actually been acknowledged.
 | `reversible` | Side effects, undoable | Not required, logged |
 | `destructive` | Hard to reverse | Required |
 
-The policy engine may raise a tier, never lower it. A tool's default tier is
-declared by the tool itself; the engine can override via `always_approve`.
+The policy engine may raise a tier, never lower it.
 
-## Tool call flow
+## HTTP API
 
-```
-ToolCall { task_id, tool, args, risk_tier, target_device, nonce }
-    │
-    ├─ policy.evaluate(call, device)
-    │     Allow             → execute
-    │     RequireApproval   → ApprovalRequest to phone, wait for ApprovalResponse
-    │     Deny(reason)      → ToolResult { state: Failed, output: reason }
-    │
-    └─ agent executes tool, replies ToolResult
-```
+| Route | Auth | Purpose |
+|---|---|---|
+| `GET /health` | none | Liveness probe |
+| `GET /api/v1/agents` | bearer | List registered devices |
+| `GET /api/v1/audit` | bearer | Hash-chained audit log |
+| `POST /api/v1/prompt` | bearer | Dispatch a prompt to a device |
+| `GET /ws` | signature | Agent WebSocket |
 
-Replay protection: `nonce` is monotonic per sender and must be greater than
-the last accepted nonce for that sender. A replayed call is dropped.
+`/api/v1/*` requires `Authorization: Bearer $HIMAN_API_TOKEN`. Comparison is
+constant-time. `/health` and `/ws` are exempt: the former for load balancers,
+the latter because agents authenticate by signature.
 
-## Not in Phase 1
+## Configuration
 
-- Transport (WebSocket hub) — Phase 1.5
+| Variable | Used by | Purpose |
+|---|---|---|
+| `HIMAN_PORT` | orchestrator | Listen port (default 8787) |
+| `HIMAN_ORCH_KEY_FILE` | orchestrator | Persisted signing key seed |
+| `HIMAN_ENROLLED_FILE` | orchestrator | Device id → public key map |
+| `HIMAN_API_TOKEN` | orchestrator | HTTP bearer token |
+| `HIMAN_AGENT_KEY_FILE` | agent | Persisted signing key seed |
+| `HIMAN_ORCH_KEY` | agent | Pinned orchestrator public key |
+
+Key files contain a base64 Ed25519 seed. They are secrets: never committed,
+never logged, never printed. Only derived public keys are printed.
+
+## WebSocket limits
+
+| Limit | Default | Purpose |
+|---|---|---|
+| Handshake timeout | 10s | Close a connection that never sends its Hello |
+| Idle timeout | 300s | Close a registered connection that goes silent |
+| Max frame | 64 KiB | Reject an oversized frame |
+| Max connections | 256 | Cap concurrent sockets |
+| Max invalid messages | 8 | Close a garbage stream |
+
+The handshake timeout applies only until the Hello arrives. Applying it to
+every read would disconnect a healthy agent that simply had nothing to say,
+which is why the idle timeout is separate and much longer.
+
+## Not implemented
+
 - Mutual TLS / WireGuard mesh — Phase 3
 - Persistence — Phase 2
-- Real LLM — Phase 2
+- Real LLM backend — Phase 2
+- Handoff to a phone — Phase 3

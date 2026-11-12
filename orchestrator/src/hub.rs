@@ -318,12 +318,18 @@ impl Hub {
                 );
                 Ok(None)
             }
-            Payload::Pong { nonce } => {
-                debug!(nonce, "pong");
+            Payload::Ping { nonce } => {
+                // Liveness: reply so the agent knows the orchestrator is alive
+                // and the round-trip latency.
+                debug!(nonce, "ping");
                 Ok(Some(self.build_message(
                     msg.meta.from,
                     Payload::Pong { nonce: *nonce },
                 )?))
+            }
+            Payload::Pong { nonce } => {
+                debug!(nonce, "pong");
+                Ok(None)
             }
             Payload::Bye { reason } => {
                 let mut audit = self.audit.lock().await;

@@ -4,10 +4,6 @@ Each attack has a test in `orchestrator/tests/redteam.rs`. This table records
 the expected defense, the test, the status before the fix (with the actual
 failure output), the status after the fix, and the commit that fixed it.
 
-A test for a defense that does not exist yet is marked
-`#[ignore = "RT-XX pending"]` so CI stays green. The ignore is removed in the
-task that implements the defense.
-
 No keys, seeds or tokens appear in this document or in test output. Public
 keys are fine.
 
@@ -17,12 +13,12 @@ keys are fine.
 |---|---|---|---|---|---|---|
 | RT-01 | Handshake reflection | Agent rejects an echoed Hello | `rt01_agent_rejects_reflected_hello` | PASS | PASS | already defended |
 | RT-02 | Wrong nonce in Welcome | Agent rejects a nonce mismatch | `rt02_wrong_nonce_is_rejected` | PASS | PASS | already defended |
-| RT-03 | Identity takeover | Reject a new key for a connected id | `rt03_identity_takeover_is_rejected` | IGNORED (pending) | TBD | TBD |
-| RT-04 | Fake orchestrator | Agent rejects an unpinned key | `rt04_fake_orchestrator_is_rejected` | IGNORED (pending) | TBD | TBD |
-| RT-05 | ToolResult replay | Hub rejects seq <= last | `rt05_tool_result_replay_is_rejected` | IGNORED (pending) | TBD | TBD |
-| RT-06 | Task-id collision | Random 128-bit task ids | `rt06_task_ids_are_unique_within_a_second` | **FAIL** | TBD | TBD |
-| RT-07 | Unauthenticated API call | 401 without a valid bearer token | `rt07_unauthenticated_api_call_is_rejected` | IGNORED (pending) | TBD | TBD |
-| RT-08 | Silent / oversized WebSocket | Socket closed within the timeout | `rt08_silent_connection_is_closed` | IGNORED (pending) | TBD | TBD |
+| RT-03 | Identity takeover | Reject a new key for a connected id | `rt03_identity_takeover_is_rejected` | IGNORED | PASS | `9052a62` |
+| RT-04 | Fake orchestrator | Agent rejects an unpinned key | `rt04_fake_orchestrator_is_rejected` | IGNORED | PASS | `a1e3406` |
+| RT-05 | ToolResult replay | Hub rejects seq <= last | `rt05_tool_result_replay_is_rejected` | IGNORED | PASS | `ef2e78a` |
+| RT-06 | Task-id collision | Random 128-bit task ids | `rt06_task_ids_are_unique_within_a_second` | **FAIL** | PASS | `8e6c61d` |
+| RT-07 | Unauthenticated API call | 401 without a valid bearer token | `rt07_unauthenticated_api_call_is_rejected` | IGNORED | PASS | `65fd428` |
+| RT-08 | Silent / oversized WebSocket | Socket closed within the timeout | `rt08_*` (3 tests) | IGNORED | PASS | `1607877` |
 
 ## Before-state evidence
 
@@ -42,8 +38,8 @@ test rt06_task_ids_are_unique_within_a_second ... FAILED
 test result: FAILED. 0 passed; 1 failed; 0 ignored; 7 filtered out
 ```
 
-Cause: the task id is derived from `Utc::now().timestamp()`, so two dispatches
-in the same second collide. The tool-call nonce has the same defect.
+Cause: the task id was derived from `Utc::now().timestamp()`, so two dispatches
+in the same second collided. The tool-call nonce had the same defect.
 
 ### RT-01 and RT-02 pass already
 
@@ -51,9 +47,6 @@ in the same second collide. The tool-call nonce has the same defect.
 test rt01_agent_rejects_reflected_hello ... ok
 test rt02_wrong_nonce_is_rejected ... ok
 ```
-
-These were defended when the handshake was hardened: `register()` requires a
-`Welcome`, checks the nonce, and verifies the signature.
 
 ### RT-03, RT-04, RT-05, RT-07, RT-08 pending
 
@@ -65,13 +58,39 @@ test rt07_unauthenticated_api_call_is_rejected ... ignored, RT-07 pending: API a
 test rt08_silent_connection_is_closed ... ignored, RT-08 pending: WebSocket hardening not implemented
 ```
 
-These defenses are not implemented yet. Each is written as a test against the
-expected behavior so the gap is explicit and the fix is verifiable.
-
 ## After-state
 
-To be filled in as each task lands, with the commit hash and the passing test
-output.
+All eight are defended and all tests pass.
+
+```
+test rt01_agent_rejects_reflected_hello ... ok
+test rt02_wrong_nonce_is_rejected ... ok
+test rt03_identity_takeover_is_rejected ... ok
+test rt04_fake_orchestrator_is_rejected ... ok
+test rt05_tool_result_replay_is_rejected ... ok
+test rt06_task_ids_are_unique_within_a_second ... ok
+test rt07_unauthenticated_api_call_is_rejected ... ok
+test rt08_oversized_frame_is_closed ... ok
+test rt08_silent_connection_is_closed ... ok
+test rt08_too_many_invalid_messages_is_closed ... ok
+test enrollment_accepts_a_matching_key ... ok
+test enrollment_rejects_a_key_mismatch ... ok
+test enrollment_rejects_an_unknown_device ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored
+```
+
+Supporting checks that are not part of the RT numbering:
+
+- `enrollment_accepts_a_matching_key` — a legitimate device still registers,
+  so the enrollment check is not a blanket rejection.
+- `enrollment_rejects_an_unknown_device` — an id not in the file is refused
+  and the rejection is audited without key material.
+- `enrollment_rejects_a_key_mismatch` — a signed Hello from a key that is not
+  enrolled creates no session.
+- RT-05 also asserts a newer `seq` is still accepted, proving the rule is
+  ordering and not "reject everything after the first".
+- RT-07 also asserts the correct token passes auth and `/health` stays open.
 
 ## Attack notes for the thesis
 
@@ -85,5 +104,40 @@ output.
   pinning without enrollment lets any key claim a device id.
 - **RT-05 (replay)** is defeated by sequence tracking, which is also what
   makes the audit log trustworthy about ordering.
+- **RT-06 (task-id collision)** is a uniqueness defect, not an attack. It
+  matters because a colliding task id makes two dispatches
+  indistinguishable in the audit log, which breaks the evidence chain the
+  thesis depends on.
+- **RT-07 (unauthenticated API)** is the difference between a system that
+  works on a developer machine and one that can be exposed.
 - **RT-08 (silent socket)** is a resource-exhaustion attack, not a
   confidentiality one. The defense is a deadline plus a size cap.
+
+## The idle-timeout bug
+
+The handshake timeout was originally applied to every read, not just the
+handshake. A healthy agent only speaks when dispatched, so a quiet agent was
+dropped 10 seconds after registering. Found by running the documented flow by
+hand: the orchestrator log showed `WebSocket handshake timed out` exactly 10s
+after a successful registration, and the agent exited.
+
+Fixed by separating the two timeouts: 10s before the Hello, 300s after.
+Regression test: `registered_agent_survives_past_the_handshake_timeout`, which
+waits past the handshake timeout and then proves the connection still answers a
+Ping.
+
+The same investigation found the hub handled `Pong` but not `Ping`, so a
+liveness check got no reply. Both arms are now implemented.
+
+## The transport bug these tests found
+
+The socket transport originally held one mutex across both halves. The read
+pump held it across `.next().await`, which blocks until a frame arrives, so
+`send_message()` never acquired the lock and the Hello was never written. It
+was a lock-ordering race: it passed when the agent was launched from a
+terminal and failed when launched from Python. Fixed in `b50677f` by
+splitting the socket and guarding sink and stream separately. Regression test:
+`parked_reader_does_not_block_the_writer`.
+
+This is the case study for why the red-team suite is worth having: the bug was
+invisible to the unit tests because they only exercised an in-memory duplex.
