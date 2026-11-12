@@ -3,7 +3,6 @@
 Secure Multi-Device AI Agent Orchestration — a zero-trust architecture for
 autonomous cross-device task execution, with an embodied 3D character.
 
-Student: Achref Ferjani (Ashe) — Network Systems Engineering, 3ISI-IRS, ISSATM
 Repository: https://github.com/cy1ingachref/HIMAN
 Phase: 1 — Foundation
 
