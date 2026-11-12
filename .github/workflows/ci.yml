@@ -60,3 +60,32 @@ jobs:
           echo "- fmt: see log" >> $GITHUB_STEP_SUMMARY
           echo "- clippy: see log" >> $GITHUB_STEP_SUMMARY
           echo "- tests: see log" >> $GITHUB_STEP_SUMMARY
+
+  e2e:
+    name: end-to-end (real binaries)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-e2e-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-e2e-
+
+      # The e2e test spawns the real binaries, so they must be built first.
+      - name: Build binaries
+        run: cargo build --workspace
+
+      - name: Run end-to-end test
+        run: cargo test -p himan-orchestrator --test e2e -- --nocapture
