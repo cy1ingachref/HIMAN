@@ -14,7 +14,7 @@
 
 use std::time::Duration;
 
-use himan_orchestrator::{router, router_with_auth, Hub, HubConfig};
+use himan_orchestrator::{router_with_auth, router_with_limits, Hub, HubConfig, WsLimits};
 use himan_proto::{
     DeviceClass, DeviceId, DeviceInfo, Payload, SigningKey, TaskState, WireMessage, WireMeta,
 };
@@ -40,6 +40,18 @@ async fn spawn_hub() -> (std::sync::Arc<Hub>, u16) {
 
 /// Spawn the real orchestrator router with API auth enabled.
 async fn spawn_hub_with_token(token: Option<&str>) -> (std::sync::Arc<Hub>, u16) {
+    spawn_hub_with_limits_and_token(token, WsLimits::default()).await
+}
+
+/// Spawn the real orchestrator router with custom WS limits.
+async fn spawn_hub_with_limits(limits: WsLimits) -> (std::sync::Arc<Hub>, u16) {
+    spawn_hub_with_limits_and_token(None, limits).await
+}
+
+async fn spawn_hub_with_limits_and_token(
+    token: Option<&str>,
+    limits: WsLimits,
+) -> (std::sync::Arc<Hub>, u16) {
     let hub = Hub::new(HubConfig::default());
     let app = match token {
         Some(t) => router_with_auth(
@@ -47,7 +59,7 @@ async fn spawn_hub_with_token(token: Option<&str>) -> (std::sync::Arc<Hub>, u16)
             HubConfig::default(),
             himan_orchestrator::ApiToken(t.to_string()),
         ),
-        None => router(hub.clone(), HubConfig::default()),
+        None => router_with_limits(hub.clone(), limits),
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -113,6 +125,20 @@ impl RawClient {
         &self.device_id
     }
 
+    /// Whether the server closed the connection, by observing a Close frame
+    /// or the end of the stream.
+    async fn server_closed(stream: &mut WsStream) -> bool {
+        use futures_util::StreamExt;
+        loop {
+            match stream.next().await {
+                None => return true,
+                Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) => return true,
+                Some(Ok(_)) => continue,
+                Some(Err(_)) => return true,
+            }
+        }
+    }
+
     /// Read one frame as a `WireMessage`.
     async fn recv_message(&mut self) -> Option<WireMessage> {
         use futures_util::StreamExt;
@@ -125,12 +151,6 @@ impl RawClient {
                 Err(_) => return None,
             }
         }
-    }
-
-    /// Whether the server closed the connection.
-    async fn is_closed(&mut self) -> bool {
-        use futures_util::StreamExt;
-        self.stream.next().await.is_none()
     }
 }
 
@@ -275,7 +295,7 @@ async fn spawn_hub_with_enrollment(enrollment_json: &str) -> (std::sync::Arc<Hub
     drop(dir);
 
     let hub = Hub::new(HubConfig::default()).with_enrollment(file);
-    let app = router(hub.clone(), HubConfig::default());
+    let app = router_with_limits(hub.clone(), WsLimits::default());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
@@ -610,13 +630,15 @@ async fn rt07_unauthenticated_api_call_is_rejected() {
 // Status: PENDING. The server has no handshake timeout and no message size
 // limit.
 // ---------------------------------------------------------------------------
-
 #[tokio::test]
-#[ignore = "RT-08 pending: WebSocket hardening not implemented"]
 async fn rt08_silent_connection_is_closed() {
-    let (_hub, port) = spawn_hub().await;
+    // A short handshake timeout keeps the test fast.
+    let (_hub, port) = spawn_hub_with_limits(WsLimits {
+        handshake_timeout_secs: 2,
+        ..WsLimits::default()
+    })
+    .await;
 
-    // Connect and send nothing. The server must close within the timeout.
     let (transport, _resp) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
         .await
         .expect("connect");
@@ -626,10 +648,80 @@ async fn rt08_silent_connection_is_closed() {
         device_id: DeviceId::new("pc-1"),
     };
 
-    let closed = tokio::time::timeout(Duration::from_secs(8), client.is_closed())
-        .await
-        .expect("RT-08 FAILED: silent connection was not closed within 8s");
+    // Send nothing; the server must close within the timeout.
+    let closed = tokio::time::timeout(
+        Duration::from_secs(8),
+        RawClient::server_closed(&mut client.stream),
+    )
+    .await
+    .expect("RT-08 FAILED: silent connection was not closed within 8s");
     assert!(closed, "RT-08 FAILED: silent connection stayed open");
+}
+
+#[tokio::test]
+async fn rt08_oversized_frame_is_closed() {
+    use futures_util::SinkExt;
+
+    let (_hub, port) = spawn_hub().await;
+
+    let (transport, _resp) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
+        .await
+        .expect("connect");
+    let mut client = RawClient {
+        stream: transport,
+        key: SigningKey::generate(),
+        device_id: DeviceId::new("pc-1"),
+    };
+
+    // A frame larger than the limit must be refused.
+    let big = "x".repeat(128 * 1024);
+    client
+        .stream
+        .send(tokio_tungstenite::tungstenite::Message::Text(big.into()))
+        .await
+        .expect("send");
+
+    let closed = tokio::time::timeout(
+        Duration::from_secs(8),
+        RawClient::server_closed(&mut client.stream),
+    )
+    .await
+    .expect("RT-08 FAILED: oversized frame did not close the connection");
+    assert!(closed, "RT-08 FAILED: oversized frame was accepted");
+}
+
+#[tokio::test]
+async fn rt08_too_many_invalid_messages_is_closed() {
+    use futures_util::SinkExt;
+
+    let (_hub, port) = spawn_hub().await;
+
+    let (transport, _resp) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
+        .await
+        .expect("connect");
+    let mut client = RawClient {
+        stream: transport,
+        key: SigningKey::generate(),
+        device_id: DeviceId::new("pc-1"),
+    };
+
+    // Send more invalid frames than the limit allows.
+    for _ in 0..16 {
+        let _ = client
+            .stream
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                "{not json".into(),
+            ))
+            .await;
+    }
+
+    let closed = tokio::time::timeout(
+        Duration::from_secs(8),
+        RawClient::server_closed(&mut client.stream),
+    )
+    .await
+    .expect("RT-08 FAILED: invalid messages did not close the connection");
+    assert!(closed, "RT-08 FAILED: invalid messages were tolerated");
 }
 
 // ---------------------------------------------------------------------------

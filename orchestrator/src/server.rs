@@ -28,10 +28,14 @@ use tracing::{info, warn};
 use himan_proto::{DeviceId, Payload, ProtoError, WireMessage};
 
 use crate::hub::{Hub, HubConfig};
-
+/// Application state shared across routes.
 #[derive(Clone)]
 pub struct AppState {
     pub hub: Arc<Hub>,
+    /// Limits applied to every WebSocket connection.
+    pub ws_limits: WsLimits,
+    /// Caps concurrent WebSocket connections.
+    pub ws_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 #[derive(Debug, Serialize)]
@@ -61,7 +65,13 @@ pub struct ErrorResponse {
 }
 
 pub fn router(hub: Arc<Hub>, _config: HubConfig) -> Router {
-    let state = AppState { hub };
+    let state = AppState {
+        hub,
+        ws_limits: WsLimits::default(),
+        ws_semaphore: Arc::new(tokio::sync::Semaphore::new(
+            WsLimits::default().max_connections,
+        )),
+    };
     Router::new()
         .route("/health", get(health))
         .route("/api/v1/agents", get(list_agents))
@@ -70,7 +80,6 @@ pub fn router(hub: Arc<Hub>, _config: HubConfig) -> Router {
         .route("/ws", get(ws_handler))
         .with_state(state)
 }
-
 /// Build the router with API authentication applied.
 ///
 /// When `HIMAN_API_TOKEN` is set, every `/api/v1/*` route requires a bearer
@@ -81,6 +90,15 @@ pub fn router_with_auth(
     _config: HubConfig,
     token: crate::api_auth::ApiToken,
 ) -> Router {
+    // One state instance, cloned into both routers, so the semaphore is shared.
+    let state = AppState {
+        hub: hub.clone(),
+        ws_limits: WsLimits::default(),
+        ws_semaphore: Arc::new(tokio::sync::Semaphore::new(
+            WsLimits::default().max_connections,
+        )),
+    };
+
     let api = Router::new()
         .route("/agents", get(list_agents))
         .route("/audit", get(audit_log))
@@ -89,13 +107,32 @@ pub fn router_with_auth(
             token,
             crate::api_auth::require_token,
         ))
-        .with_state(AppState { hub: hub.clone() });
+        .with_state(state.clone());
 
     Router::new()
         .route("/health", get(health))
         .route("/ws", get(ws_handler))
         .nest("/api/v1", api)
-        .with_state(AppState { hub })
+        .with_state(state)
+}
+
+/// Build a router with custom WebSocket limits and no API token.
+///
+/// Used by tests to exercise the hardening limits (a short handshake timeout
+/// keeps them fast).
+pub fn router_with_limits(hub: Arc<Hub>, limits: WsLimits) -> Router {
+    let state = AppState {
+        hub,
+        ws_limits: limits.clone(),
+        ws_semaphore: Arc::new(tokio::sync::Semaphore::new(limits.max_connections)),
+    };
+    Router::new()
+        .route("/health", get(health))
+        .route("/api/v1/agents", get(list_agents))
+        .route("/api/v1/audit", get(audit_log))
+        .route("/api/v1/prompt", post(prompt))
+        .route("/ws", get(ws_handler))
+        .with_state(state)
 }
 
 /// Load the enrollment file from `HIMAN_ENROLLED_FILE` and attach it.
@@ -150,12 +187,66 @@ async fn prompt(
     }
 }
 
+/// Hardening limits for a WebSocket connection.
+///
+/// These are resource-exhaustion defenses, not confidentiality ones: a silent
+/// or oversized connection consumes a task and a socket indefinitely.
+#[derive(Debug, Clone)]
+pub struct WsLimits {
+    /// Seconds allowed for the first message (the Hello).
+    pub handshake_timeout_secs: u64,
+    /// Maximum accepted text/binary frame size, in bytes.
+    pub max_frame_bytes: usize,
+    /// Maximum concurrent WebSocket connections.
+    pub max_connections: usize,
+    /// Invalid or unparseable messages tolerated before closing.
+    pub max_invalid_messages: usize,
+}
+
+impl Default for WsLimits {
+    fn default() -> Self {
+        Self {
+            handshake_timeout_secs: 10,
+            max_frame_bytes: 64 * 1024,
+            max_connections: 256,
+            max_invalid_messages: 8,
+        }
+    }
+}
+
+/// A connection permit, released when the socket closes.
+pub struct ConnectionGuard(
+    /// Held for the lifetime of the connection, then dropped to release the
+    /// slot. The field is never read; its existence is the point.
+    #[allow(dead_code)]
+    tokio::sync::OwnedSemaphorePermit,
+);
+
+pub async fn acquire_connection(
+    semaphore: &std::sync::Arc<tokio::sync::Semaphore>,
+) -> Option<ConnectionGuard> {
+    let permit = std::sync::Arc::clone(semaphore)
+        .acquire_owned()
+        .await
+        .ok()?;
+    Some(ConnectionGuard(permit))
+}
+
 /// WebSocket handler. The first message must be a signed `Hello`.
 async fn ws_handler(State(state): State<AppState>, ws: WebSocketUpgrade) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_socket(state, socket))
 }
 
 async fn handle_socket(state: AppState, socket: WebSocket) {
+    // Refuse to start when the connection table is full.
+    let _permit = match acquire_connection(&state.ws_semaphore).await {
+        Some(p) => p,
+        None => {
+            tracing::warn!("WebSocket connection refused: too many open connections");
+            return;
+        }
+    };
+
     let (mut sink, mut stream) = socket.split();
     let (tx, mut rx) = tokio::sync::mpsc::channel::<WireMessage>(64);
 
@@ -178,22 +269,61 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
 
     // Receive task: the first frame must be a signed Hello.
     let mut registered: Option<DeviceId> = None;
-    while let Some(Ok(frame)) = stream.next().await {
+    let mut invalid_messages = 0usize;
+    let limits = state.ws_limits.clone();
+
+    loop {
+        // A silent connection must not hold a slot forever.
+        let next = tokio::time::timeout(
+            std::time::Duration::from_secs(limits.handshake_timeout_secs),
+            stream.next(),
+        )
+        .await;
+
+        let frame = match next {
+            Err(_) => {
+                tracing::warn!("WebSocket handshake timed out: no message received");
+                break;
+            }
+            Ok(Some(Ok(f))) => f,
+            Ok(Some(Err(e))) => {
+                tracing::warn!(error = %e, "WebSocket read error");
+                break;
+            }
+            Ok(None) => break,
+        };
+
         let text = match frame {
             AxumMessage::Text(t) => t.to_string(),
-            AxumMessage::Binary(b) => match String::from_utf8(b.to_vec()) {
-                Ok(s) => s,
-                Err(_) => continue,
-            },
+            AxumMessage::Binary(b) => {
+                if b.len() > limits.max_frame_bytes {
+                    tracing::warn!(len = b.len(), "oversized binary frame rejected");
+                    break;
+                }
+                match String::from_utf8(b.to_vec()) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                }
+            }
             AxumMessage::Close(_) => break,
             _ => continue,
         };
+
+        if text.len() > limits.max_frame_bytes {
+            tracing::warn!(len = text.len(), "oversized text frame rejected");
+            break;
+        }
 
         let msg: WireMessage = match serde_json::from_str(&text) {
             Ok(m) => m,
             Err(e) => {
                 warn!(error = %e, "invalid message from agent");
-                break;
+                invalid_messages += 1;
+                if invalid_messages >= limits.max_invalid_messages {
+                    warn!("too many invalid messages, closing connection");
+                    break;
+                }
+                continue;
             }
         };
 

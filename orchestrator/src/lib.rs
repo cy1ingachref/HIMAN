@@ -23,7 +23,7 @@ pub use orchkey::{
 };
 pub use policy::{Decision, PolicyConfig, PolicyEngine};
 pub use presence::{PresenceManager, PresenceSnapshot};
-pub use server::{router, router_with_auth, serve, AppState};
+pub use server::{router, router_with_auth, router_with_limits, serve, AppState, WsLimits};
 pub use state::{StateStore, TaskRecord};
 
 pub use himan_agent_core::init_logging;
