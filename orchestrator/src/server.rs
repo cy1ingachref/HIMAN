@@ -198,9 +198,9 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
     }
 
     if let Some(id) = registered {
-        info!(device = %id, "agent disconnected");
-        let mut agents = state.hub.agents().await;
-        agents.retain(|a| a.id != id);
+        // Remove the session from the hub, not just from a local list. The
+        // hub's copy is what dispatch() looks at.
+        state.hub.unregister(&id).await;
     }
     drop(tx);
     send_task.abort();

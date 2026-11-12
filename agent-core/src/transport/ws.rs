@@ -2,6 +2,17 @@
 //!
 //! Thin wrapper over `tokio-tungstenite` with `rustls`. Messages cross as
 //! JSON text frames, one `WireMessage` per frame.
+//!
+//! The read half is NOT behind the sink mutex. A reader parked on
+//! `stream.next().await` blocks until a frame arrives, so putting it under the
+//! same lock as writes makes `send()` wait forever.
+//!
+//! That was a real bug. The first version wrapped the whole socket in one
+//! `Mutex<WebSocketStream>`; the read pump held that lock across
+//! `.next().await`, so `send_message()` never acquired it and the Hello was
+//! never written. It presented as an intermittent hang that depended on which
+//! task won the lock race — it passed when the agent was launched from a
+//! terminal and failed when launched from Python.
 
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -10,42 +21,65 @@ use crate::transport::{Connection, Shutdown, TransportError};
 use himan_proto::WireMessage;
 
 /// A WebSocket connection to an orchestrator.
+///
+/// `sink` is mutex-guarded because writes are serialized. `stream` is not
+/// guarded because a pending read must not block a write.
 #[derive(Debug)]
 pub struct WsTransport {
-    sink: tokio::sync::Mutex<
-        tokio_tungstenite::WebSocketStream<
-            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-        >,
-    >,
+    sink: tokio::sync::Mutex<SocketSink>,
+    stream: tokio::sync::Mutex<SocketStream>,
 }
 
+/// The write half of a connected WebSocket.
+pub type SocketSink = futures_util::stream::SplitSink<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    WsMessage,
+>;
+
+/// The read half of a connected WebSocket.
+pub type SocketStream = futures_util::stream::SplitStream<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+>;
+
 impl WsTransport {
-    /// Connect to `url` (e.g. `ws://127.0.0.1:8787/ws`).
+    /// Connect to `url` (e.g. `ws://127.0.0.1:8787/ws`) and split the socket.
     pub async fn connect(url: &str) -> Result<Self, TransportError> {
-        let (stream, _response) = tokio_tungstenite::connect_async(url)
+        let (socket, _response) = tokio_tungstenite::connect_async(url)
             .await
             .map_err(|e| TransportError::WebSocket(e.to_string()))?;
-        Ok(Self {
-            sink: tokio::sync::Mutex::new(stream),
-        })
+        Ok(Self::from_socket(socket))
     }
 
-    /// Wrap an already-connected stream (used by tests).
-    pub fn from_stream(
-        stream: tokio_tungstenite::WebSocketStream<
+    /// Wrap an already-connected socket by splitting it.
+    pub fn from_socket(
+        socket: tokio_tungstenite::WebSocketStream<
             tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
         >,
     ) -> Self {
+        let (sink, stream) = socket.split();
         Self {
-            sink: tokio::sync::Mutex::new(stream),
+            sink: tokio::sync::Mutex::new(sink),
+            stream: tokio::sync::Mutex::new(stream),
         }
     }
 
+    /// Send a message. Takes the sink lock only for the duration of the write.
+    pub async fn send_message(&self, msg: &WireMessage) -> Result<(), TransportError> {
+        let json = serde_json::to_string(msg)?;
+        let mut sink = self.sink.lock().await;
+        sink.send(WsMessage::Text(json.into()))
+            .await
+            .map_err(|e| TransportError::WebSocket(e.to_string()))
+    }
+
     /// Read one message. Returns `None` on clean close.
+    ///
+    /// Callers hold the stream lock while awaiting a frame. That is safe only
+    /// because the sink is a separate lock.
     pub async fn next_message(&self) -> Option<Result<WireMessage, TransportError>> {
-        let mut guard = self.sink.lock().await;
+        let mut stream = self.stream.lock().await;
         loop {
-            match guard.next().await {
+            match stream.next().await {
                 Some(Ok(WsMessage::Text(text))) => {
                     return Some(serde_json::from_str(&text).map_err(TransportError::from));
                 }
@@ -59,29 +93,18 @@ impl WsTransport {
         }
     }
 
-    /// Send a message.
-    pub async fn send_message(&self, msg: &WireMessage) -> Result<(), TransportError> {
-        let json = serde_json::to_string(msg)?;
-        let mut guard = self.sink.lock().await;
-        guard
-            .send(WsMessage::Text(json.into()))
-            .await
-            .map_err(|e| TransportError::WebSocket(e.to_string()))
-    }
-
     /// Close the connection.
     pub async fn close(&self) {
-        let mut guard = self.sink.lock().await;
-        let _ = guard.close(None).await;
+        let mut sink = self.sink.lock().await;
+        let _ = sink.close().await;
     }
 }
 
-/// Build a `Connection` around a WebSocket by pumping `next_message` into a
-/// channel.
+/// Build a `Connection` around a WebSocket.
 ///
-/// The `Sender` impl must go to the socket, not into the receive channel:
-/// routing outgoing messages through the pump would make an agent read its own
-/// messages back, which is exactly the bug this design avoids.
+/// Outgoing messages go to the socket's sink half; incoming frames are pumped
+/// into the receive channel from the stream half. The two directions use
+/// separate locks, so a parked reader cannot block a writer.
 pub fn connection_from_socket(
     transport: std::sync::Arc<WsTransport>,
     capacity: usize,
@@ -101,7 +124,7 @@ pub fn connection_from_socket(
                             break; // receiver dropped
                         }
                     }
-                    Err(_) => break, // protocol or socket error ends the pump
+                    Err(_) => break,
                 }
             }
             shutdown.stop().await;
@@ -113,6 +136,7 @@ pub fn connection_from_socket(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use std::time::Duration;
 
     /// The socket adapter must not feed a peer's outbound messages back into
@@ -139,13 +163,10 @@ mod tests {
             }
         });
 
-        // Connect through the real transport.
         let url = format!("ws://{addr}/");
-        let transport =
-            std::sync::Arc::new(crate::transport::WsTransport::connect(&url).await.unwrap());
+        let transport = std::sync::Arc::new(WsTransport::connect(&url).await.unwrap());
         let conn = crate::transport::ws::connection_from_socket(transport, 8);
 
-        // Send one message from the agent.
         let sk = himan_proto::SigningKey::generate();
         let msg = himan_proto::WireMessage::sign(
             himan_proto::WireMeta {
@@ -160,8 +181,7 @@ mod tests {
         .unwrap();
         conn.send(msg).await.unwrap();
 
-        // The server must have received it.
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
         let got = received.lock().await;
         assert_eq!(got.len(), 1, "server must receive exactly one frame");
         assert!(
@@ -169,9 +189,8 @@ mod tests {
             "frame must carry our nonce"
         );
 
-        // And the agent must NOT receive its own message back: recv() would
-        // hang if the echo bug were present, so the timeout proves absence.
-        let echoed = tokio::time::timeout(std::time::Duration::from_millis(300), conn.recv()).await;
+        // And the agent must NOT receive its own message back.
+        let echoed = tokio::time::timeout(Duration::from_millis(300), conn.recv()).await;
         assert!(
             echoed.is_err(),
             "socket adapter must not echo outbound messages back to the sender"
@@ -182,8 +201,6 @@ mod tests {
 
     #[tokio::test]
     async fn socket_adapter_delivers_inbound_messages() {
-        // Same setup, but the server sends a message and the agent must
-        // receive it. Proves the inbound direction works independently.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -191,7 +208,7 @@ mod tests {
             use futures_util::{SinkExt, StreamExt};
             let (stream, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
-            // Wait for the agent's frame, then reply with a Pong.
+
             let ping = tokio::time::timeout(Duration::from_secs(3), ws.next())
                 .await
                 .expect("server should receive the agent's frame")
@@ -218,13 +235,11 @@ mod tests {
             ws.send(tokio_tungstenite::tungstenite::Message::Text(json.into()))
                 .await
                 .unwrap();
-            // Keep the socket open long enough for the client to read the reply.
             tokio::time::sleep(Duration::from_millis(500)).await;
         });
 
         let url = format!("ws://{addr}/");
-        let transport =
-            std::sync::Arc::new(crate::transport::WsTransport::connect(&url).await.unwrap());
+        let transport = std::sync::Arc::new(WsTransport::connect(&url).await.unwrap());
         let conn = crate::transport::ws::connection_from_socket(transport, 8);
 
         let sk = himan_proto::SigningKey::generate();
@@ -244,12 +259,90 @@ mod tests {
         .await
         .unwrap();
 
-        let got = tokio::time::timeout(std::time::Duration::from_secs(3), conn.recv())
+        let got = tokio::time::timeout(Duration::from_secs(3), conn.recv())
             .await
             .expect("inbound message must arrive")
             .expect("some message");
         match got.payload {
             himan_proto::Payload::Pong { nonce } => assert_eq!(nonce, 7),
+            other => panic!("expected Pong, got {}", other.kind_name()),
+        }
+
+        server.abort();
+    }
+
+    /// A parked reader must not block a writer.
+    ///
+    /// Regression test for the deadlock where one mutex covered both halves
+    /// and the read pump held it across `.next().await`, so `send()` never
+    /// acquired it and the Hello was never written.
+    #[tokio::test]
+    async fn parked_reader_does_not_block_the_writer() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            use futures_util::{SinkExt, StreamExt};
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _ = tokio::time::timeout(Duration::from_secs(3), ws.next()).await;
+            for nonce in 1..=2 {
+                let sk = himan_proto::SigningKey::generate();
+                let msg = himan_proto::WireMessage::sign(
+                    himan_proto::WireMeta {
+                        seq: nonce,
+                        ts: chrono::Utc::now().timestamp(),
+                        from: himan_proto::DeviceId::new("orchestrator"),
+                        to: "pc-1".into(),
+                    },
+                    himan_proto::Payload::Pong { nonce },
+                    &sk,
+                )
+                .unwrap();
+                ws.send(tokio_tungstenite::tungstenite::Message::Text(
+                    serde_json::to_string(&msg).unwrap().into(),
+                ))
+                .await
+                .unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        });
+
+        let url = format!("ws://{addr}/");
+        let transport = std::sync::Arc::new(WsTransport::connect(&url).await.unwrap());
+        let conn = crate::transport::ws::connection_from_socket(transport, 8);
+
+        // Park a reader, then send. With the shared-lock bug this deadlocks.
+        let reader = tokio::spawn({
+            let conn = conn.clone();
+            async move { conn.recv().await }
+        });
+        tokio::task::yield_now().await;
+
+        let sk = himan_proto::SigningKey::generate();
+        conn.send(
+            himan_proto::WireMessage::sign(
+                himan_proto::WireMeta {
+                    seq: 1,
+                    ts: chrono::Utc::now().timestamp(),
+                    from: himan_proto::DeviceId::new("pc-1"),
+                    to: "orchestrator".into(),
+                },
+                himan_proto::Payload::Ping { nonce: 42 },
+                &sk,
+            )
+            .unwrap(),
+        )
+        .await
+        .expect("send must not deadlock while the reader is parked");
+
+        let got = tokio::time::timeout(Duration::from_secs(3), reader)
+            .await
+            .expect("reader must finish")
+            .expect("task must not panic")
+            .expect("inbound message must arrive");
+        match got.payload {
+            himan_proto::Payload::Pong { .. } => {}
             other => panic!("expected Pong, got {}", other.kind_name()),
         }
 

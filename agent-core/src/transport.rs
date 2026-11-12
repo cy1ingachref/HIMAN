@@ -125,6 +125,9 @@ impl Connection {
     /// Outgoing messages go straight to the socket; incoming messages are
     /// pumped into the receiver by the caller. Mixing the two directions
     /// through one channel would let a peer read its own messages back.
+    ///
+    /// `WsTransport` guards its sink and stream with separate locks, so the
+    /// transport itself is the synchronization point; no outer mutex here.
     pub fn from_socket(
         transport: Arc<WsTransport>,
         receiver: Receiver,

@@ -372,6 +372,26 @@ impl Hub {
         })
     }
 
+    /// Remove a device from the live session table.
+    ///
+    /// Without this, a disconnected agent leaves a stale session whose sender
+    /// points at a closed channel, and dispatch to the next agent with the
+    /// same id fails with "agent queue full or closed".
+    pub async fn unregister(&self, id: &DeviceId) {
+        let mut agents = self.agents.lock().await;
+        if agents.remove(id).is_some() {
+            let mut presence = self.presence.lock().await;
+            presence.unregister(id);
+            let mut audit = self.audit.lock().await;
+            audit.append(
+                "agent_unregistered".into(),
+                id.to_string(),
+                "disconnected".into(),
+            );
+            info!(device = %id, "agent unregistered");
+        }
+    }
+
     /// Read a task record.
     pub async fn task(&self, id: &TaskId) -> Option<himan_proto::TaskState> {
         let store = self.store.lock().await;
