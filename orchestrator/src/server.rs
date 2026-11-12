@@ -71,6 +71,33 @@ pub fn router(hub: Arc<Hub>, _config: HubConfig) -> Router {
         .with_state(state)
 }
 
+/// Build the router with API authentication applied.
+///
+/// When `HIMAN_API_TOKEN` is set, every `/api/v1/*` route requires a bearer
+/// token. `/health` stays open so a load balancer can probe without one, and
+/// `/ws` is unaffected because agents authenticate by signature.
+pub fn router_with_auth(
+    hub: Arc<Hub>,
+    _config: HubConfig,
+    token: crate::api_auth::ApiToken,
+) -> Router {
+    let api = Router::new()
+        .route("/agents", get(list_agents))
+        .route("/audit", get(audit_log))
+        .route("/prompt", post(prompt))
+        .route_layer(axum::middleware::from_fn_with_state(
+            token,
+            crate::api_auth::require_token,
+        ))
+        .with_state(AppState { hub: hub.clone() });
+
+    Router::new()
+        .route("/health", get(health))
+        .route("/ws", get(ws_handler))
+        .nest("/api/v1", api)
+        .with_state(AppState { hub })
+}
+
 /// Load the enrollment file from `HIMAN_ENROLLED_FILE` and attach it.
 ///
 /// Returns an error when the variable is set but the file cannot be read or
@@ -238,8 +265,25 @@ fn build_welcome(hub: &Hub, device: &DeviceId, nonce: &str) -> Result<WireMessag
 }
 
 /// Spawn the server on `127.0.0.1:port`.
+/// Serve the orchestrator.
+///
+/// When `HIMAN_API_TOKEN` is set, the HTTP API requires a bearer token.
+/// The token is never printed; only whether auth is enabled.
 pub async fn serve(hub: Arc<Hub>, port: u16) -> Result<(), std::io::Error> {
-    let app = router(hub.clone(), HubConfig::default());
+    let token = crate::api_auth::ApiToken::from_env();
+    let app = match token {
+        Some(t) => {
+            tracing::info!("API authentication enabled");
+            router_with_auth(hub.clone(), HubConfig::default(), t)
+        }
+        None => {
+            tracing::warn!(
+                "HIMAN_API_TOKEN is not set: the HTTP API is open. \
+                 Set it before exposing the port."
+            );
+            router(hub.clone(), HubConfig::default())
+        }
+    };
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
     info!(port, "orchestrator listening on 127.0.0.1");
     axum::serve(listener, app).await

@@ -14,7 +14,7 @@
 
 use std::time::Duration;
 
-use himan_orchestrator::{router, Hub, HubConfig};
+use himan_orchestrator::{router, router_with_auth, Hub, HubConfig};
 use himan_proto::{
     DeviceClass, DeviceId, DeviceInfo, Payload, SigningKey, TaskState, WireMessage, WireMeta,
 };
@@ -35,8 +35,20 @@ async fn wait_for_port(port: u16) {
 
 /// Spawn the real orchestrator router on an ephemeral port.
 async fn spawn_hub() -> (std::sync::Arc<Hub>, u16) {
+    spawn_hub_with_token(None).await
+}
+
+/// Spawn the real orchestrator router with API auth enabled.
+async fn spawn_hub_with_token(token: Option<&str>) -> (std::sync::Arc<Hub>, u16) {
     let hub = Hub::new(HubConfig::default());
-    let app = router(hub.clone(), HubConfig::default());
+    let app = match token {
+        Some(t) => router_with_auth(
+            hub.clone(),
+            HubConfig::default(),
+            himan_orchestrator::ApiToken(t.to_string()),
+        ),
+        None => router(hub.clone(), HubConfig::default()),
+    };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
@@ -527,12 +539,12 @@ async fn rt06_task_ids_are_unique_within_a_second() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore = "RT-07 pending: API authentication not implemented"]
 async fn rt07_unauthenticated_api_call_is_rejected() {
-    let (_hub, port) = spawn_hub().await;
+    let (_hub, port) = spawn_hub_with_token(Some("s3cret-token")).await;
+
+    let client = reqwest::Client::new();
 
     // No Authorization header at all.
-    let client = reqwest::Client::new();
     let status = client
         .post(format!("http://127.0.0.1:{port}/api/v1/prompt"))
         .json(&serde_json::json!({"device": "pc-1", "prompt": "status"}))
@@ -557,6 +569,35 @@ async fn rt07_unauthenticated_api_call_is_rejected() {
     assert_eq!(
         status, 401,
         "RT-07 FAILED: a wrong token returned {status}, expected 401"
+    );
+
+    // The correct token passes authentication. With no agent connected the
+    // dispatch itself fails, so the expected status is 400 (not 401): the
+    // point is that auth no longer rejects it.
+    let status = client
+        .post(format!("http://127.0.0.1:{port}/api/v1/prompt"))
+        .header("Authorization", "Bearer s3cret-token")
+        .json(&serde_json::json!({"device": "pc-1", "prompt": "status"}))
+        .send()
+        .await
+        .expect("request")
+        .status();
+    assert_eq!(
+        status, 400,
+        "RT-07 FAILED: the correct token should pass auth (400 from dispatch, \
+         not 401), got {status}"
+    );
+
+    // /health must stay open without a token.
+    let status = client
+        .get(format!("http://127.0.0.1:{port}/health"))
+        .send()
+        .await
+        .expect("request")
+        .status();
+    assert_eq!(
+        status, 200,
+        "RT-07 FAILED: /health should stay open, got {status}"
     );
 }
 
