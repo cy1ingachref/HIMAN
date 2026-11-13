@@ -144,10 +144,30 @@ the latter because agents authenticate by signature.
 |---|---|---|
 | `HIMAN_PORT` | orchestrator | Listen port (default 8787) |
 | `HIMAN_ORCH_KEY_FILE` | orchestrator | Persisted signing key seed |
-| `HIMAN_ENROLLED_FILE` | orchestrator | Device id → public key map |
-| `HIMAN_API_TOKEN` | orchestrator | HTTP bearer token |
+| `HIMAN_ENROLLED_FILE` | orchestrator | Device id → public key map (**required**) |
+| `HIMAN_API_TOKEN` | orchestrator | HTTP bearer token (**required**) |
+| `HIMAN_INSECURE_DEV` | orchestrator | Set to `1` to start without a token or enrollment file |
 | `HIMAN_AGENT_KEY_FILE` | agent | Persisted signing key seed |
 | `HIMAN_ORCH_KEY` | agent | Pinned orchestrator public key |
+| `HIMAN_KEEPALIVE_SECS` | agent | Signed Ping interval, default 60 |
+
+## Fail-closed startup
+
+The orchestrator refuses to start unless **both** `HIMAN_API_TOKEN` and
+`HIMAN_ENROLLED_FILE` are set. The failure names the missing variable and exits
+with status 1; it is not a warning.
+
+Setting `HIMAN_INSECURE_DEV=1` allows startup with either protection missing,
+but logs a loud `INSECURE DEV MODE` warning for each one. Only the exact value
+`1` enables it — `true`, `yes` and `0` do not, so a near-miss cannot silently
+disable a control.
+
+    $ himan-orchestrator
+    ERROR refusing to start: HIMAN_API_TOKEN is not set, so the HTTP API would
+    be open. Set it, or set HIMAN_INSECURE_DEV=1 to acknowledge the risk.
+
+Tests: `orchestrator/tests/startup.rs` covers all four cases (no token, no
+enrollment file, insecure mode, both protections present).
 
 Key files contain a base64 Ed25519 seed. They are secrets: never committed,
 never logged, never printed. Only derived public keys are printed.

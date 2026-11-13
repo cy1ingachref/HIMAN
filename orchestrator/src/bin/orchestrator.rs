@@ -4,6 +4,16 @@ use himan_orchestrator::{serve, Hub, HubConfig};
 async fn main() {
     himan_orchestrator::init_logging();
 
+    // Fail closed: refuse to start with the API open or no enrollment unless
+    // HIMAN_INSECURE_DEV=1 is set explicitly.
+    if let Err(e) =
+        himan_orchestrator::enforce_startup(&himan_orchestrator::StartupRequirements::default())
+    {
+        tracing::error!(error = %e, "refusing to start");
+        std::process::exit(1);
+    }
+    himan_orchestrator::log_posture();
+
     let port: u16 = std::env::var("HIMAN_PORT")
         .ok()
         .and_then(|v| v.parse().ok())

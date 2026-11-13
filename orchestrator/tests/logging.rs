@@ -34,9 +34,22 @@ fn run_and_capture(name: &str, args: &[(&str, &str)]) -> String {
     for (flag, value) in args {
         cmd.arg(flag).arg(value);
     }
-    cmd.env_remove("RUST_LOG")
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
+    // Drop any inherited HIMAN_* so this test is hermetic, but keep the OS
+    // variables needed to bind a socket.
+    for (k, v) in std::env::vars() {
+        if !k.starts_with("HIMAN_") {
+            cmd.env(k, v);
+        }
+    }
+    cmd.env_remove("RUST_LOG");
+
+    // The orchestrator now fails closed without these, which would make the
+    // "startup logs INFO" assertion meaningless.
+    if name.contains("orchestrator") {
+        cmd.env("HIMAN_INSECURE_DEV", "1");
+    }
+
+    cmd.stdout(Stdio::null()).stderr(Stdio::piped());
 
     let mut child = cmd.spawn().expect("spawn");
     // Give the process time to attempt the connection and log the outcome.

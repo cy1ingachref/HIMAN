@@ -51,9 +51,13 @@ async fn wait_for_port(port: u16) {
     panic!("server on port {port} never came up");
 }
 
+/// The token the e2e orchestrator is started with.
+const API_TOKEN: &str = "e2e-test-token";
+
 fn http_get(port: u16, path: &str) -> Value {
     let url = format!("http://127.0.0.1:{port}{path}");
     let body = ureq::get(&url)
+        .set("Authorization", &format!("Bearer {API_TOKEN}"))
         .call()
         .expect("GET")
         .into_string()
@@ -86,6 +90,9 @@ impl Orchestrator {
             .env("HIMAN_PORT", port.to_string())
             .env("HIMAN_ORCH_KEY_FILE", &key_file)
             .env("HIMAN_ENROLLED_FILE", &enrollment_file)
+            // The orchestrator fails closed without a token, so the e2e run sets
+            // one even though this test does not call the authenticated routes.
+            .env("HIMAN_API_TOKEN", API_TOKEN)
             .env_remove("RUST_LOG")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -186,6 +193,7 @@ async fn e2e_real_binaries_round_trip() {
 
     // The agent must be reachable for dispatch.
     let prompt = ureq::post(&format!("http://127.0.0.1:{}/api/v1/prompt", orch.port))
+        .set("Authorization", &format!("Bearer {API_TOKEN}"))
         .send_json(serde_json::json!({"device": "pc-1", "prompt": "status"}));
     match prompt {
         Ok(resp) => {

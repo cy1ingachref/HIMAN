@@ -11,7 +11,10 @@ pub mod orchkey;
 pub mod policy;
 pub mod presence;
 pub mod server;
+pub mod startup;
 pub mod state;
+
+pub use startup::{enforce_startup, insecure_dev_enabled, log_posture, StartupRequirements};
 
 pub use api_auth::{constant_time_eq, ApiToken};
 pub use audit::{AuditEvent, AuditLog};

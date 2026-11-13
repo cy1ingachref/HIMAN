@@ -52,9 +52,16 @@ Test layers:
 
 ## Running it
 
+The orchestrator fails closed: it will not start without both an API token and
+an enrollment file. For local development only, `HIMAN_INSECURE_DEV=1` overrides
+that check and logs a loud warning for each missing protection.
+
     # terminal 1: orchestrator
-    HIMAN_PORT=8787 HIMAN_ORCH_KEY_FILE=./orchestrator.key \
-    HIMAN_ENROLLED_FILE=./enrolled.json cargo run -p himan-orchestrator
+    HIMAN_PORT=8787 \
+    HIMAN_ORCH_KEY_FILE=./orchestrator.key \
+    HIMAN_ENROLLED_FILE=./enrolled.json \
+    HIMAN_API_TOKEN=$(openssl rand -hex 32) \
+        cargo run -p himan-orchestrator
 
     # terminal 2: agent
     cargo run -p himan-agent-pc -- --ws ws://127.0.0.1:8787/ws \
@@ -63,6 +70,10 @@ Test layers:
 `enrolled.json` maps device id to the agent's public key. Generate it with
 `himan-agent-pc keygen --out ./agent.key` and copy the printed public key.
 See `docs/PROTOCOL.md` for every configuration variable.
+
+The agent sends a signed keepalive `Ping` every `HIMAN_KEEPALIVE_SECS`
+(default 60, well below the orchestrator's 300s idle timeout) and reconnects if
+the orchestrator stops answering.
 
 ## Security model
 
