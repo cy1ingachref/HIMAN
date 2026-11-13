@@ -13,19 +13,56 @@ keys are fine.
 |---|---|---|---|---|---|---|
 | RT-01 | Handshake reflection | Agent rejects an echoed Hello | `rt01_agent_rejects_reflected_hello` | PASS | PASS | already defended |
 | RT-02 | Wrong nonce in Welcome | Agent rejects a nonce mismatch | `rt02_wrong_nonce_is_rejected` | PASS | PASS | already defended |
-| RT-03 | Identity takeover | Reject a new key for a connected id | `rt03_identity_takeover_is_rejected` | IGNORED | PASS | `9052a62` |
-| RT-04 | Fake orchestrator | Agent rejects an unpinned key | `rt04_fake_orchestrator_is_rejected` | IGNORED | PASS | `a1e3406` |
-| RT-05 | ToolResult replay | Hub rejects seq <= last | `rt05_tool_result_replay_is_rejected` | IGNORED | PASS | `ef2e78a` |
+| RT-03 | Identity takeover | Reject a new key for a connected id | `rt03_identity_takeover_is_rejected` | **SUCCEEDED** (real binaries) | PASS | `9052a62` |
+| RT-04 | Fake orchestrator | Agent rejects an unpinned key | `rt04_fake_orchestrator_is_rejected` | **SUCCEEDED** (real binaries) | PASS | `a1e3406` |
+| RT-05 | ToolResult replay | Hub rejects seq <= last | `rt05_tool_result_replay_is_rejected` | IGNORED (no seq tracking) | PASS | `ef2e78a` |
 | RT-06 | Task-id collision | Random 128-bit task ids | `rt06_task_ids_are_unique_within_a_second` | **FAIL** | PASS | `8e6c61d` |
-| RT-07 | Unauthenticated API call | 401 without a valid bearer token | `rt07_unauthenticated_api_call_is_rejected` | IGNORED | PASS | `65fd428` |
-| RT-08 | Silent / oversized WebSocket | Socket closed within the timeout | `rt08_*` (3 tests) | IGNORED | PASS | `1607877` |
+| RT-07 | Unauthenticated API call | 401 without a valid bearer token | `rt07_unauthenticated_api_call_is_rejected` | **SUCCEEDED** (real binaries) | PASS | `65fd428` |
+| RT-08 | Silent / oversized WebSocket | Socket closed within the timeout | `rt08_*` (3 tests) | IGNORED (no limits) | PASS | `1607877` |
 
 ## Before-state evidence
 
-Captured by running `cargo test -p himan-orchestrator --test redteam` at
-commit `b50677f` (the commit before the fixes).
+Two kinds of evidence, both real output rather than assumptions.
 
-### RT-06 fails (the one real defect found before fixes)
+### Against the old binaries at `b50677f`
+
+A temporary worktree checked out `b50677f` and its binaries were attacked
+directly by an external script. This proves what a real attacker could do,
+not just what the test harness asserted. All six checks succeeded:
+
+```
+SUCCEEDED  RT-07 POST /api/v1/prompt with NO token is accepted  -- HTTP 400 (reached dispatch)
+SUCCEEDED  RT-07 GET /api/v1/agents with NO token is accepted  -- HTTP 200
+SUCCEEDED  RT-03 first pc-1 gets a Welcome                      -- {"meta":{"seq":0,...}}
+SUCCEEDED  RT-03 DUPLICATE id with a DIFFERENT key also gets a Welcome
+SUCCEEDED  RT-03 the duplicate session REPLACED the legitimate one -- agents=1
+SUCCEEDED  RT-04 agent accepts a Welcome signed by an UNKNOWN key -- agent stopped
+
+Attacks that succeeded at b50677f: 6/6
+```
+
+What each proves:
+
+- **RT-07**: the API answered unauthenticated requests. `GET /api/v1/agents`
+  returned 200 with device metadata; `POST /api/v1/prompt` reached dispatch
+  (400 only because no agent was connected). Anyone who could reach the port
+  could enumerate devices and attempt dispatch.
+- **RT-03**: a second client presenting a *different* key for the same device
+  id received a full `Welcome`. The hub then held one session for `pc-1`
+  owned by the attacker's key — the legitimate agent's session was replaced,
+  so the attacker could receive that device's tool calls.
+- **RT-04**: a fake orchestrator signing its own `Welcome` with its own key was
+  accepted and the agent proceeded to "agent stopped" only when the test killed
+  it, not on any security check. The agent trusted whichever key the Welcome
+  advertised.
+
+The worktree was removed after the run.
+
+### From the red-team test suite at `b50677f`
+
+Captured by running `cargo test -p himan-orchestrator --test redteam`.
+
+#### RT-06 fails (the one real defect found before fixes)
 
 ```
 thread 'rt06_task_ids_are_unique_within_a_second' (8656) panicked at orchestrator\tests\redteam.rs:446:5:
@@ -41,14 +78,14 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 7 filtered out
 Cause: the task id was derived from `Utc::now().timestamp()`, so two dispatches
 in the same second collided. The tool-call nonce had the same defect.
 
-### RT-01 and RT-02 pass already
+#### RT-01 and RT-02 pass already
 
 ```
 test rt01_agent_rejects_reflected_hello ... ok
 test rt02_wrong_nonce_is_rejected ... ok
 ```
 
-### RT-03, RT-04, RT-05, RT-07, RT-08 pending
+#### RT-03, RT-04, RT-05, RT-07, RT-08 pending at that commit
 
 ```
 test rt03_identity_takeover_is_rejected ... ignored, RT-03 pending: enrollment not implemented
@@ -57,6 +94,10 @@ test rt05_tool_result_replay_is_rejected ... ignored, RT-05 pending: sequence tr
 test rt07_unauthenticated_api_call_is_rejected ... ignored, RT-07 pending: API authentication not implemented
 test rt08_silent_connection_is_closed ... ignored, RT-08 pending: WebSocket hardening not implemented
 ```
+
+These were `#[ignore]` placeholders written against the intended behavior, so
+the suite stayed green while the defenses did not exist. The binary-level
+attack above is the evidence that the gap was real.
 
 ## After-state
 
