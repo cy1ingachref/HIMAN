@@ -17,4 +17,4 @@ pub mod transport;
 pub use llm::{ChatBackend, ChatMessage, ChatRequest, ChatResponse, ScriptedBackend};
 pub use logging::init as init_logging;
 pub use tool::{Tool, ToolError, ToolOutput, ToolRegistry};
-pub use transport::{Connection, TransportError, WsTransport};
+pub use transport::{Connection, KeepaliveSender, TransportError, WsTransport};

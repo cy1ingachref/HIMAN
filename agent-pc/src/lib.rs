@@ -6,10 +6,12 @@
 
 pub mod agent_loop;
 pub mod client;
+pub mod keepalive;
 pub mod key;
 pub mod tools;
 
 pub use agent_loop::{AgentLoop, LoopOutcome};
 pub use client::{connect_ws, AgentClient};
+pub use keepalive::{configured_interval, default_interval, parse_interval};
 pub use key::{keygen, load_from_file, load_or_generate, save_to_file};
 pub use tools::{DeviceStatusTool, RunDiagnosticTool};

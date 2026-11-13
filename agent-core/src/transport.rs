@@ -83,6 +83,16 @@ enum SenderKind {
     Socket(Arc<WsTransport>),
 }
 
+/// A cloneable send-only handle for background tasks such as keepalive.
+///
+/// The agent's main loop blocks in [`Connection::recv`], so the keepalive
+/// ticker needs its own handle to send Pings concurrently.
+#[derive(Clone)]
+pub enum KeepaliveSender {
+    Channel(mpsc::Sender<WireMessage>),
+    Socket(Arc<WsTransport>),
+}
+
 impl Connection {
     /// Create a paired in-memory connection. Side A's sent messages arrive on
     /// side B and vice versa.
@@ -177,6 +187,29 @@ impl Connection {
         match &self.sender {
             SenderKind::Channel(tx) => Some(tx),
             SenderKind::Socket(_) => None,
+        }
+    }
+
+    /// A cloneable send-only handle for background tasks.
+    ///
+    /// Used by the agent's keepalive task, which must send Pings while the main
+    /// loop is blocked in [`recv`](Self::recv). For a socket-backed connection
+    /// this shares the same transport, so it is independent of the receiver.
+    pub fn keepalive_sender(&self) -> Option<KeepaliveSender> {
+        match &self.sender {
+            SenderKind::Channel(tx) => Some(KeepaliveSender::Channel(tx.clone())),
+            SenderKind::Socket(t) => Some(KeepaliveSender::Socket(Arc::clone(t))),
+        }
+    }
+
+    /// Send one message through a [`KeepaliveSender`].
+    pub async fn send_via(
+        sender: &KeepaliveSender,
+        msg: WireMessage,
+    ) -> Result<(), TransportError> {
+        match sender {
+            KeepaliveSender::Channel(tx) => tx.send(msg).await.map_err(|_| TransportError::Closed),
+            KeepaliveSender::Socket(t) => t.send_message(&msg).await,
         }
     }
 }

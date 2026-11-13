@@ -10,7 +10,7 @@ use himan_agent_core::transport::Connection;
 use himan_proto::{
     DeviceId, DeviceInfo, Payload, SigningKey, TaskState, VerifyingKey, WireMessage, WireMeta,
 };
-use tracing::{info, warn};
+use tracing::{info, trace, warn};
 
 use crate::tools::registry;
 
@@ -85,10 +85,27 @@ pub struct AgentClient {
     pinned_orchestrator_key: Option<VerifyingKey>,
     /// Tool calls already executed, so a replayed call is not run twice.
     seen_nonces: std::sync::Mutex<NonceCache>,
+    /// Keepalive interval; defaults to 60s when unset or invalid.
+    keepalive_interval: std::time::Duration,
+    /// Number of keepalive pings sent in this session.
+    keepalive_pings: u64,
+    /// Number of Pongs received. A stall means the orchestrator is gone and the
+    /// agent should reconnect.
+    pongs_received: u64,
+    /// Send handle for the keepalive task.
+    keepalive_sender: Option<himan_agent_core::KeepaliveSender>,
 }
 
 impl AgentClient {
     pub fn new(device_id: DeviceId, key: SigningKey, conn: Connection) -> Self {
+        let (keepalive_interval, configured) = crate::keepalive::configured_interval();
+        if !configured {
+            tracing::warn!(
+                "HIMAN_KEEPALIVE_SECS is unset or invalid; using {}s",
+                keepalive_interval.as_secs()
+            );
+        }
+        let keepalive_sender = conn.keepalive_sender();
         Self {
             device_id,
             key,
@@ -96,7 +113,17 @@ impl AgentClient {
             seq: 0,
             pinned_orchestrator_key: None,
             seen_nonces: std::sync::Mutex::new(NonceCache::new(1024)),
+            keepalive_interval,
+            keepalive_pings: 0,
+            pongs_received: 0,
+            keepalive_sender,
         }
+    }
+
+    /// Override the keepalive interval (used by tests).
+    pub fn with_keepalive_interval(mut self, interval: std::time::Duration) -> Self {
+        self.keepalive_interval = interval;
+        self
     }
 
     /// Pin the orchestrator's public key (base64).
@@ -226,12 +253,45 @@ impl AgentClient {
     /// `ToolResult`s.
     pub async fn run(&mut self) {
         let tools = registry();
+
+        info!(
+            interval_secs = self.keepalive_interval.as_secs(),
+            "keepalive enabled"
+        );
+
+        let mut ping_ticker = tokio::time::interval(self.keepalive_interval);
+        ping_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The first tick fires immediately; consume it so registration settles.
+        ping_ticker.tick().await;
+
+        // Pongs received at the last ping, used to detect a silent peer.
+        let mut pongs_at_last_ping = self.pongs_received;
+
         loop {
-            let msg = match self.conn.recv().await {
-                Some(m) => m,
-                None => {
-                    info!("connection closed, agent exiting");
-                    break;
+            let msg = tokio::select! {
+                biased;
+                incoming = self.conn.recv() => {
+                    match incoming {
+                        Some(m) => m,
+                        None => {
+                            info!("connection closed, agent exiting");
+                            break;
+                        }
+                    }
+                }
+                _ = ping_ticker.tick() => {
+                    // A missing Pong means the orchestrator is gone or wedged:
+                    // reconnect rather than wait for the idle timeout.
+                    if self.keepalive_pings > 0 && pongs_at_last_ping == self.pongs_received {
+                        warn!(
+                            interval_secs = self.keepalive_interval.as_secs(),
+                            "no Pong since the previous keepalive; reconnect needed"
+                        );
+                        break;
+                    }
+                    pongs_at_last_ping = self.pongs_received;
+                    self.send_keepalive_ping();
+                    continue;
                 }
             };
 
@@ -242,6 +302,13 @@ impl AgentClient {
                         warn!(error = %e, "failed to send pong");
                         break;
                     }
+                    continue;
+                }
+                Payload::Pong { .. } => {
+                    // Keepalive reply. Count it so the caller can detect a
+                    // silent orchestrator and reconnect.
+                    self.pongs_received += 1;
+                    trace!("keepalive pong received");
                     continue;
                 }
                 other => {
@@ -347,6 +414,41 @@ impl AgentClient {
             {
                 warn!(error = %e, "failed to send tool result");
                 break;
+            }
+        }
+    }
+
+    /// Send one signed keepalive Ping.
+    ///
+    /// The orchestrator answers with a Pong. A failure means the write half is
+    /// gone, so the caller should reconnect.
+    fn send_keepalive_ping(&mut self) {
+        self.keepalive_pings += 1;
+        let nonce = self.keepalive_pings;
+        let meta = WireMeta {
+            seq: self.seq,
+            ts: chrono::Utc::now().timestamp(),
+            from: self.device_id.clone(),
+            to: "orchestrator".into(),
+        };
+        self.seq += 1;
+
+        match WireMessage::sign(meta, Payload::Ping { nonce }, &self.key) {
+            Ok(ping) => {
+                // The send handle is independent of the receiver, so this runs
+                // without blocking the main recv loop.
+                if let Some(sender) = self.keepalive_sender.clone() {
+                    tokio::spawn(async move {
+                        if let Err(e) =
+                            himan_agent_core::transport::Connection::send_via(&sender, ping).await
+                        {
+                            tracing::warn!(error = %e, "keepalive ping failed");
+                        }
+                    });
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to sign keepalive ping");
             }
         }
     }

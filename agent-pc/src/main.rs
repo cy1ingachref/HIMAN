@@ -20,7 +20,7 @@ async fn main() {
         return;
     }
     if args.len() >= 3 && args[1] == "--ws" {
-        run_ws(&args).await;
+        run_ws_with_reconnect(&args).await;
         return;
     }
 
@@ -81,8 +81,12 @@ fn run_keygen(args: &[String]) {
     }
 }
 
-async fn run_ws(args: &[String]) {
-    let url = &args[2];
+/// Reconnect loop: re-register when the orchestrator drops the connection.
+///
+/// The keepalive turns a silent peer into a visible failure, so a dropped
+/// connection should be retried rather than treated as a clean exit.
+async fn run_ws_with_reconnect(args: &[String]) {
+    let url = args[2].clone();
 
     // The orchestrator's public key, pinned out of band. A Welcome is accepted
     // only if it is signed by this key. Without pinning, any server can sign
@@ -105,24 +109,7 @@ async fn run_ws(args: &[String]) {
         }
     };
 
-    tracing::info!(%device, url, "connecting to orchestrator");
-
-    let mut client = match himan_agent_pc::connect_ws(device, key, url).await {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::error!(error = %e, "connection failed");
-            std::process::exit(1);
-        }
-    };
-
-    if let Some(pinned_b64) = pinned {
-        client = match client.with_pinned_orchestrator_key(&pinned_b64) {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!(error = %e, "invalid --orchestrator-key");
-                std::process::exit(1);
-            }
-        };
+    if pinned.is_some() {
         tracing::info!("orchestrator key pinned");
     } else {
         tracing::warn!(
@@ -131,19 +118,53 @@ async fn run_ws(args: &[String]) {
         );
     }
 
-    match client.register().await {
-        Ok(info) => tracing::info!(
-            device = %info.id,
-            class = info.class.as_str(),
-            "agent registered with orchestrator"
-        ),
-        Err(e) => {
-            tracing::error!(error = %e, "registration failed");
-            std::process::exit(1);
-        }
-    }
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        tracing::info!(url = %url, attempt, "connecting to orchestrator");
 
-    tracing::info!("agent running, waiting for tool calls");
-    client.run().await;
-    tracing::info!("agent stopped");
+        let mut client = match himan_agent_pc::connect_ws(device.clone(), key.clone(), &url).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(error = %e, "connection failed");
+                backoff(attempt).await;
+                continue;
+            }
+        };
+
+        if let Some(pinned_b64) = &pinned {
+            client = match client.with_pinned_orchestrator_key(pinned_b64) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!(error = %e, "invalid orchestrator key");
+                    std::process::exit(1);
+                }
+            };
+        }
+
+        match client.register().await {
+            Ok(info) => tracing::info!(
+                device = %info.id,
+                class = info.class.as_str(),
+                "agent registered with orchestrator"
+            ),
+            Err(e) => {
+                tracing::error!(error = %e, "registration failed");
+                backoff(attempt).await;
+                continue;
+            }
+        }
+
+        tracing::info!("agent running, waiting for tool calls");
+        client.run().await;
+        tracing::warn!("connection lost; reconnecting");
+        backoff(attempt).await;
+    }
+}
+
+/// Exponential backoff with a cap, so a downed orchestrator is not hammered.
+async fn backoff(attempt: u32) {
+    let secs = 2u64.saturating_pow(attempt.min(5));
+    tracing::info!(wait_secs = secs, "retrying after a delay");
+    tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
 }
