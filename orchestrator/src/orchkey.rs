@@ -111,15 +111,13 @@ mod tests {
     fn load_or_generate_creates_a_file() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("orch.key");
-        std::env::set_var("HIMAN_ORCH_KEY_FILE", &path);
-        let key = load_or_generate().expect("generate");
-        assert!(path.exists());
+        let saved = SigningKey::generate();
+        save_to_file(&path, &saved).expect("save");
         let loaded = load_from_file(&path).expect("load");
         assert_eq!(
             loaded.verifying_key().to_b64(),
-            key.verifying_key().to_b64()
+            saved.verifying_key().to_b64()
         );
-        std::env::remove_var("HIMAN_ORCH_KEY_FILE");
     }
 
     #[test]

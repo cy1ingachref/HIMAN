@@ -16,7 +16,7 @@ pub mod state;
 
 pub use startup::{enforce_startup, insecure_dev_enabled, log_posture, StartupRequirements};
 
-pub use api_auth::{constant_time_eq, ApiToken};
+pub use api_auth::{tokens_equal, ApiToken};
 pub use audit::{AuditEvent, AuditLog};
 pub use enrollment::{check_enrollment, EnrollmentDecision, EnrollmentError, EnrollmentFile};
 pub use hub::{DispatchResult, Hub, HubConfig};

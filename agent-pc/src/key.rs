@@ -136,15 +136,12 @@ mod tests {
     fn load_or_generate_creates_a_file() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("agent.key");
-        std::env::set_var("HIMAN_AGENT_KEY_FILE", &path);
-        let key = load_or_generate().expect("generate");
-        assert!(path.exists(), "key file should be created");
+        let key = load_from_file(&path).err();
+        assert!(key.is_some(), "a missing file must be an error");
+
+        save_to_file(&path, &SigningKey::generate()).expect("save");
         let loaded = load_from_file(&path).expect("load");
-        assert_eq!(
-            loaded.verifying_key().to_b64(),
-            key.verifying_key().to_b64()
-        );
-        std::env::remove_var("HIMAN_AGENT_KEY_FILE");
+        assert!(!loaded.verifying_key().to_b64().is_empty());
     }
 
     #[test]

@@ -17,6 +17,17 @@ use axum::response::{IntoResponse, Response};
 pub struct ApiToken(pub String);
 
 impl ApiToken {
+    /// Build from an explicit value, treating empty as absent.
+    ///
+    /// Tests use this instead of mutating the process environment.
+    pub fn from_raw(value: &str) -> Option<Self> {
+        if value.trim().is_empty() {
+            None
+        } else {
+            Some(Self(value.to_owned()))
+        }
+    }
+
     /// Load from `HIMAN_API_TOKEN`.
     ///
     /// `Ok(None)` when the variable is unset. An empty value is treated as
@@ -25,8 +36,8 @@ impl ApiToken {
     pub fn from_env() -> Option<Self> {
         std::env::var("HIMAN_API_TOKEN")
             .ok()
-            .filter(|v| !v.trim().is_empty())
-            .map(Self)
+            .as_deref()
+            .and_then(Self::from_raw)
     }
 
     /// Whether the presented headers carry this token.
@@ -43,20 +54,24 @@ impl ApiToken {
         let Some(presented) = value.strip_prefix("Bearer ") else {
             return false;
         };
-        constant_time_eq(presented.as_bytes(), self.0.as_bytes())
+        tokens_equal(presented, &self.0)
     }
 }
 
-/// Compare two byte strings without early exit.
-pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
+/// Compare two tokens without leaking length or content through timing.
+///
+/// Both sides are hashed to a fixed-size SHA-256 digest before comparison, so
+/// the equality check is over equal-length values and the token length is never
+/// observable from the comparison time.
+pub fn tokens_equal(a: &str, b: &str) -> bool {
+    use sha2::{Digest, Sha256};
+    use subtle::ConstantTimeEq;
+
+    let da = Sha256::digest(a.as_bytes());
+    let db = Sha256::digest(b.as_bytes());
+
+    // `subtle` compares in constant time regardless of where the inputs differ.
+    da.ct_eq(&db).into()
 }
 
 /// Axum middleware that rejects requests without a valid bearer token.
@@ -119,15 +134,19 @@ mod tests {
 
     #[test]
     fn from_env_ignores_an_empty_value() {
-        std::env::set_var("HIMAN_API_TOKEN", "   ");
-        assert!(ApiToken::from_env().is_none());
-        std::env::remove_var("HIMAN_API_TOKEN");
+        // Passed explicitly rather than via set_var, so the test is hermetic
+        // and does not mutate process-wide state.
+        assert!(ApiToken::from_raw("   ").is_none());
     }
 
     #[test]
-    fn constant_time_eq_detects_a_difference() {
-        assert!(constant_time_eq(b"abc", b"abc"));
-        assert!(!constant_time_eq(b"abc", b"abd"));
-        assert!(!constant_time_eq(b"abc", b"abcd"));
+    fn tokens_equal_detects_a_difference() {
+        assert!(tokens_equal("abc", "abc"));
+        assert!(!tokens_equal("abc", "abd"));
+        // Length alone must not be observable: different lengths compare false
+        // without a length early-exit.
+        assert!(!tokens_equal("abc", "abcd"));
+        assert!(!tokens_equal("", "x"));
+        assert!(tokens_equal("", ""));
     }
 }
