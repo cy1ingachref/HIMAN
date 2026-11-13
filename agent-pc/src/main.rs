@@ -162,9 +162,59 @@ async fn run_ws_with_reconnect(args: &[String]) {
     }
 }
 
-/// Exponential backoff with a cap, so a downed orchestrator is not hammered.
+/// Compute the backoff delay for a reconnect attempt.
+///
+/// Exponential with the exponent capped at 5 (so a long outage does not grow
+/// the wait without bound), plus +/-50% jitter so agents that lose their
+/// connection together do not retry together. Never below 1s.
+fn backoff_delay_secs(attempt: u32, jitter_percent: u64) -> u64 {
+    let base_secs = 2u64.saturating_pow(attempt.min(5));
+    // `jitter_percent` is expressed as a percentage of the base; the caller
+    // passes a random value in 50..=150.
+    let clamped = jitter_percent.clamp(1, 1000);
+    ((base_secs as u128 * clamped as u128) / 100).max(1) as u64
+}
+
 async fn backoff(attempt: u32) {
-    let secs = 2u64.saturating_pow(attempt.min(5));
-    tracing::info!(wait_secs = secs, "retrying after a delay");
+    use rand::Rng;
+
+    // Jitter up to +/-50% of the base.
+    let jitter_percent = rand::thread_rng().gen_range(50..=150);
+    let secs = backoff_delay_secs(attempt, jitter_percent);
+
+    tracing::info!(wait_secs = secs, attempt, "retrying after a delay");
     tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backoff_grows_with_the_attempt() {
+        assert_eq!(backoff_delay_secs(1, 100), 2);
+        assert_eq!(backoff_delay_secs(2, 100), 4);
+        assert_eq!(backoff_delay_secs(3, 100), 8);
+    }
+
+    #[test]
+    fn backoff_exponent_is_capped() {
+        // attempt 5 -> 32s; attempt 10 must not exceed that.
+        let capped = backoff_delay_secs(5, 100);
+        assert_eq!(backoff_delay_secs(10, 100), capped);
+        assert_eq!(backoff_delay_secs(999, 100), capped);
+    }
+
+    #[test]
+    fn backoff_jitter_stays_within_half() {
+        // At 50% the delay is half the base; at 150% it is one and a half.
+        assert_eq!(backoff_delay_secs(3, 50), 4); // 8 * 0.5
+        assert_eq!(backoff_delay_secs(3, 150), 12); // 8 * 1.5
+    }
+
+    #[test]
+    fn backoff_never_drops_below_one_second() {
+        // Even a degenerate jitter must not produce a zero-second spin.
+        assert!(backoff_delay_secs(1, 1) >= 1);
+    }
 }

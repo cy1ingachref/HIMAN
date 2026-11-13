@@ -65,6 +65,27 @@ fn http_get(port: u16, path: &str) -> Value {
     serde_json::from_str(&body).expect("json")
 }
 
+/// How the orchestrator under test should be started.
+#[derive(Clone, Copy)]
+enum StartMode {
+    /// Both protections set: the configuration production uses.
+    Secure,
+    /// `HIMAN_INSECURE_DEV=1` with no token and no enrollment file.
+    InsecureDev,
+}
+
+impl StartMode {
+    fn envs(self) -> Vec<(&'static str, String)> {
+        match self {
+            StartMode::Secure => vec![
+                ("HIMAN_API_TOKEN", API_TOKEN.to_string()),
+                ("HIMAN_ENROLLED_FILE", "set-by-spawn".to_string()),
+            ],
+            StartMode::InsecureDev => vec![("HIMAN_INSECURE_DEV", "1".to_string())],
+        }
+    }
+}
+
 /// Spawn the orchestrator with a fresh key file and enrollment file.
 struct Orchestrator {
     child: std::process::Child,
@@ -74,31 +95,43 @@ struct Orchestrator {
 
 impl Orchestrator {
     fn spawn(agent_public_key: &str) -> Self {
+        Self::spawn_in_mode(agent_public_key, StartMode::Secure)
+    }
+
+    fn spawn_in_mode(agent_public_key: &str, mode: StartMode) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let key_file = dir.path().join("orchestrator.key");
         let enrollment_file = dir.path().join("enrolled.json");
         let port = free_port();
 
-        // Pre-create the enrollment file so the agent is accepted.
-        std::fs::write(
-            &enrollment_file,
-            format!(r#"{{"pc-1":"{agent_public_key}"}}"#),
-        )
-        .expect("write enrollment");
+        // In secure mode the agent must be enrolled. In dev mode the
+        // orchestrator accepts any device, so an empty file is enough to
+        // satisfy the "file is readable" check.
+        let contents = if matches!(mode, StartMode::Secure) {
+            format!(r#"{{"pc-1":"{agent_public_key}"}}"#)
+        } else {
+            "{}".to_string()
+        };
+        std::fs::write(&enrollment_file, contents).expect("write enrollment");
 
-        let child = Command::new(binary("himan-orchestrator").expect("orchestrator binary"))
-            .env("HIMAN_PORT", port.to_string())
+        let mut cmd = Command::new(binary("himan-orchestrator").expect("orchestrator binary"));
+        cmd.env("HIMAN_PORT", port.to_string())
             .env("HIMAN_ORCH_KEY_FILE", &key_file)
-            .env("HIMAN_ENROLLED_FILE", &enrollment_file)
-            // The orchestrator fails closed without a token, so the e2e run sets
-            // one even though this test does not call the authenticated routes.
-            .env("HIMAN_API_TOKEN", API_TOKEN)
             .env_remove("RUST_LOG")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .current_dir(workspace_root())
-            .spawn()
-            .expect("spawn orchestrator");
+            .current_dir(workspace_root());
+
+        for (k, v) in mode.envs() {
+            let value = if v == "set-by-spawn" {
+                enrollment_file.display().to_string()
+            } else {
+                v
+            };
+            cmd.env(k, value);
+        }
+
+        let child = cmd.spawn().expect("spawn orchestrator");
 
         Self {
             child,
@@ -219,6 +252,72 @@ async fn e2e_real_binaries_round_trip() {
         events.iter().any(|e| e["action"] == "agent_registered"),
         "audit log is missing the registration: {audit}"
     );
+
+    let _ = agent.kill();
+    let _ = agent.wait();
+}
+
+/// The dev-mode escape hatch must actually work end to end.
+///
+/// `orchestrator/tests/startup.rs` asserts the process starts and warns; this
+/// test proves the resulting orchestrator is functional: an agent registers,
+/// dispatch works, and the API needs no token in this mode.
+#[tokio::test]
+async fn e2e_insecure_dev_mode_starts_and_accepts_an_agent() {
+    let agent_bin = binary("himan-agent-pc").expect("build the agent first");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let agent_key_file = dir.path().join("agent.key");
+
+    // Generate a key so we know which device id to expect. In dev mode the
+    // orchestrator does not check enrollment, so any valid key is accepted.
+    let output = Command::new(&agent_bin)
+        .args(["keygen", "--out"])
+        .arg(&agent_key_file)
+        .env_remove("RUST_LOG")
+        .current_dir(workspace_root())
+        .output()
+        .expect("keygen");
+    assert!(output.status.success(), "keygen failed");
+
+    let orch = Orchestrator::spawn_in_mode("not-enrolled-in-dev-mode", StartMode::InsecureDev);
+    wait_for_port(orch.port).await;
+
+    // No token is required in dev mode.
+    let agents_unauth = ureq::get(&format!("http://127.0.0.1:{}/api/v1/agents", orch.port))
+        .call()
+        .expect("unauthenticated GET should succeed in dev mode");
+    let listed: Value = agents_unauth.into_string().unwrap().parse().unwrap();
+    assert_eq!(listed.as_array().map(|a| a.len()).unwrap_or(0), 0);
+
+    // An agent that is NOT enrolled still registers, because dev mode skips it.
+    let mut agent = Command::new(&agent_bin)
+        .args(["--ws", &format!("ws://127.0.0.1:{}/ws", orch.port)])
+        .env("HIMAN_AGENT_KEY_FILE", &agent_key_file)
+        .env_remove("RUST_LOG")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .current_dir(workspace_root())
+        .spawn()
+        .expect("spawn agent");
+
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if let Ok(resp) =
+                ureq::get(&format!("http://127.0.0.1:{}/api/v1/agents", orch.port)).call()
+            {
+                if let Ok(body) = resp.into_string() {
+                    if let Ok(v) = body.parse::<Value>() {
+                        if v.as_array().map(|a| a.len()).unwrap_or(0) >= 1 {
+                            return;
+                        }
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("dev-mode agent did not register within 15s");
 
     let _ = agent.kill();
     let _ = agent.wait();

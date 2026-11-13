@@ -558,6 +558,7 @@ dependencies = [
  "chrono",
  "himan-agent-core",
  "himan-proto",
+ "rand 0.8.8",
  "serde",
  "serde_json",
  "sysinfo",
