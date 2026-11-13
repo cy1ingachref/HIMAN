@@ -31,6 +31,10 @@ fn binary() -> String {
 /// kept: clearing everything makes Windows socket init fail with error 10106.
 fn run_with(envs: &[(&str, &str)], timeout_secs: u64) -> (Option<i32>, String) {
     let mut cmd = Command::new(binary());
+    // Run from a scratch directory so the binary's default key file lands in
+    // the tempdir instead of the repository.
+    let scratch = tempfile::tempdir().expect("scratch dir");
+    cmd.current_dir(scratch.path());
     // Keep only what the OS needs; drop every HIMAN_* variable.
     for (k, v) in std::env::vars() {
         if !k.starts_with("HIMAN_") {

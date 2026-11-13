@@ -34,6 +34,11 @@ fn run_and_capture(name: &str, args: &[(&str, &str)]) -> String {
     for (flag, value) in args {
         cmd.arg(flag).arg(value);
     }
+    // Run from a scratch directory. Without this the binary inherits the crate
+    // dir and writes its default key file (himan-orchestrator.key,
+    // himan-agent.key) into the repository.
+    let scratch = tempfile::tempdir().expect("scratch dir");
+    cmd.current_dir(scratch.path());
     // Drop any inherited HIMAN_* so this test is hermetic, but keep the OS
     // variables needed to bind a socket.
     for (k, v) in std::env::vars() {
