@@ -5,8 +5,10 @@
 //! actual executables, so it proves the wiring that only exists in `main.rs`:
 //! argument parsing, key files, enrollment, and the WS path.
 //!
-//! Requires `cargo build --workspace` to have produced the binaries. Marked
-//! `#[ignore]` when they are missing so `cargo test` alone still passes.
+//! Requires `cargo build --workspace` to have produced the binaries. If they are
+//! missing these tests PANIC (via `.expect`) rather than being skipped: a
+//! missing binary is a broken CI setup, not a passing test. CI builds the
+//! workspace before running tests, so this never fires there.
 
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
