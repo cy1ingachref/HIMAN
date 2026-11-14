@@ -100,3 +100,25 @@ fn orchestrator_logs_info_without_rust_log() {
         "orchestrator must log that it is listening, got:\n{out}"
     );
 }
+
+/// Piped stderr must carry no ANSI escape sequences.
+///
+/// `run_and_capture` pipes stderr, so the child sees a non-terminal writer. If
+/// tracing emitted colour unconditionally, every piped log would be wrapped in
+/// ESC sequences and unreadable in CI logs or a file.
+#[test]
+fn piped_stderr_has_no_ansi_escape_sequences() {
+    for name in ["himan-agent-pc", "himan-orchestrator"] {
+        let args: &[(&str, &str)] = if name.contains("agent") {
+            &[("--ws", "ws://127.0.0.1:1/nope")]
+        } else {
+            &[]
+        };
+        let out = run_and_capture(name, args);
+        assert!(
+            !out.contains('\u{1b}'),
+            "{name} wrote an ANSI escape sequence to piped stderr; \
+             color must follow terminal detection. Output:\n{out}"
+        );
+    }
+}
