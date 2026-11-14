@@ -58,6 +58,21 @@ Status of each phase. Mark a phase done only when its exit check passes.
 - [ ] Audit log exported to an append-only sink
 - [ ] Mutual TLS for the agent↔orchestrator channel
 
+### TODO — bind address is not configurable yet, but dev mode must stay local
+
+`HIMAN_PORT` selects only the port; the orchestrator always binds `127.0.0.1`
+(see `orchestrator/src/server.rs`). When a configurable bind address is added,
+`HIMAN_INSECURE_DEV=1` MUST refuse any non-loopback address (anything other
+than `127.0.0.1`, `::1`, or `localhost`) and exit with a clear error.
+
+Reason: dev mode disables both the API token check and the enrollment
+allowlist. If an operator can point that at a routable interface, an
+unauthenticated tool-dispatch endpoint becomes reachable on the LAN. Fail
+closed, exactly as the startup check does for a missing token.
+
+Note that today's default already binds loopback-only, so this TODO is about
+preserving that property when configurability arrives, not fixing a live hole.
+
 ## Phase 6: Red team and evaluation
 
 - [x] Attack suite: reflection, nonce, takeover, fake orchestrator, replay,
