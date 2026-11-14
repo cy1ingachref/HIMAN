@@ -20,6 +20,22 @@ keys are fine.
 | RT-07 | Unauthenticated API call | 401 without a valid bearer token | `rt07_unauthenticated_api_call_is_rejected` | **SUCCEEDED** (real binaries) | PASS | `65fd428` |
 | RT-08 | Silent / oversized WebSocket | Socket closed within the timeout | `rt08_*` (3 tests) | IGNORED (no limits) | PASS | `1607877` |
 
+### Why RT-05 and RT-06 point at different commits
+
+The two are easy to confuse because `ef2e78a`'s message says "fixes RT-05, RT-06",
+but its diff touches no task-id or nonce code. Verified by diffing both commits:
+
+- **`8e6c61d` is the RT-06 fix.** Its hub.rs diff replaces
+  `TaskId::new(format!("task-{}", Utc::now().timestamp()))` with a uuid v4 value
+  and replaces the timestamp-derived tool-call nonce with `random_nonce()`. That
+  is exactly the change that makes the RT-06 test pass.
+- **`ef2e78a` fixes RT-05** (per-device sequence tracking, rejecting `seq <= last`)
+  and adds one stale-timestamp audit line. It reworks parts of the red-team tests,
+  which is why its message mentions RT-06, but it contains no RT-06 fix.
+
+The RT-06 row therefore credits the commit that changed the behavior, not the
+commit whose message claimed it.
+
 ## Before-state evidence
 
 Two kinds of evidence, both real output rather than assumptions.
