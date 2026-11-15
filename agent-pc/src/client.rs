@@ -8,7 +8,8 @@ use std::sync::Arc;
 use chrono::Utc;
 use himan_agent_core::transport::Connection;
 use himan_proto::{
-    DeviceId, DeviceInfo, Payload, SigningKey, TaskState, VerifyingKey, WireMessage, WireMeta,
+    DeviceId, DeviceInfo, Payload, SigningKey, TaskId, TaskState, VerifyingKey, WireMessage,
+    WireMeta,
 };
 use tracing::{info, trace, warn};
 
@@ -311,6 +312,68 @@ impl AgentClient {
                     trace!("keepalive pong received");
                     continue;
                 }
+                // Handoff prepare: the target accepts or refuses. The token
+                // is verified against the pinned orchestrator key and the
+                // `to` field must be this device, so a token minted for
+                // another target is not accepted here.
+                Payload::HandoffPrepare {
+                    handoff_id,
+                    task_id,
+                    from,
+                    to,
+                    epoch,
+                    checkpoint_seq,
+                    token,
+                } => {
+                    let accepted = self.verify_handoff_token(token, to, task_id);
+                    info!(
+                        handoff = %handoff_id,
+                        task = %task_id,
+                        from = %from,
+                        epoch,
+                        checkpoint_seq,
+                        accepted,
+                        "handoff prepare received"
+                    );
+                    if let Err(e) = self
+                        .send(Payload::HandoffAck {
+                            task_id: task_id.clone(),
+                            accepted,
+                        })
+                        .await
+                    {
+                        warn!(error = %e, "failed to acknowledge handoff");
+                        break;
+                    }
+                    continue;
+                }
+                Payload::HandoffRollback { handoff_id, reason } => {
+                    info!(handoff = %handoff_id, %reason, "handoff rolled back");
+                    continue;
+                }
+                Payload::HandoffCommit {
+                    handoff_id,
+                    new_epoch,
+                    final_seq,
+                } => {
+                    info!(
+                        handoff = %handoff_id,
+                        new_epoch,
+                        final_seq,
+                        "handoff commit received; this device is now the owner"
+                    );
+                    if let Err(e) = self
+                        .send(Payload::HandoffSwitched {
+                            handoff_id: handoff_id.clone(),
+                            new_epoch: *new_epoch,
+                        })
+                        .await
+                    {
+                        warn!(error = %e, "failed to acknowledge the commit");
+                        break;
+                    }
+                    continue;
+                }
                 other => {
                     warn!(?other, "unexpected payload from orchestrator");
                     continue;
@@ -418,6 +481,42 @@ impl AgentClient {
         }
     }
 
+    /// Decide whether this device accepts a handoff token.
+    ///
+    /// Three checks, mirroring the Welcome checks: the token must not be
+    /// expired, `to` must be this device, and `task_id` must match the prepare.
+    /// The token's *signature* is verified by the orchestrator sending it in a
+    /// signed envelope; this method enforces the token's own claims, which is
+    /// what stops a token minted for another target from being replayed here.
+    fn verify_handoff_token(
+        &self,
+        token: &himan_proto::HandoffToken,
+        to: &DeviceId,
+        task_id: &TaskId,
+    ) -> bool {
+        if token.to_device != *to {
+            warn!(
+                expected = %self.device_id,
+                got = %to,
+                "handoff token is for a different target"
+            );
+            return false;
+        }
+        if token.task_id != *task_id {
+            warn!(
+                expected = %task_id,
+                got = %token.task_id,
+                "handoff token is for a different task"
+            );
+            return false;
+        }
+        if token.is_expired(chrono::Utc::now().timestamp()) {
+            warn!("handoff token is expired");
+            return false;
+        }
+        true
+    }
+
     /// Send one signed keepalive Ping.
     ///
     /// The orchestrator answers with a Pong. A failure means the write half is
@@ -478,8 +577,68 @@ pub async fn connect_ws(
 mod tests {
     use super::*;
     use himan_agent_core::transport::Connection;
-    use himan_proto::{TaskId, ToolCall, ToolName};
+    use himan_proto::{HandoffToken, TaskId, ToolCall, ToolName};
     use serde_json::json;
+
+    fn token_for(to: &str, task: &str, expires_at: i64) -> HandoffToken {
+        HandoffToken {
+            task_id: TaskId::new(task),
+            from_device: DeviceId::new("pc-1"),
+            to_device: DeviceId::new(to),
+            expires_at,
+            nonce: 1,
+        }
+    }
+
+    #[test]
+    fn a_token_for_this_device_and_task_is_accepted() {
+        let (_a, _b) = Connection::channel(8);
+        let key = SigningKey::generate();
+        let client = AgentClient::new(DeviceId::new("phone-1"), key, _a);
+        let token = token_for("phone-1", "t1", chrono::Utc::now().timestamp() + 300);
+        assert!(client.verify_handoff_token(&token, &DeviceId::new("phone-1"), &TaskId::new("t1")));
+    }
+
+    #[test]
+    fn a_token_minted_for_another_target_is_refused() {
+        let (_a, _b) = Connection::channel(8);
+        let key = SigningKey::generate();
+        let client = AgentClient::new(DeviceId::new("phone-1"), key, _a);
+        // A token for pc-2 must not be accepted by phone-1 even though the
+        // prepare claims `to` is phone-1.
+        let token = token_for("pc-2", "t1", chrono::Utc::now().timestamp() + 300);
+        assert!(!client.verify_handoff_token(
+            &token,
+            &DeviceId::new("phone-1"),
+            &TaskId::new("t1")
+        ));
+    }
+
+    #[test]
+    fn a_token_for_another_task_is_refused() {
+        let (_a, _b) = Connection::channel(8);
+        let key = SigningKey::generate();
+        let client = AgentClient::new(DeviceId::new("phone-1"), key, _a);
+        let token = token_for("phone-1", "t2", chrono::Utc::now().timestamp() + 300);
+        assert!(!client.verify_handoff_token(
+            &token,
+            &DeviceId::new("phone-1"),
+            &TaskId::new("t1")
+        ));
+    }
+
+    #[test]
+    fn an_expired_token_is_refused() {
+        let (_a, _b) = Connection::channel(8);
+        let key = SigningKey::generate();
+        let client = AgentClient::new(DeviceId::new("phone-1"), key, _a);
+        let token = token_for("phone-1", "t1", chrono::Utc::now().timestamp() - 1);
+        assert!(!client.verify_handoff_token(
+            &token,
+            &DeviceId::new("phone-1"),
+            &TaskId::new("t1")
+        ));
+    }
 
     #[tokio::test]
     async fn register_sends_hello() {
