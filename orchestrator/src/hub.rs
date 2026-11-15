@@ -22,15 +22,37 @@ use tracing::{debug, info, warn};
 use crate::audit::AuditLog;
 use crate::enrollment::{check_enrollment, EnrollmentDecision, EnrollmentFile};
 use crate::handoff::{Handoff, HandoffError, HandoffEvent, HandoffState, HandoffTimeouts};
+use crate::handoff_driver::{HandoffDriver, Mailbox, RetryPolicy};
 use crate::ownership::OwnerRegistry;
 use crate::policy::{Decision, PolicyEngine};
 use crate::presence::PresenceManager;
 use crate::state::StateStore;
 
+/// The result of driving a handoff over the live sockets.
+///
+/// Carries the token so the HTTP layer can report exactly what was issued
+/// without a second lookup.
+#[derive(Debug, Clone)]
+pub struct HandoffOutcome {
+    pub handoff_id: String,
+    pub state: HandoffState,
+    pub token: HandoffToken,
+    pub epoch: u64,
+    pub commit_attempts: u32,
+    pub switch_time_ms: u128,
+    pub reason: Option<String>,
+    pub committed: bool,
+}
+
 /// A connected agent.
 pub struct AgentSession {
     pub device: DeviceInfo,
     pub tx: mpsc::Sender<WireMessage>,
+    /// The agent's inbound messages, retained so the handoff driver can read
+    /// its replies. The socket handler owns the stream and forwards into this
+    /// receiver's sender half; the driver takes the receiver half.
+    pub inbound_tx: mpsc::Sender<WireMessage>,
+    pub inbound_rx: Mutex<Option<mpsc::Receiver<WireMessage>>>,
 }
 
 /// Shared hub state.
@@ -55,6 +77,7 @@ pub struct Hub {
     /// Per-task owner and fencing counter.
     owners: Mutex<OwnerRegistry>,
     handoff_timeouts: HandoffTimeouts,
+    retry_policy: RetryPolicy,
 }
 
 #[derive(Debug, Clone)]
@@ -115,6 +138,7 @@ impl Hub {
             handoffs: Mutex::new(HashMap::new()),
             owners: Mutex::new(OwnerRegistry::new()),
             handoff_timeouts: HandoffTimeouts::default(),
+            retry_policy: RetryPolicy::default(),
         })
     }
 
@@ -202,11 +226,14 @@ impl Hub {
         }
 
         keys.insert(info.id.clone(), claimed);
+        let (inbound_tx, inbound_rx) = mpsc::channel(self.config.agent_queue);
         agents.insert(
             info.id.clone(),
             AgentSession {
                 device: info.clone(),
                 tx,
+                inbound_tx,
+                inbound_rx: Mutex::new(Some(inbound_rx)),
             },
         );
 
@@ -388,6 +415,8 @@ impl Hub {
                 AgentSession {
                     device: session.device.clone(),
                     tx: session.tx.clone(),
+                    inbound_tx: session.inbound_tx.clone(),
+                    inbound_rx: Mutex::new(None),
                 },
                 session.device.clone(),
             )
@@ -554,6 +583,23 @@ impl Hub {
         audit.events().to_vec()
     }
 
+    /// Take a device's inbound receiver, so the handoff driver can read that
+    /// agent's replies. Returns `None` if the receiver was already taken or the
+    /// device is not connected.
+    pub async fn take_inbound(&self, device: &DeviceId) -> Option<mpsc::Receiver<WireMessage>> {
+        let agents = self.agents.lock().await;
+        let session = agents.get(device)?;
+        let mut guard = session.inbound_rx.lock().await;
+        guard.take()
+    }
+
+    /// Clone the sender that feeds a device's inbound stream. The socket
+    /// handler forwards agent messages through it.
+    pub async fn inbound_sender(&self, device: &DeviceId) -> Option<mpsc::Sender<WireMessage>> {
+        let agents = self.agents.lock().await;
+        agents.get(device).map(|s| s.inbound_tx.clone())
+    }
+
     /// Read a handoff attempt by id.
     pub async fn handoff(&self, handoff_id: &str) -> Option<Handoff> {
         let handoffs = self.handoffs.lock().await;
@@ -568,11 +614,14 @@ impl Hub {
         let claimed = VerifyingKey::from_b64(&info.verifying_key)
             .expect("a registered device must carry a valid key");
         self.keys.lock().await.insert(info.id.clone(), claimed);
+        let (inbound_tx, inbound_rx) = mpsc::channel(self.config.agent_queue);
         self.agents.lock().await.insert(
             info.id.clone(),
             AgentSession {
                 device: info.clone(),
                 tx,
+                inbound_tx,
+                inbound_rx: Mutex::new(Some(inbound_rx)),
             },
         );
         self.presence.lock().await.register(info);
@@ -749,6 +798,145 @@ impl Hub {
         Ok(state)
     }
 
+    /// Run a full handoff for a task from `from` to `to`, over the live sockets.
+    ///
+    /// This is the path `server.rs` calls. It records the attempt, takes both
+    /// devices' inbound receivers, drives the procedure, and commits ownership
+    /// on success.
+    pub async fn drive_handoff(
+        &self,
+        task_id: &TaskId,
+        from: &DeviceId,
+        to: &DeviceId,
+        applied_seq: u64,
+    ) -> ProtoResult<HandoffOutcome> {
+        // Request records the attempt and issues the token.
+        let token = self.request_handoff(task_id, from, to).await?;
+        let handoff_id = {
+            let handoffs = self.handoffs.lock().await;
+            handoffs
+                .values()
+                .find(|h| h.task_id == *task_id && h.from == *from && h.to == *to)
+                .map(|h| h.handoff_id.clone())
+                .ok_or_else(|| ProtoError::Policy("handoff attempt is missing".into()))?
+        };
+        let attempt = {
+            let handoffs = self.handoffs.lock().await;
+            handoffs
+                .get(&handoff_id)
+                .cloned()
+                .ok_or_else(|| ProtoError::Policy(format!("handoff {handoff_id} is not known")))?
+        };
+
+        // The driver reads the agents' replies; the socket handler forwards
+        // each inbound message into these channels.
+        let source_rx = self
+            .take_inbound(from)
+            .await
+            .ok_or_else(|| ProtoError::Policy(format!("{from} has no inbound channel")))?;
+        let target_rx = self
+            .take_inbound(to)
+            .await
+            .ok_or_else(|| ProtoError::Policy(format!("{to} has no inbound channel")))?;
+
+        let (source_tx, target_tx) = {
+            let agents = self.agents.lock().await;
+            let s = agents
+                .get(from)
+                .ok_or_else(|| ProtoError::Policy(format!("{from} is not connected")))?
+                .tx
+                .clone();
+            let t = agents
+                .get(to)
+                .ok_or_else(|| ProtoError::Policy(format!("{to} is not connected")))?
+                .tx
+                .clone();
+            (s, t)
+        };
+
+        let source = Mailbox {
+            outbound: source_tx,
+            inbound: source_rx,
+        };
+        let target = Mailbox {
+            outbound: target_tx,
+            inbound: target_rx,
+        };
+
+        let signer = {
+            let key = self.orchestrator_key.clone();
+            move |payload: Payload| {
+                let meta = WireMeta {
+                    seq: 0,
+                    ts: Utc::now().timestamp(),
+                    from: DeviceId::new("orchestrator"),
+                    to: "device".into(),
+                };
+                WireMessage::sign(meta, payload, &key).expect("sign")
+            }
+        };
+
+        let retries = self.retry_policy;
+        let timeouts = self.handoff_timeouts;
+        let outcome = HandoffDriver::new(attempt, source, target, timeouts, retries)
+            .run(&token, applied_seq, signer, || Utc::now().timestamp())
+            .await;
+
+        // Mirror the outcome into the hub's own record so the API reflects it,
+        // and commit ownership if the driver reached the commit point.
+        {
+            let mut handoffs = self.handoffs.lock().await;
+            if let Some(record) = handoffs.get_mut(&handoff_id) {
+                record.state = outcome.state;
+                record.epoch = outcome.epoch;
+                record.committed = outcome.committed;
+                record.applied_seq = applied_seq;
+                if let Some(reason) = &outcome.reason {
+                    record.end_reason = Some(reason.clone());
+                }
+            }
+        }
+
+        if outcome.committed {
+            let mut owners = self.owners.lock().await;
+            owners
+                .commit(task_id.as_str(), to.clone(), outcome.epoch)
+                .map_err(|e| ProtoError::Policy(e.to_string()))?;
+        }
+
+        let mut audit = self.audit.lock().await;
+        audit.append(
+            "handoff_driver_finished".into(),
+            from.to_string(),
+            format!(
+                "handoff={} state={} epoch={} commit_attempts={} reason={:?}",
+                handoff_id,
+                outcome.state.as_str(),
+                outcome.epoch,
+                outcome.commit_attempts,
+                outcome.reason
+            ),
+        );
+
+        info!(
+            handoff = %handoff_id,
+            state = outcome.state.as_str(),
+            commit_attempts = outcome.commit_attempts,
+            "handoff driver finished"
+        );
+
+        Ok(HandoffOutcome {
+            handoff_id,
+            state: outcome.state,
+            token,
+            epoch: outcome.epoch,
+            commit_attempts: outcome.commit_attempts,
+            switch_time_ms: outcome.switch_time_ms,
+            reason: outcome.reason,
+            committed: outcome.committed,
+        })
+    }
+
     /// Check a write against the owner registry (fencing).
     pub async fn check_write(
         &self,
@@ -789,11 +977,14 @@ mod tests {
         // sends fail with "agent queue full or closed", which is a test
         // artifact rather than a hub bug.
         std::mem::forget(rx);
+        let (inbound_tx, inbound_rx) = mpsc::channel(8);
         hub.agents.lock().await.insert(
             dev.id.clone(),
             AgentSession {
                 device: dev.clone(),
                 tx,
+                inbound_tx,
+                inbound_rx: Mutex::new(Some(inbound_rx)),
             },
         );
         hub.presence.lock().await.register(dev);
@@ -1015,6 +1206,8 @@ mod tests {
                 AgentSession {
                     device: dev.clone(),
                     tx,
+                    inbound_tx: mpsc::channel(8).0,
+                    inbound_rx: Mutex::new(None),
                 },
             );
             hub.presence.lock().await.register(dev);

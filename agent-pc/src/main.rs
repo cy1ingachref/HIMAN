@@ -15,8 +15,13 @@ async fn main() {
     //   himan-agent-pc --ws <url>           connect to an orchestrator
     //   himan-agent-pc --ws <url> --orchestrator-key <b64>
     //   himan-agent-pc keygen --out <file>  write a new key, print its public key
+    //   himan-agent-pc --scenario <steps> [--step-ms <n>]  run a scenario task
     if args.len() >= 2 && args[1] == "keygen" {
         run_keygen(&args);
+        return;
+    }
+    if let Some(pos) = args.iter().position(|a| a == "--scenario") {
+        run_scenario(&args, pos).await;
         return;
     }
     if args.len() >= 3 && args[1] == "--ws" {
@@ -79,6 +84,52 @@ fn run_keygen(args: &[String]) {
         eprintln!("keygen failed: {e}");
         std::process::exit(1);
     }
+}
+
+/// Run the deterministic multi-step scenario task.
+///
+/// Each step is printed on its own line so the acceptance test can observe the
+/// exact execution order and which device ran which step. The process exits
+/// non-zero if it was stopped before completing all steps, so a test can tell a
+/// clean finish from an interrupted one.
+async fn run_scenario(args: &[String], pos: usize) {
+    let total: u64 = args.get(pos + 1).and_then(|v| v.parse().ok()).unwrap_or(20);
+    let step_ms: u64 = args
+        .iter()
+        .position(|a| a == "--step-ms")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100);
+    let device = std::env::var("HIMAN_DEVICE_ID")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "pc-1".to_owned());
+
+    tracing::info!(device = %device, total, step_ms, "scenario starting");
+
+    let mut run = himan_agent_pc::scenario_run::ScenarioRun::spawn(
+        device.clone(),
+        total,
+        std::time::Duration::from_millis(step_ms),
+    );
+
+    let mut done = 0u64;
+    while let Some(report) = run.reports.recv().await {
+        println!(
+            "step {} call_id={} device={}",
+            report.step, report.call_id, report.device
+        );
+        done = report.step;
+    }
+
+    let executed = himan_agent_pc::scenario_run::executions(&device);
+    tracing::info!(device = %device, executed, total, "scenario finished");
+    println!("executed={executed} total={total} device={device}");
+
+    if executed < total {
+        std::process::exit(1);
+    }
+    let _ = done;
 }
 
 /// Reconnect loop: re-register when the orchestrator drops the connection.

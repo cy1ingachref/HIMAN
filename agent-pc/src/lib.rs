@@ -9,6 +9,7 @@ pub mod client;
 pub mod keepalive;
 pub mod key;
 pub mod scenario;
+pub mod scenario_run;
 pub mod tools;
 
 pub use agent_loop::{AgentLoop, LoopOutcome};

@@ -29,7 +29,7 @@ pub use handoff::{
     HandoffTimeouts,
 };
 pub use handoff_driver::{DriveOutcome, HandoffDriver, Mailbox, RetryPolicy};
-pub use hub::{DispatchResult, Hub, HubConfig};
+pub use hub::{DispatchResult, HandoffOutcome, Hub, HubConfig};
 pub use orchkey::{
     load_from_file as load_orchestrator_key_from_file,
     load_or_generate as load_or_generate_orchestrator_key, OrchestratorKeyError,

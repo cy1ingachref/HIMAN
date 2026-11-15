@@ -95,6 +95,8 @@ pub struct AgentClient {
     pongs_received: u64,
     /// Send handle for the keepalive task.
     keepalive_sender: Option<himan_agent_core::KeepaliveSender>,
+    /// Highest log seq this device has produced, reported during a handoff.
+    last_seq: u64,
 }
 
 impl AgentClient {
@@ -118,6 +120,7 @@ impl AgentClient {
             keepalive_pings: 0,
             pongs_received: 0,
             keepalive_sender,
+            last_seq: 0,
         }
     }
 
@@ -336,9 +339,10 @@ impl AgentClient {
                         "handoff prepare received"
                     );
                     if let Err(e) = self
-                        .send(Payload::HandoffAck {
-                            task_id: task_id.clone(),
-                            accepted,
+                        .send(Payload::HandoffReady {
+                            handoff_id: handoff_id.clone(),
+                            applied_seq: self.last_seq,
+                            capabilities: "full".into(),
                         })
                         .await
                     {
@@ -349,6 +353,50 @@ impl AgentClient {
                 }
                 Payload::HandoffRollback { handoff_id, reason } => {
                     info!(handoff = %handoff_id, %reason, "handoff rolled back");
+                    continue;
+                }
+                // The target warmed: it reports the log position it has applied
+                // so the orchestrator can stream from the checkpoint.
+                Payload::HandoffReady {
+                    handoff_id,
+                    applied_seq,
+                    capabilities,
+                } => {
+                    info!(
+                        handoff = %handoff_id,
+                        applied_seq,
+                        %capabilities,
+                        "reporting shadow readiness"
+                    );
+                    if let Err(e) = self
+                        .send(Payload::HandoffProgress {
+                            handoff_id: handoff_id.clone(),
+                            applied_seq: *applied_seq,
+                        })
+                        .await
+                    {
+                        warn!(error = %e, "failed to send shadow progress");
+                        break;
+                    }
+                    continue;
+                }
+                // The orchestrator asks this device (as the source) to stop
+                // starting new steps and report the last seq it produced.
+                Payload::HandoffDrain {
+                    handoff_id,
+                    new_epoch,
+                } => {
+                    info!(handoff = %handoff_id, new_epoch, "drain requested");
+                    if let Err(e) = self
+                        .send(Payload::HandoffDrained {
+                            handoff_id: handoff_id.clone(),
+                            last_seq: self.last_seq,
+                        })
+                        .await
+                    {
+                        warn!(error = %e, "failed to send drain acknowledgement");
+                        break;
+                    }
                     continue;
                 }
                 Payload::HandoffCommit {
@@ -381,6 +429,10 @@ impl AgentClient {
             };
 
             info!(tool = %call.tool, task = %call.task_id, "tool call received");
+
+            // This device produced an event, so the log head advances. The
+            // handoff drain reports it as the safe point.
+            self.last_seq += 1;
 
             // 1. Target device check.
             if call.target_device != self.device_id {

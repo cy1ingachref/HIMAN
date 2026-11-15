@@ -71,13 +71,21 @@ pub struct HandoffRequest {
     pub task_id: String,
     pub from: String,
     pub to: String,
+    /// Highest log seq the target has applied. The driver reports it as shadow
+    /// progress; a target that has not warmed reports 0.
+    #[serde(default)]
+    pub applied_seq: u64,
 }
 
+/// What a handoff attempt produced, for the HTTP response.
 #[derive(Debug, Serialize)]
 pub struct HandoffResponse {
     pub handoff_id: String,
     pub state: String,
     pub token: HandoffToken,
+    pub epoch: u64,
+    pub commit_attempts: u32,
+    pub reason: Option<String>,
 }
 
 pub fn router(hub: Arc<Hub>, _config: HubConfig) -> Router {
@@ -221,18 +229,23 @@ async fn handoff(
     let task_id = TaskId::new(req.task_id);
     let from = DeviceId::new(req.from);
     let to = DeviceId::new(req.to);
-    match state.hub.request_handoff(&task_id, &from, &to).await {
-        Ok(token) => {
-            // The attempt now exists and is Prepared; read its id back.
-            let handoffs = state.hub.handoffs_snapshot().await;
-            let attempt = handoffs
-                .iter()
-                .find(|h| h.task_id == task_id && h.from == from && h.to == to)
-                .expect("the attempt was just recorded");
+
+    // Drive the real procedure over the live sockets. This is the path AC-1
+    // exercises: the driver sends HandoffPrepare, waits for HandoffReady,
+    // drains the source, commits, and acks.
+    match state
+        .hub
+        .drive_handoff(&task_id, &from, &to, req.applied_seq)
+        .await
+    {
+        Ok(outcome) => {
             let body = HandoffResponse {
-                handoff_id: attempt.handoff_id.clone(),
-                state: attempt.state.as_str().to_string(),
-                token,
+                handoff_id: outcome.handoff_id,
+                state: outcome.state.as_str().to_string(),
+                token: outcome.token,
+                epoch: outcome.epoch,
+                commit_attempts: outcome.commit_attempts,
+                reason: outcome.reason,
             };
             (StatusCode::OK, Json(body)).into_response()
         }
@@ -451,6 +464,14 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
                 }
             }
             continue;
+        }
+
+        // Agent messages go to two consumers: the hub, which verifies and acts
+        // on them, and the session's inbound channel, which the handoff driver
+        // reads. A message is never copied; the hub sees the original and the
+        // driver gets a clone, so neither blocks the other.
+        if let Some(sender) = state.hub.inbound_sender(&msg.meta.from).await {
+            let _ = sender.send(msg.clone()).await;
         }
 
         match state.hub.handle_message(msg).await {
