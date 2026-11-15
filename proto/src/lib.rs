@@ -24,7 +24,7 @@ pub use envelope::{Payload, WireMessage, WireMeta};
 pub use error::{ProtoError, ProtoResult};
 pub use registry::KeyRegistry;
 pub use signing::{KeyBundle, SigningKey, VerifyingKey};
-pub use task::{HandoffToken, RiskTier, TaskId, TaskState, ToolCall, ToolName};
+pub use task::{HandoffToken, Idempotency, RiskTier, TaskId, TaskState, ToolCall, ToolName};
 
 /// Generate a fresh 16-byte nonce, base64 standard.
 ///

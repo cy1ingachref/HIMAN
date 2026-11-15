@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use himan_proto::{DeviceId, RiskTier, ToolName};
+use himan_proto::{DeviceId, Idempotency, RiskTier, ToolName};
 
 use crate::llm::ChatError;
 
@@ -14,6 +14,15 @@ pub trait Tool: Send + Sync {
 
     /// Default risk tier. The policy engine may raise it, never lower it.
     fn risk_tier(&self) -> RiskTier;
+
+    /// Whether a re-issued call with the same `call_id` may run twice.
+    ///
+    /// Used by the handoff switch to decide what must finish on the old owner
+    /// before ownership moves. Defaults to `NonIdempotent` — the safe answer —
+    /// so a tool that does not declare otherwise is never replayed.
+    fn idempotency(&self) -> Idempotency {
+        Idempotency::NonIdempotent
+    }
 
     /// Human-readable description for the planner's tool schema.
     fn description(&self) -> &str;
@@ -126,6 +135,7 @@ impl ToolRegistry {
                     "name": t.name(),
                     "description": t.description(),
                     "risk_tier": t.risk_tier().as_str(),
+                    "idempotency": t.idempotency().as_str(),
                     "args": t.args_schema(),
                 })
             })
@@ -200,14 +210,64 @@ mod tests {
         assert!(reg.resolve(&ToolName::new("rm_rf")).is_err());
     }
 
-    #[tokio::test]
-    async fn schemas_include_risk_tier() {
+    #[test]
+    fn schemas_include_risk_tier() {
         let reg = registry();
         let schemas = reg.schemas();
         assert_eq!(schemas.len(), 2);
         assert!(schemas
             .iter()
             .any(|s| s["name"] == "device_status" && s["risk_tier"] == "read_only"));
+    }
+
+    #[test]
+    fn schemas_expose_idempotency() {
+        let reg = registry();
+        let schemas = reg.schemas();
+        // The dummy tool does not override `idempotency`, so it must fall back
+        // to the safe default rather than claiming to be replayable.
+        assert!(schemas.iter().all(|s| s["idempotency"] == "non_idempotent"));
+    }
+
+    struct IdempotentDummy {
+        name: &'static str,
+    }
+
+    #[async_trait]
+    impl Tool for IdempotentDummy {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn risk_tier(&self) -> RiskTier {
+            RiskTier::ReadOnly
+        }
+        fn idempotency(&self) -> Idempotency {
+            Idempotency::Idempotent
+        }
+        fn description(&self) -> &str {
+            "safe to re-issue"
+        }
+        fn args_schema(&self) -> serde_json::Value {
+            json!({"type": "object"})
+        }
+        async fn run(
+            &self,
+            _device: &DeviceId,
+            _args: serde_json::Value,
+        ) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::ok("done"))
+        }
+    }
+
+    #[test]
+    fn a_tool_can_declare_itself_idempotent() {
+        let reg = ToolRegistry::new()
+            .with_tool(Arc::new(IdempotentDummy {
+                name: "device_status",
+            }))
+            .with_whitelist(["device_status"]);
+        let schema = &reg.schemas()[0];
+        assert_eq!(schema["idempotency"], "idempotent");
     }
 
     #[tokio::test]
