@@ -6,6 +6,7 @@
 pub mod api_auth;
 pub mod audit;
 pub mod enrollment;
+pub mod eventlog;
 pub mod handoff;
 pub mod hub;
 pub mod orchkey;
@@ -21,6 +22,7 @@ pub use startup::{enforce_startup, insecure_dev_enabled, log_posture, StartupReq
 pub use api_auth::{tokens_equal, ApiToken};
 pub use audit::{AuditEvent, AuditLog};
 pub use enrollment::{check_enrollment, EnrollmentDecision, EnrollmentError, EnrollmentFile};
+pub use eventlog::{EventLog, EventPayload, TaskEvent};
 pub use handoff::{
     AuditLine as HandoffAuditLine, Handoff, HandoffError, HandoffEvent, HandoffState,
     HandoffTimeouts,
