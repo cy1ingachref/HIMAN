@@ -12,8 +12,8 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use himan_proto::{
-    DeviceId, DeviceInfo, KeyRegistry, Payload, ProtoError, ProtoResult, RiskTier, SigningKey,
-    TaskId, TaskState, ToolCall, WireMessage, WireMeta,
+    DeviceId, DeviceInfo, HandoffToken, KeyRegistry, Payload, ProtoError, ProtoResult, RiskTier,
+    SigningKey, TaskId, TaskState, ToolCall, VerifyingKey, WireMessage, WireMeta,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, Mutex};
@@ -21,6 +21,8 @@ use tracing::{debug, info, warn};
 
 use crate::audit::AuditLog;
 use crate::enrollment::{check_enrollment, EnrollmentDecision, EnrollmentFile};
+use crate::handoff::{Handoff, HandoffError, HandoffEvent, HandoffState, HandoffTimeouts};
+use crate::ownership::OwnerRegistry;
 use crate::policy::{Decision, PolicyEngine};
 use crate::presence::PresenceManager;
 use crate::state::StateStore;
@@ -48,6 +50,11 @@ pub struct Hub {
     /// makes replay detectable. Reset on each new registration because the
     /// agent's seq counter restarts on reconnect.
     last_seq: Mutex<HashMap<DeviceId, u64>>,
+    /// In-flight handoff attempts, keyed by handoff id.
+    handoffs: Mutex<HashMap<String, Handoff>>,
+    /// Per-task owner and fencing counter.
+    owners: Mutex<OwnerRegistry>,
+    handoff_timeouts: HandoffTimeouts,
 }
 
 #[derive(Debug, Clone)]
@@ -105,6 +112,9 @@ impl Hub {
             config,
             enrollment: None,
             last_seq: Mutex::new(HashMap::new()),
+            handoffs: Mutex::new(HashMap::new()),
+            owners: Mutex::new(OwnerRegistry::new()),
+            handoff_timeouts: HandoffTimeouts::default(),
         })
     }
 
@@ -543,6 +553,214 @@ impl Hub {
         let audit = self.audit.lock().await;
         audit.events().to_vec()
     }
+
+    /// Read a handoff attempt by id.
+    pub async fn handoff(&self, handoff_id: &str) -> Option<Handoff> {
+        let handoffs = self.handoffs.lock().await;
+        handoffs.get(handoff_id).cloned()
+    }
+
+    /// Register a device directly, bypassing the signed Hello.
+    ///
+    /// For tests and for local tooling that already hold the key. Production
+    /// registration goes through `register`, which verifies the Hello.
+    pub async fn register_device(&self, info: DeviceInfo, tx: mpsc::Sender<WireMessage>) {
+        let claimed = VerifyingKey::from_b64(&info.verifying_key)
+            .expect("a registered device must carry a valid key");
+        self.keys.lock().await.insert(info.id.clone(), claimed);
+        self.agents.lock().await.insert(
+            info.id.clone(),
+            AgentSession {
+                device: info.clone(),
+                tx,
+            },
+        );
+        self.presence.lock().await.register(info);
+    }
+
+    /// Snapshot of every handoff attempt, for the API and tests.
+    pub async fn handoffs_snapshot(&self) -> Vec<Handoff> {
+        let handoffs = self.handoffs.lock().await;
+        handoffs.values().cloned().collect()
+    }
+
+    /// Read the owner and epoch recorded for a task.
+    pub async fn owner(&self, task_id: &str) -> Option<crate::ownership::Ownership> {
+        let owners = self.owners.lock().await;
+        owners.get(task_id).cloned()
+    }
+
+    /// Ask for a handoff of `task_id` from `from` to `to`.
+    ///
+    /// This is the Requested -> Prepared step. It checks that both devices are
+    /// connected, that the source is the recorded owner, issues the signed
+    /// token, records the attempt, and returns the token the target must be
+    /// sent. Ownership does not move here; the commit does.
+    pub async fn request_handoff(
+        &self,
+        task_id: &TaskId,
+        from: &DeviceId,
+        to: &DeviceId,
+    ) -> ProtoResult<HandoffToken> {
+        let now = Utc::now().timestamp();
+
+        // Both devices must be live. A handoff to a device that is not
+        // connected would stall in Warming until the timeout.
+        {
+            let agents = self.agents.lock().await;
+            if !agents.contains_key(to) {
+                return Err(ProtoError::Policy(format!(
+                    "target device {to} is not connected"
+                )));
+            }
+            if !agents.contains_key(from) {
+                return Err(ProtoError::Policy(format!(
+                    "source device {from} is not connected"
+                )));
+            }
+        }
+
+        // The source must own the task. If the task is unknown it is declared
+        // with the source as owner at epoch 0, which is what a first dispatch
+        // does anyway.
+        let epoch = {
+            let mut owners = self.owners.lock().await;
+            match owners.get(task_id.as_str()) {
+                Some(current) => {
+                    if current.owner != *from {
+                        return Err(ProtoError::Policy(format!(
+                            "device {from} is not the owner of task {task_id}"
+                        )));
+                    }
+                    current.epoch
+                }
+                None => {
+                    owners
+                        .register(task_id.as_str().to_owned(), from.clone())
+                        .map_err(|e| ProtoError::Policy(e.to_string()))?;
+                    0
+                }
+            }
+        };
+
+        let token = {
+            let mut presence = self.presence.lock().await;
+            presence.issue_handoff(task_id.clone(), from.clone(), to.clone())?
+        };
+
+        let handoff_id = format!("handoff-{}", uuid::Uuid::new_v4().simple());
+        let mut handoff = Handoff::new(
+            handoff_id.clone(),
+            task_id.clone(),
+            from.clone(),
+            to.clone(),
+            epoch,
+            now,
+        );
+        let line = handoff
+            .apply(
+                HandoffEvent::Approved {
+                    checkpoint_seq: 0,
+                    epoch,
+                },
+                now,
+                &self.handoff_timeouts,
+            )
+            .map_err(|e: HandoffError| ProtoError::Policy(e.to_string()))?;
+
+        {
+            let mut handoffs = self.handoffs.lock().await;
+            handoffs.insert(handoff_id.clone(), handoff);
+        }
+
+        {
+            let mut audit = self.audit.lock().await;
+            audit.append(line.action, from.to_string(), line.detail);
+        }
+
+        info!(
+            handoff = %handoff_id,
+            task = %task_id,
+            from = %from,
+            to = %to,
+            epoch,
+            "handoff requested"
+        );
+
+        Ok(token)
+    }
+
+    /// Advance a handoff attempt and report the resulting state.
+    ///
+    /// The caller supplies the event; this keeps the hub out of the business of
+    /// parsing handoff messages while still being the single place that owns
+    /// the attempt and the audit line.
+    pub async fn advance_handoff(
+        &self,
+        handoff_id: &str,
+        event: HandoffEvent,
+    ) -> ProtoResult<HandoffState> {
+        let now = Utc::now().timestamp();
+        let (state, line, task_id, from, to) = {
+            let mut handoffs = self.handoffs.lock().await;
+            let handoff = handoffs
+                .get_mut(handoff_id)
+                .ok_or_else(|| ProtoError::Policy(format!("handoff {handoff_id} is not known")))?;
+            let was_committed = handoff.committed;
+            let line = handoff
+                .apply(event, now, &self.handoff_timeouts)
+                .map_err(|e: HandoffError| ProtoError::Policy(e.to_string()))?;
+
+            // The commit is the one event that moves ownership. It happens
+            // here, inside the same critical section that records the
+            // attempt, so the epoch bump and the owner change cannot be
+            // observed separately. `was_committed` makes this fire exactly
+            // once, on the event that flipped the flag.
+            if handoff.committed && !was_committed {
+                let mut owners = self.owners.lock().await;
+                owners
+                    .commit(handoff.task_id.as_str(), handoff.to.clone(), handoff.epoch)
+                    .map_err(|e| ProtoError::Policy(e.to_string()))?;
+            }
+
+            (
+                handoff.state,
+                line,
+                handoff.task_id.clone(),
+                handoff.from.clone(),
+                handoff.to.clone(),
+            )
+        };
+
+        {
+            let mut audit = self.audit.lock().await;
+            audit.append(line.action, from.to_string(), line.detail);
+        }
+
+        info!(
+            handoff = %handoff_id,
+            task = %task_id,
+            from = %from,
+            to = %to,
+            state = state.as_str(),
+            "handoff advanced"
+        );
+
+        Ok(state)
+    }
+
+    /// Check a write against the owner registry (fencing).
+    pub async fn check_write(
+        &self,
+        task_id: &str,
+        device: &DeviceId,
+        epoch: u64,
+    ) -> ProtoResult<()> {
+        let owners = self.owners.lock().await;
+        owners
+            .check_write(task_id, device, epoch)
+            .map_err(|e| ProtoError::Policy(e.to_string()))
+    }
 }
 
 #[cfg(test)]
@@ -772,5 +990,233 @@ mod tests {
             hub.task(&TaskId::new("t1")).await,
             Some(TaskState::Succeeded)
         );
+    }
+
+    /// Two registered devices, for handoff tests.
+    async fn hub_with_two() -> (Arc<Hub>, SigningKey, SigningKey) {
+        let hub = Hub::new(HubConfig::default());
+        let a = SigningKey::generate();
+        let b = SigningKey::generate();
+        for (id, key) in [("pc-1", &a), ("phone-1", &b)] {
+            let dev = DeviceInfo::new(
+                DeviceId::new(id),
+                DeviceClass::Pc,
+                id.to_owned(),
+                key.verifying_key().to_b64(),
+            );
+            hub.keys
+                .lock()
+                .await
+                .insert(dev.id.clone(), key.verifying_key());
+            let (tx, rx) = mpsc::channel(8);
+            std::mem::forget(rx);
+            hub.agents.lock().await.insert(
+                dev.id.clone(),
+                AgentSession {
+                    device: dev.clone(),
+                    tx,
+                },
+            );
+            hub.presence.lock().await.register(dev);
+        }
+        (hub, a, b)
+    }
+
+    #[tokio::test]
+    async fn handoff_request_issues_a_token_and_records_the_attempt() {
+        let (hub, _a, _b) = hub_with_two().await;
+        let token = hub
+            .request_handoff(
+                &TaskId::new("t1"),
+                &DeviceId::new("pc-1"),
+                &DeviceId::new("phone-1"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(token.task_id, TaskId::new("t1"));
+        assert_eq!(token.from_device, DeviceId::new("pc-1"));
+        assert_eq!(token.to_device, DeviceId::new("phone-1"));
+
+        let attempts = hub.handoffs_snapshot().await;
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].state, HandoffState::Prepared);
+        // The source still owns the task: the request does not move ownership.
+        assert_eq!(hub.owner("t1").await.unwrap().owner, DeviceId::new("pc-1"));
+        assert_eq!(hub.owner("t1").await.unwrap().epoch, 0);
+    }
+
+    #[tokio::test]
+    async fn handoff_to_a_disconnected_device_is_refused() {
+        let (hub, _a, _b) = hub_with_two().await;
+        let err = hub
+            .request_handoff(
+                &TaskId::new("t1"),
+                &DeviceId::new("pc-1"),
+                &DeviceId::new("tv-1"),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not connected"));
+    }
+
+    #[tokio::test]
+    async fn a_non_owner_cannot_request_a_handoff() {
+        let (hub, _a, _b) = hub_with_two().await;
+        // Declare t1 as owned by pc-1, then ask phone-1 to hand it on.
+        hub.owners
+            .lock()
+            .await
+            .register("t1".to_owned(), DeviceId::new("pc-1"))
+            .unwrap();
+        let err = hub
+            .request_handoff(
+                &TaskId::new("t1"),
+                &DeviceId::new("phone-1"),
+                &DeviceId::new("pc-1"),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("is not the owner"));
+    }
+
+    #[tokio::test]
+    async fn the_commit_moves_ownership_and_bumps_the_epoch() {
+        let (hub, _a, _b) = hub_with_two().await;
+        let token = hub
+            .request_handoff(
+                &TaskId::new("t1"),
+                &DeviceId::new("pc-1"),
+                &DeviceId::new("phone-1"),
+            )
+            .await
+            .unwrap();
+        let handoff_id = hub.handoffs_snapshot().await[0].handoff_id.clone();
+        let _ = token;
+
+        let state = hub
+            .advance_handoff(&handoff_id, HandoffEvent::PrepareAccepted)
+            .await
+            .unwrap();
+        assert_eq!(state, HandoffState::Warming);
+
+        // Before the commit the source can still write.
+        assert!(hub
+            .check_write("t1", &DeviceId::new("pc-1"), 0)
+            .await
+            .is_ok());
+
+        // Jump the machine to Switching, then commit.
+        hub.advance_handoff(
+            &handoff_id,
+            HandoffEvent::TargetReady {
+                applied_seq: 1,
+                capabilities: "full".into(),
+            },
+        )
+        .await
+        .unwrap();
+        hub.advance_handoff(&handoff_id, HandoffEvent::SourceDrained { last_seq: 1 })
+            .await
+            .unwrap();
+        let state = hub
+            .advance_handoff(&handoff_id, HandoffEvent::Committed { epoch: 1 })
+            .await
+            .unwrap();
+        assert_eq!(state, HandoffState::Committed);
+
+        // Ownership moved, and the old owner's epoch is now stale.
+        let owner = hub.owner("t1").await.unwrap();
+        assert_eq!(owner.owner, DeviceId::new("phone-1"));
+        assert_eq!(owner.epoch, 1);
+        let err = hub
+            .check_write("t1", &DeviceId::new("pc-1"), 0)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("stale epoch"), "got: {err}");
+        assert!(hub
+            .check_write("t1", &DeviceId::new("phone-1"), 1)
+            .await
+            .is_ok());
+
+        // The audit log recorded the commit.
+        let events = hub.audit_events().await;
+        assert!(events.iter().any(|e| e.action == "handoff_committed"));
+    }
+
+    #[tokio::test]
+    async fn a_second_commit_is_refused_and_ownership_is_unchanged() {
+        let (hub, _a, _b) = hub_with_two().await;
+        hub.request_handoff(
+            &TaskId::new("t1"),
+            &DeviceId::new("pc-1"),
+            &DeviceId::new("phone-1"),
+        )
+        .await
+        .unwrap();
+        let handoff_id = hub.handoffs_snapshot().await[0].handoff_id.clone();
+        for event in [
+            HandoffEvent::PrepareAccepted,
+            HandoffEvent::TargetReady {
+                applied_seq: 1,
+                capabilities: String::new(),
+            },
+            HandoffEvent::SourceDrained { last_seq: 1 },
+        ] {
+            hub.advance_handoff(&handoff_id, event).await.unwrap();
+        }
+        hub.advance_handoff(&handoff_id, HandoffEvent::Committed { epoch: 1 })
+            .await
+            .unwrap();
+
+        // A redelivered commit must not move ownership back or skip epochs.
+        let err = hub
+            .advance_handoff(&handoff_id, HandoffEvent::Committed { epoch: 2 })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not allowed"));
+        assert_eq!(
+            hub.owner("t1").await.unwrap().owner,
+            DeviceId::new("phone-1")
+        );
+        assert_eq!(hub.owner("t1").await.unwrap().epoch, 1);
+    }
+
+    #[tokio::test]
+    async fn handoff_rolls_back_and_keeps_the_source_as_owner() {
+        let (hub, _a, _b) = hub_with_two().await;
+        hub.request_handoff(
+            &TaskId::new("t1"),
+            &DeviceId::new("pc-1"),
+            &DeviceId::new("phone-1"),
+        )
+        .await
+        .unwrap();
+        let handoff_id = hub.handoffs_snapshot().await[0].handoff_id.clone();
+
+        let state = hub
+            .advance_handoff(
+                &handoff_id,
+                HandoffEvent::Rollback {
+                    reason: "target went away".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(state, HandoffState::RolledBack);
+        assert_eq!(hub.owner("t1").await.unwrap().owner, DeviceId::new("pc-1"));
+        assert!(hub
+            .check_write("t1", &DeviceId::new("pc-1"), 0)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn advancing_an_unknown_handoff_is_refused() {
+        let (hub, _a, _b) = hub_with_two().await;
+        let err = hub
+            .advance_handoff("handoff-nope", HandoffEvent::PrepareAccepted)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not known"));
     }
 }

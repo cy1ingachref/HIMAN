@@ -1,11 +1,13 @@
 //! HTTP and WebSocket server for the orchestrator.
 //!
 //! Routes:
-//!   GET  /health              liveness
-//!   GET  /api/v1/agents       registered agents
-//!   GET  /api/v1/audit        audit log
-//!   POST /api/v1/prompt       dispatch a prompt to a device
-//!   GET  /ws                  agent WebSocket
+//!   GET  /health                    liveness
+//!   GET  /api/v1/agents             registered agents
+//!   GET  /api/v1/audit              audit log
+//!   POST /api/v1/prompt             dispatch a prompt to a device
+//!   POST /api/v1/handoff            request a handoff of a task
+//!   GET  /api/v1/tasks/{id}/owner   owner and epoch for a task
+//!   GET  /ws                        agent WebSocket
 //!
 //! Phase 1: plain HTTP and `ws://`. TLS and mutual TLS are Phase 3.
 
@@ -25,7 +27,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-use himan_proto::{DeviceId, Payload, ProtoError, WireMessage};
+use himan_proto::{DeviceId, HandoffToken, Payload, ProtoError, TaskId, WireMessage};
 
 use crate::hub::{Hub, HubConfig};
 /// Application state shared across routes.
@@ -64,6 +66,20 @@ pub struct ErrorResponse {
     pub error: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct HandoffRequest {
+    pub task_id: String,
+    pub from: String,
+    pub to: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct HandoffResponse {
+    pub handoff_id: String,
+    pub state: String,
+    pub token: HandoffToken,
+}
+
 pub fn router(hub: Arc<Hub>, _config: HubConfig) -> Router {
     let state = AppState {
         hub,
@@ -77,6 +93,8 @@ pub fn router(hub: Arc<Hub>, _config: HubConfig) -> Router {
         .route("/api/v1/agents", get(list_agents))
         .route("/api/v1/audit", get(audit_log))
         .route("/api/v1/prompt", post(prompt))
+        .route("/api/v1/handoff", post(handoff))
+        .route("/api/v1/tasks/{task_id}/owner", get(task_owner))
         .route("/ws", get(ws_handler))
         .with_state(state)
 }
@@ -103,6 +121,8 @@ pub fn router_with_auth(
         .route("/agents", get(list_agents))
         .route("/audit", get(audit_log))
         .route("/prompt", post(prompt))
+        .route("/handoff", post(handoff))
+        .route("/tasks/{task_id}/owner", get(task_owner))
         .route_layer(axum::middleware::from_fn_with_state(
             token,
             crate::api_auth::require_token,
@@ -131,6 +151,8 @@ pub fn router_with_limits(hub: Arc<Hub>, limits: WsLimits) -> Router {
         .route("/api/v1/agents", get(list_agents))
         .route("/api/v1/audit", get(audit_log))
         .route("/api/v1/prompt", post(prompt))
+        .route("/api/v1/handoff", post(handoff))
+        .route("/api/v1/tasks/{task_id}/owner", get(task_owner))
         .route("/ws", get(ws_handler))
         .with_state(state)
 }
@@ -184,6 +206,65 @@ async fn prompt(
             };
             (StatusCode::BAD_REQUEST, Json(body)).into_response()
         }
+    }
+}
+
+/// Request a handoff of a task from one device to another.
+///
+/// This is the entry point the UI or planner uses. It does not move ownership
+/// by itself; it records the attempt and returns the signed token that the
+/// target must receive. The commit happens later, through `advance_handoff`.
+async fn handoff(
+    State(state): State<AppState>,
+    Json(req): Json<HandoffRequest>,
+) -> impl IntoResponse {
+    let task_id = TaskId::new(req.task_id);
+    let from = DeviceId::new(req.from);
+    let to = DeviceId::new(req.to);
+    match state.hub.request_handoff(&task_id, &from, &to).await {
+        Ok(token) => {
+            // The attempt now exists and is Prepared; read its id back.
+            let handoffs = state.hub.handoffs_snapshot().await;
+            let attempt = handoffs
+                .iter()
+                .find(|h| h.task_id == task_id && h.from == from && h.to == to)
+                .expect("the attempt was just recorded");
+            let body = HandoffResponse {
+                handoff_id: attempt.handoff_id.clone(),
+                state: attempt.state.as_str().to_string(),
+                token,
+            };
+            (StatusCode::OK, Json(body)).into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+/// Report the owner and epoch recorded for a task (fencing state).
+async fn task_owner(
+    State(state): State<AppState>,
+    axum::extract::Path(task_id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    match state.hub.owner(&task_id).await {
+        Some(o) => Json(serde_json::json!({
+            "task_id": task_id,
+            "owner": o.owner.as_str(),
+            "epoch": o.epoch,
+        }))
+        .into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("task {task_id} has no recorded owner"),
+            }),
+        )
+            .into_response(),
     }
 }
 
@@ -437,6 +518,8 @@ pub async fn serve(hub: Arc<Hub>, port: u16) -> Result<(), std::io::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::sync::mpsc;
+    use tower::ServiceExt;
 
     #[tokio::test]
     async fn router_has_expected_routes() {
@@ -454,5 +537,171 @@ mod tests {
         // from the same identity agents are told to trust.
         let key = himan_proto::VerifyingKey::from_b64(&hub.orchestrator_key_b64()).unwrap();
         assert!(msg.verify_with(&key).is_ok());
+    }
+
+    /// Register a device directly so a test can focus on the HTTP routes.
+    async fn hub_with_device(hub: &Arc<Hub>, id: &str) {
+        let sk = himan_proto::SigningKey::generate();
+        let dev = himan_proto::DeviceInfo::new(
+            DeviceId::new(id),
+            himan_proto::DeviceClass::Pc,
+            id.to_owned(),
+            sk.verifying_key().to_b64(),
+        );
+        let (tx, rx) = mpsc::channel(8);
+        // Keep the receiver alive: dropping it makes sends fail.
+        std::mem::forget(rx);
+        hub.register_device(dev, tx).await;
+    }
+
+    #[tokio::test]
+    async fn handoff_route_returns_a_token_and_records_the_attempt() {
+        let hub = Hub::new(HubConfig::default());
+        hub_with_device(&hub, "pc-1").await;
+        hub_with_device(&hub, "phone-1").await;
+        let app = router(hub.clone(), HubConfig::default());
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/handoff")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        r#"{"task_id":"t1","from":"pc-1","to":"phone-1"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["handoff_id"].as_str().unwrap().starts_with("handoff-"));
+        assert_eq!(json["state"], "prepared");
+        assert_eq!(json["token"]["from_device"], "pc-1");
+        assert_eq!(json["token"]["to_device"], "phone-1");
+
+        let attempts = hub.handoffs_snapshot().await;
+        assert_eq!(attempts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn handoff_route_rejects_an_unknown_target() {
+        let hub = Hub::new(HubConfig::default());
+        hub_with_device(&hub, "pc-1").await;
+        let app = router(hub.clone(), HubConfig::default());
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/handoff")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        r#"{"task_id":"t1","from":"pc-1","to":"ghost"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        // No attempt may be recorded for a refused request.
+        assert!(hub.handoffs_snapshot().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn owner_route_reports_the_recorded_owner() {
+        let hub = Hub::new(HubConfig::default());
+        hub_with_device(&hub, "pc-1").await;
+        hub_with_device(&hub, "phone-1").await;
+        hub.request_handoff(
+            &TaskId::new("t1"),
+            &DeviceId::new("pc-1"),
+            &DeviceId::new("phone-1"),
+        )
+        .await
+        .unwrap();
+        let app = router(hub.clone(), HubConfig::default());
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/tasks/t1/owner")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["owner"], "pc-1");
+        assert_eq!(json["epoch"], 0);
+    }
+
+    #[tokio::test]
+    async fn owner_route_is_404_for_an_unknown_task() {
+        let hub = Hub::new(HubConfig::default());
+        let app = router(hub.clone(), HubConfig::default());
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/tasks/nope/owner")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn handoff_route_requires_the_bearer_token() {
+        // The handoff route must not be reachable without a token when auth is
+        // on: it is the endpoint that moves ownership.
+        let hub = Hub::new(HubConfig::default());
+        hub_with_device(&hub, "pc-1").await;
+        hub_with_device(&hub, "phone-1").await;
+        let token = crate::api_auth::ApiToken::from_raw("test-token").expect("non-empty token");
+        let app = router_with_auth(hub.clone(), HubConfig::default(), token);
+
+        let unauth = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/handoff")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        r#"{"task_id":"t1","from":"pc-1","to":"phone-1"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+        assert!(hub.handoffs_snapshot().await.is_empty());
+
+        let auth = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/handoff")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token")
+                    .body(axum::body::Body::from(
+                        r#"{"task_id":"t1","from":"pc-1","to":"phone-1"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(auth.status(), StatusCode::OK);
     }
 }
