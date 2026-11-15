@@ -65,6 +65,54 @@ pub enum Payload {
         task_id: TaskId,
         accepted: bool,
     },
+    /// Orchestrator approved the handoff: checkpoint taken, token issued.
+    /// Sent to the target as the prepare step (spec section 4).
+    HandoffPrepare {
+        handoff_id: String,
+        task_id: TaskId,
+        from: DeviceId,
+        to: DeviceId,
+        epoch: u64,
+        checkpoint_seq: u64,
+        token: HandoffToken,
+    },
+    /// Target finished loading and reports its capabilities.
+    HandoffReady {
+        handoff_id: String,
+        applied_seq: u64,
+        capabilities: String,
+    },
+    /// Target reports shadow progress.
+    HandoffProgress {
+        handoff_id: String,
+        applied_seq: u64,
+    },
+    /// Orchestrator tells the source to stop starting new steps.
+    HandoffDrain {
+        handoff_id: String,
+        new_epoch: u64,
+    },
+    /// Source reached a safe point and stopped.
+    HandoffDrained {
+        handoff_id: String,
+        last_seq: u64,
+    },
+    /// The commit point: epoch bumped, ownership moved to the target.
+    HandoffCommit {
+        handoff_id: String,
+        new_epoch: u64,
+        final_seq: u64,
+    },
+    /// Target confirmed the commit.
+    HandoffSwitched {
+        handoff_id: String,
+        new_epoch: u64,
+    },
+    /// Handoff abandoned; both devices are told.
+    HandoffRollback {
+        handoff_id: String,
+        reason: String,
+    },
     /// Agent is going away (shutdown, network loss).
     Bye {
         reason: String,
@@ -101,6 +149,14 @@ impl Payload {
             Payload::ApprovalResponse { .. } => "approval_response",
             Payload::Handoff(_) => "handoff",
             Payload::HandoffAck { .. } => "handoff_ack",
+            Payload::HandoffPrepare { .. } => "handoff_prepare",
+            Payload::HandoffReady { .. } => "handoff_ready",
+            Payload::HandoffProgress { .. } => "handoff_progress",
+            Payload::HandoffDrain { .. } => "handoff_drain",
+            Payload::HandoffDrained { .. } => "handoff_drained",
+            Payload::HandoffCommit { .. } => "handoff_commit",
+            Payload::HandoffSwitched { .. } => "handoff_switched",
+            Payload::HandoffRollback { .. } => "handoff_rollback",
             Payload::Bye { .. } => "bye",
             Payload::Ping { .. } => "ping",
             Payload::Pong { .. } => "pong",
@@ -242,5 +298,105 @@ mod tests {
         assert!(msg.is_stale(1_700_000_000 + 601, 600));
         assert!(msg.is_stale(1_700_000_000 - 601, 600));
         assert!(!msg.is_stale(1_700_000_000 + 599, 600));
+    }
+
+    fn handoff_payload() -> Payload {
+        Payload::HandoffPrepare {
+            handoff_id: "h1".into(),
+            task_id: TaskId::new("t1"),
+            from: DeviceId::new("pc-1"),
+            to: DeviceId::new("phone-1"),
+            epoch: 8,
+            checkpoint_seq: 42,
+            token: HandoffToken {
+                task_id: TaskId::new("t1"),
+                from_device: DeviceId::new("pc-1"),
+                to_device: DeviceId::new("phone-1"),
+                expires_at: 1_800_000_000,
+                nonce: 7,
+            },
+        }
+    }
+
+    #[test]
+    fn handoff_payloads_round_trip_through_json() {
+        let payload = handoff_payload();
+        let json = serde_json::to_string(&payload).unwrap();
+        let back: Payload = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, payload);
+    }
+
+    #[test]
+    fn handoff_payloads_use_the_tag_content_wire_form() {
+        // The envelope is `#[serde(tag = "kind", content = "data")]`, so a
+        // mismatch here would look like a server-side rejection in a red-team
+        // run rather than a broken client.
+        let json = serde_json::to_string(&handoff_payload()).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["kind"], "HandoffPrepare");
+        assert_eq!(value["data"]["handoff_id"], "h1");
+        assert_eq!(value["data"]["checkpoint_seq"], 42);
+    }
+
+    #[test]
+    fn every_handoff_kind_has_a_stable_name() {
+        let names = [
+            Payload::Handoff(HandoffToken {
+                task_id: TaskId::new("t1"),
+                from_device: DeviceId::new("pc-1"),
+                to_device: DeviceId::new("phone-1"),
+                expires_at: 1,
+                nonce: 1,
+            }),
+            Payload::HandoffAck {
+                task_id: TaskId::new("t1"),
+                accepted: true,
+            },
+            handoff_payload(),
+            Payload::HandoffReady {
+                handoff_id: "h1".into(),
+                applied_seq: 3,
+                capabilities: "full".into(),
+            },
+            Payload::HandoffProgress {
+                handoff_id: "h1".into(),
+                applied_seq: 4,
+            },
+            Payload::HandoffDrain {
+                handoff_id: "h1".into(),
+                new_epoch: 8,
+            },
+            Payload::HandoffDrained {
+                handoff_id: "h1".into(),
+                last_seq: 9,
+            },
+            Payload::HandoffCommit {
+                handoff_id: "h1".into(),
+                new_epoch: 8,
+                final_seq: 9,
+            },
+            Payload::HandoffSwitched {
+                handoff_id: "h1".into(),
+                new_epoch: 8,
+            },
+            Payload::HandoffRollback {
+                handoff_id: "h1".into(),
+                reason: "target lost".into(),
+            },
+        ];
+        let expected = [
+            "handoff",
+            "handoff_ack",
+            "handoff_prepare",
+            "handoff_ready",
+            "handoff_progress",
+            "handoff_drain",
+            "handoff_drained",
+            "handoff_commit",
+            "handoff_switched",
+            "handoff_rollback",
+        ];
+        let got: Vec<&str> = names.iter().map(|p| p.kind_name()).collect();
+        assert_eq!(got, expected);
     }
 }
