@@ -324,3 +324,164 @@ async fn e2e_insecure_dev_mode_starts_and_accepts_an_agent() {
     let _ = agent.kill();
     let _ = agent.wait();
 }
+
+/// Drive the handoff request over real HTTP against the real orchestrator.
+///
+/// Two agents stand in for PC and phone: both are `himan-agent-pc`, but each
+/// registers under its own device id (`HIMAN_DEVICE_ID`) and key, and both are
+/// enrolled. The test asks for a handoff and asserts the observable contract:
+/// a signed token is returned, ownership has not moved yet, a request naming a
+/// disconnected device is refused, and the audit log records both registrations
+/// and the attempt.
+///
+/// Scope, stated plainly: the switch procedure's later events are applied
+/// through the hub methods the unit tests drive directly. This test covers what
+/// only the real binaries can prove — two live sockets, enrollment of two
+/// devices, and the real HTTP surface. The post-commit ownership move is proven
+/// in `hub.rs::the_commit_moves_ownership_and_bumps_the_epoch`, not here.
+#[tokio::test]
+async fn e2e_handoff_request_between_two_real_agents() {
+    let agent_bin = binary("himan-agent-pc").expect("build the agent first");
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source_key = dir.path().join("source.key");
+    let target_key = dir.path().join("target.key");
+
+    // Generate both agent keys and capture their public halves for enrollment.
+    let mut public_keys = Vec::new();
+    for key_file in [&source_key, &target_key] {
+        let output = Command::new(&agent_bin)
+            .args(["keygen", "--out"])
+            .arg(key_file)
+            .env_remove("RUST_LOG")
+            .current_dir(workspace_root())
+            .output()
+            .expect("keygen");
+        assert!(output.status.success(), "keygen failed: {output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let public = stdout
+            .lines()
+            .find_map(|l| l.strip_prefix("public key: "))
+            .expect("keygen must print a public key")
+            .trim()
+            .to_string();
+        public_keys.push(public);
+    }
+
+    // Both devices are enrolled.
+    let enrollment = format!(
+        r#"{{"pc-1":"{}","phone-1":"{}"}}"#,
+        public_keys[0], public_keys[1]
+    );
+    let enrollment_file = dir.path().join("enrolled.json");
+    std::fs::write(&enrollment_file, enrollment).expect("write enrollment");
+
+    let key_file = dir.path().join("orchestrator.key");
+    let port = free_port();
+    let mut orch = Command::new(binary("himan-orchestrator").unwrap())
+        .env("HIMAN_PORT", port.to_string())
+        .env("HIMAN_ORCH_KEY_FILE", &key_file)
+        .env("HIMAN_ENROLLED_FILE", &enrollment_file)
+        .env("HIMAN_API_TOKEN", API_TOKEN)
+        .env_remove("RUST_LOG")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .current_dir(workspace_root())
+        .spawn()
+        .expect("spawn orchestrator");
+
+    // Read the orchestrator's advertised key so both agents can pin it.
+    let orch_key = {
+        use std::io::BufRead;
+        let stdout = orch.stdout.as_mut().expect("stdout");
+        let reader = std::io::BufReader::new(stdout);
+        let mut found = String::new();
+        for line in reader.lines().map_while(Result::ok) {
+            if let Some(key) = line.strip_prefix("orchestrator key:") {
+                found = key.trim().to_string();
+                break;
+            }
+        }
+        found
+    };
+    assert!(!orch_key.is_empty(), "orchestrator printed no key");
+    wait_for_port(port).await;
+
+    // Spawn both agents. Each pins the orchestrator key and registers under
+    // its own device id.
+    let mut children = Vec::new();
+    for (id, key_file) in [("pc-1", &source_key), ("phone-1", &target_key)] {
+        let child = Command::new(&agent_bin)
+            .args(["--ws", &format!("ws://127.0.0.1:{port}/ws")])
+            .env("HIMAN_DEVICE_ID", id)
+            .env("HIMAN_AGENT_KEY_FILE", key_file)
+            .env("HIMAN_ORCH_KEY", &orch_key)
+            .env_remove("RUST_LOG")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .current_dir(workspace_root())
+            .spawn()
+            .expect("spawn agent");
+        children.push(child);
+    }
+
+    // Wait for both to register.
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let agents = http_get(port, "/api/v1/agents");
+            if agents.as_array().map(|a| a.len()).unwrap_or(0) >= 2 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("both agents did not register within 20s");
+
+    // Ask for the handoff over the real HTTP surface.
+    let response = ureq::post(&format!("http://127.0.0.1:{port}/api/v1/handoff"))
+        .set("Authorization", &format!("Bearer {API_TOKEN}"))
+        .send_json(serde_json::json!({"task_id":"t-handoff","from":"pc-1","to":"phone-1"}))
+        .expect("handoff request");
+    let body: Value = response.into_string().unwrap().parse().unwrap();
+    let handoff_id = body["handoff_id"].as_str().expect("handoff id").to_string();
+    assert!(handoff_id.starts_with("handoff-"));
+    assert_eq!(body["state"], "prepared");
+    assert_eq!(body["token"]["from_device"], "pc-1");
+    assert_eq!(body["token"]["to_device"], "phone-1");
+
+    // Ownership has not moved yet: the source is still the owner at epoch 0.
+    let before = http_get(port, "/api/v1/tasks/t-handoff/owner");
+    assert_eq!(before["owner"], "pc-1");
+    assert_eq!(before["epoch"], 0);
+
+    // A handoff to a device that is not connected is refused, and nothing is
+    // recorded for it.
+    match ureq::post(&format!("http://127.0.0.1:{port}/api/v1/handoff"))
+        .set("Authorization", &format!("Bearer {API_TOKEN}"))
+        .send_json(serde_json::json!({"task_id":"t-handoff","from":"pc-1","to":"tv-1"}))
+    {
+        Ok(_) => panic!("a handoff to a disconnected device must be refused"),
+        Err(ureq::Error::Status(code, _)) => assert_eq!(code, 400),
+        Err(ureq::Error::Transport(t)) => panic!("request failed: {t}"),
+    }
+
+    // The audit log recorded the attempt and the registration of both agents.
+    let audit = http_get(port, "/api/v1/audit");
+    let events = audit.as_array().expect("audit array");
+    assert!(events.iter().any(|e| e["action"] == "handoff_prepared"));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e["action"] == "agent_registered")
+            .count(),
+        2
+    );
+
+    for child in &mut children {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let _ = orch.kill();
+    let _ = orch.wait();
+}

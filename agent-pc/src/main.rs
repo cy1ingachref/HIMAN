@@ -100,7 +100,15 @@ async fn run_ws_with_reconnect(args: &[String]) {
                 .and_then(|i| args.get(i + 1).cloned())
         });
 
-    let device = DeviceId::new("pc-1");
+    // The device id this agent registers under. Two agents on one host need
+    // distinct ids to stand in for PC and phone, so it is overridable; the
+    // default keeps single-agent setups working unchanged.
+    let device = std::env::var("HIMAN_DEVICE_ID")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .map(|v| DeviceId::new(v.trim()))
+        .unwrap_or_else(|| DeviceId::new("pc-1"));
+
     let key = match himan_agent_pc::load_or_generate() {
         Ok(k) => k,
         Err(e) => {
