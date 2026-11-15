@@ -1,0 +1,46 @@
+Finish Phase 3 (docs/HANDOFF.md) in the HIMAN repo. Commit the three uncommitted doc files
+first. Do not ask questions. Same evidence rules as before: claim only what you ran, show
+each new test failing before it passes, ignored tests do not count, check every commit
+message against its diff. Work on a branch and push it so CI runs.
+
+Close the gap you named: wire the orchestrator so a handoff runs end to end.
+1. Orchestrator sends HandoffPrepare to the target, streams log events from the checkpoint,
+   feeds HandoffReady and ShadowProgress into advance_handoff, drives SwitchPrepare, waits
+   for DrainDone, performs the commit, sends SwitchCommit, and completes on SwitchAck.
+   Persist handoff state, epoch and owner in one transaction. After Committed with no ack:
+   retry SwitchCommit (configurable count), then mark the target failed and offer the task
+   to another device.
+2. Agent shadow replay: apply streamed events without executing tools, reject gaps, report
+   progress; on SwitchPrepare finish in-flight non-idempotent calls then send DrainDone; after
+   SwitchCommit resume, re-issuing unresolved Idempotent calls with the same call_id.
+3. Add a deterministic multi-step scenario task (for example 20 steps of 100 ms each, driven
+   through the ChatBackend stub) so a handoff can happen mid-run.
+
+Acceptance tests (write them first, in orchestrator/tests, using two real enrolled agents):
+- AC-1 happy path: start the task on A, request the handoff to B mid-run. Assert every step
+  executed exactly once, seq continuous, exactly one owner at every observed moment, epoch
+  incremented once, final owner B, A drained.
+- AC-2 no gap: from the audit timeline, there is never an interval with no owner.
+- AC-3 rollback: target never sends Ready, so the handoff rolls back at the timeout and A
+  keeps working.
+- AC-4 failure matrix (one test per row of the spec's section 8): kill source in Shadowing,
+  kill source in Switching before commit, kill target in Warming, kill target after commit,
+  drop SwitchCommit, duplicate SwitchCommit, delay SwitchAck, stale-epoch write from the old
+  owner after the switch, non-idempotent call in flight at the switch (flip waits for it),
+  orchestrator restart mid-handoff (uncommitted rolls back, committed resumes at the ack).
+- AC-5 red team RT-09 to RT-14 in orchestrator/tests/redteam.rs, with before-state evidence
+  in docs/REDTEAM.md (run the attack against the code before the defense where possible),
+  and the fix commit credited only after diffing it.
+- AC-6 metrics: record handoff gap, switch time, total handoff time, replay lag, and rollback
+  cause as audit events; the e2e test asserts them and prints a summary table.
+- AC-7 CI runs all of it on Linux. Docs, README and ROADMAP updated, and the phase exit check
+  ("task started on A finishes on B") ticked only if AC-1 passes.
+
+Stop only for: needing credentials or hardware, or a spec contradiction the decision rules
+cannot resolve (log the choice in docs/DECISIONS.md and continue instead of stopping when
+possible). If a test fails after three genuinely different approaches, record it in
+BLOCKERS.md and move on.
+
+Finish: fresh clone into a temp directory, run every gate and every acceptance test there,
+review your own diff for security issues, then write a final report with, for each AC, the
+command, the result and the commit hash. List anything not done.

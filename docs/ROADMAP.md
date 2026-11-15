@@ -39,9 +39,33 @@ Status of each phase. Mark a phase done only when its exit check passes.
 - [ ] Android app shell: foreground service, Keystore, push wake-up
 - [ ] Phone tools: `device_status`, `request_approval`, `list_files`,
       `upload_file`, `show_notification`
-- [ ] Presence manager + signed handoff tokens over the wire
-- [ ] Secure mesh (Tailscale/WireGuard/Headscale)
+- [x] Handoff state machine (`orchestrator/src/handoff.rs`), pure and
+      fake-clock testable — spec `docs/HANDOFF.md` sections 1-3
+- [x] Epoch fencing and one-owner enforcement
+      (`orchestrator/src/ownership.rs`) — spec section 5
+- [x] Handoff wire messages (`HandoffPrepare`, `HandoffReady`,
+      `HandoffProgress`, `HandoffDrain`, `HandoffDrained`, `HandoffCommit`,
+      `HandoffSwitched`, `HandoffRollback`) — spec section 4
+- [x] Hub flow + HTTP surface (`POST /api/v1/handoff`,
+      `GET /api/v1/tasks/{id}/owner`)
+- [x] Agent answers `HandoffPrepare` / `HandoffCommit` and enforces the
+      token's own claims (target, task, expiry)
+- [ ] Agent-side target: warm state, shadow the log, report `applied_seq`
 - [ ] Exit check: task started on PC finishes on phone
+- [ ] Secure mesh (Tailscale/WireGuard/Headscale)
+
+### TODO — the switch procedure is not driven end to end yet
+
+The state machine, the fencing, the wire types and the agent's token check
+exist and are tested, but nothing on the orchestrator *sends* `HandoffPrepare`
+to the target or feeds the target's `HandoffReady` back into
+`advance_handoff`. Today `advance_handoff` is reached only from tests.
+
+Concretely missing: a handoff driver that owns the two sockets and walks
+Requested -> Prepared -> Warming -> Shadowing -> Switching -> Committed ->
+Active, plus the agent loop's shadow mode (apply log events side-effect free
+and report `applied_seq`). Until that lands, the e2e exit check
+"task started on PC finishes on phone" is not claimable.
 
 ## Phase 4: Character
 
