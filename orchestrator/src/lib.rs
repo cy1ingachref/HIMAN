@@ -8,6 +8,7 @@ pub mod audit;
 pub mod enrollment;
 pub mod eventlog;
 pub mod handoff;
+pub mod handoff_driver;
 pub mod hub;
 pub mod orchkey;
 pub mod ownership;
@@ -27,6 +28,7 @@ pub use handoff::{
     AuditLine as HandoffAuditLine, Handoff, HandoffError, HandoffEvent, HandoffState,
     HandoffTimeouts,
 };
+pub use handoff_driver::{DriveOutcome, HandoffDriver, Mailbox, RetryPolicy};
 pub use hub::{DispatchResult, Hub, HubConfig};
 pub use orchkey::{
     load_from_file as load_orchestrator_key_from_file,

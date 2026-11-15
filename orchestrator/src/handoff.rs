@@ -216,6 +216,26 @@ impl Handoff {
         }
     }
 
+    /// Rebuild an attempt that is already Prepared.
+    ///
+    /// `request_handoff` applies `Approved` and records the attempt; the driver
+    /// needs that same attempt rather than a fresh one starting at `Requested`,
+    /// or it would refuse its own `PrepareAccepted`.
+    pub fn prepared(
+        handoff_id: impl Into<String>,
+        task_id: TaskId,
+        from: DeviceId,
+        to: DeviceId,
+        epoch: u64,
+        checkpoint_seq: u64,
+        now_unix: i64,
+    ) -> Self {
+        let mut h = Self::new(handoff_id, task_id, from, to, epoch, now_unix);
+        h.checkpoint_seq = checkpoint_seq;
+        h.enter(HandoffState::Prepared, now_unix);
+        h
+    }
+
     fn enter(&mut self, state: HandoffState, now_unix: i64) {
         self.state = state;
         self.state_entered_at = now_unix;
