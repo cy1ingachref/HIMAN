@@ -184,6 +184,8 @@ pub struct Handoff {
     pub state_entered_at: i64,
     /// Whether the atomic commit has been made.
     pub committed: bool,
+    /// Caller-supplied clock value at which the commit happened.
+    pub committed_at: Option<i64>,
     /// Why the attempt ended, if it did.
     pub end_reason: Option<String>,
 }
@@ -209,6 +211,7 @@ impl Handoff {
             last_seq: 0,
             state_entered_at: now_unix,
             committed: false,
+            committed_at: None,
             end_reason: None,
         }
     }
@@ -335,11 +338,7 @@ impl Handoff {
                     return Err(HandoffError::Guard("epoch did not increment by one"));
                 }
                 self.epoch = epoch;
-                self.committed = true;
-                // Not Active yet: the target must ack before it is confirmed.
-                // This is the state the spec's failure matrix calls
-                // "after commit, before ack".
-                self.enter(HandoffState::Committed, now_unix);
+                self.commit(now_unix);
                 "handoff_committed"
             }
             HandoffEvent::SwitchAcked => {
@@ -399,6 +398,17 @@ impl Handoff {
         self.end_reason = Some(reason.to_owned());
     }
 
+    /// The atomic commit: epoch is already validated, so the owner flips and
+    /// the point of no return is recorded in one step.
+    ///
+    /// `Active` is deliberately not set here — the target must ack first. The
+    /// spec's failure matrix calls this window "after commit, before ack".
+    fn commit(&mut self, now_unix: i64) {
+        self.committed = true;
+        self.committed_at = Some(now_unix);
+        self.enter(HandoffState::Committed, now_unix);
+    }
+
     /// Has the current state exceeded its deadline?
     pub fn timed_out(&self, now_unix: i64, timeouts: &HandoffTimeouts) -> bool {
         match self.timeout(timeouts) {
@@ -408,9 +418,13 @@ impl Handoff {
     }
 
     /// The owner during the current state. Before the commit the source owns;
-    /// from `Active` on the target owns (spec section 3).
+    /// from the commit on the target owns (spec section 3).
+    ///
+    /// This is driven by `committed_at`, not by `state`, so the answer is
+    /// unambiguous in the Committed-but-not-yet-acked window: the commit has
+    /// already moved ownership even though the handoff is not Active yet.
     pub fn owner(&self) -> &DeviceId {
-        if self.state == HandoffState::Active || self.committed {
+        if self.committed {
             &self.to
         } else {
             &self.from

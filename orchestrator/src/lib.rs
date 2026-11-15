@@ -9,6 +9,7 @@ pub mod enrollment;
 pub mod handoff;
 pub mod hub;
 pub mod orchkey;
+pub mod ownership;
 pub mod policy;
 pub mod presence;
 pub mod server;
@@ -29,6 +30,7 @@ pub use orchkey::{
     load_from_file as load_orchestrator_key_from_file,
     load_or_generate as load_or_generate_orchestrator_key, OrchestratorKeyError,
 };
+pub use ownership::{FenceError, OwnerRegistry, Ownership};
 pub use policy::{Decision, PolicyConfig, PolicyEngine};
 pub use presence::{PresenceManager, PresenceSnapshot};
 pub use server::{router, router_with_auth, router_with_limits, serve, AppState, WsLimits};
