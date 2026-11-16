@@ -49,9 +49,14 @@ async fn ac1_mid_run_handoff_is_atomic_and_complete() {
     let task_id = dispatch_scenario(port, "dev-a");
     harness.record_phase("task dispatched");
 
-    // Let the scenario run a few steps, then ask for the handoff over HTTP.
-    // The scenario is mid-run: this is the point AC-1 is about.
-    tokio::time::sleep(Duration::from_millis(STEP_MS * 5)).await;
+    // Wait until the scenario is demonstrably mid-run (a few steps already
+    // executed) and then ask for the handoff over HTTP. Requesting it before
+    // the first step, or after the last, would not be a mid-run handoff.
+    let mid_run = wait_for_steps(&harness, 4).await;
+    assert!(
+        mid_run >= 4,
+        "the scenario did not reach step {mid_run} before the handoff"
+    );
     let handoff = common::http_post(
         port,
         "/api/v1/handoff",
@@ -236,6 +241,21 @@ async fn ac1_mid_run_handoff_is_atomic_and_complete() {
     let _ = (a, b);
     harness.record_phase("assertions done");
     harness.stop().await;
+}
+
+/// Wait until the agents have executed at least `count` steps between them.
+async fn wait_for_steps(harness: &common::E2ETest, count: u64) -> u64 {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let executed = scenario_steps(harness).len() as u64;
+        if executed >= count {
+            return executed;
+        }
+        if std::time::Instant::now() >= deadline {
+            return executed;
+        }
+        tokio::time::sleep(common::POLL_INTERVAL).await;
+    }
 }
 
 /// POST a scenario prompt to `device`, returning the task id.
