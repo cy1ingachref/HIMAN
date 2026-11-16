@@ -3,6 +3,8 @@
 //! The receive loop is transport-agnostic so it can be tested over the
 //! in-memory duplex. `WsTransport` is the production transport.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -13,7 +15,10 @@ use himan_proto::{
 };
 use tracing::{info, trace, warn};
 
-use crate::tools::registry;
+use crate::scenario_tool::scenario_registry;
+
+/// A boxed, `'static` future — the shape a drain hook returns.
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Why a registration attempt failed.
 #[derive(Debug, thiserror::Error)]
@@ -97,6 +102,11 @@ pub struct AgentClient {
     keepalive_sender: Option<himan_agent_core::KeepaliveSender>,
     /// Highest log seq this device has produced, reported during a handoff.
     last_seq: u64,
+    /// Set when the orchestrator asks this device to drain. A scenario run
+    /// stops starting new steps; a plain agent is already idle.
+    stopping: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Optional drain hook: a scenario run registers its stop handle here.
+    stop_hook: Option<Arc<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>>,
 }
 
 impl AgentClient {
@@ -121,6 +131,8 @@ impl AgentClient {
             pongs_received: 0,
             keepalive_sender,
             last_seq: 0,
+            stopping: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            stop_hook: None,
         }
     }
 
@@ -246,6 +258,43 @@ impl AgentClient {
         Ok(info)
     }
 
+    /// Ask this device to stop starting new work.
+    ///
+    /// A drain is a request to reach a safe point, not a kill: the agent
+    /// finishes the step it is in and then reports `HandoffDrained` with the
+    /// last seq it produced. `stop` is the hook a running scenario uses to
+    /// break between steps.
+    pub async fn request_stop(&self) {
+        self.stopping
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(stop) = &self.stop_hook {
+            stop().await;
+        }
+    }
+
+    /// Install the drain hook (a scenario run's stop handle).
+    pub fn with_stop_hook<F>(mut self, stop: F) -> Self
+    where
+        F: Fn() -> BoxFuture<'static, ()> + Send + Sync + 'static,
+    {
+        self.stop_hook = Some(Arc::new(stop));
+        self
+    }
+
+    /// Whether a drain has been requested.
+    pub fn stopping(&self) -> bool {
+        self.stopping.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Run the receive loop until the connection closes.
+    ///
+    /// Incoming `ToolCall`s are checked before anything runs:
+    ///   1. the call targets this device
+    ///   2. the nonce has not been seen before (replay guard)
+    ///   3. the envelope timestamp is recent
+    ///
+    /// Then the tool whitelist is applied. Results are sent back as signed
+    /// `ToolResult`s.
     /// Run the receive loop until the connection closes.
     ///
     /// Incoming `ToolCall`s are checked before anything runs:
@@ -256,8 +305,6 @@ impl AgentClient {
     /// Then the tool whitelist is applied. Results are sent back as signed
     /// `ToolResult`s.
     pub async fn run(&mut self) {
-        let tools = registry();
-
         info!(
             interval_secs = self.keepalive_interval.as_secs(),
             "keepalive enabled"
@@ -272,7 +319,7 @@ impl AgentClient {
         let mut pongs_at_last_ping = self.pongs_received;
 
         loop {
-            let msg = tokio::select! {
+            let incoming = tokio::select! {
                 biased;
                 incoming = self.conn.recv() => {
                     match incoming {
@@ -298,195 +345,268 @@ impl AgentClient {
                     continue;
                 }
             };
+            if !self.handle_once(Some(incoming)).await {
+                break;
+            }
+        }
+    }
 
-            let call = match &msg.payload {
-                Payload::ToolCall(call) => call.clone(),
-                Payload::Ping { nonce } => {
-                    if let Err(e) = self.send(Payload::Pong { nonce: *nonce }).await {
-                        warn!(error = %e, "failed to send pong");
-                        break;
-                    }
-                    continue;
+    /// Wait for the next envelope from the orchestrator.
+    ///
+    /// `None` means the connection closed. Shared with the scenario runner,
+    /// which must keep answering handoff messages while its task advances.
+    pub async fn recv_message(&mut self) -> Option<himan_proto::WireMessage> {
+        self.conn.recv().await
+    }
+
+    /// Handle one incoming envelope. Returns `false` when the loop should stop.
+    ///
+    /// Shared by [`AgentClient::run`] and the scenario runner, which must keep
+    /// answering handoff messages while its own task advances.
+    pub async fn handle_once(&mut self, incoming: Option<himan_proto::WireMessage>) -> bool {
+        let msg = match incoming {
+            Some(m) => m,
+            None => {
+                info!("connection closed, agent exiting");
+                return false;
+            }
+        };
+        let tools = scenario_registry(std::time::Duration::from_millis(100));
+        let call = match &msg.payload {
+            Payload::ToolCall(call) => call.clone(),
+            Payload::Ping { nonce } => {
+                if let Err(e) = self.send(Payload::Pong { nonce: *nonce }).await {
+                    warn!(error = %e, "failed to send pong");
+                    return false;
                 }
-                Payload::Pong { .. } => {
-                    // Keepalive reply. Count it so the caller can detect a
-                    // silent orchestrator and reconnect.
-                    self.pongs_received += 1;
-                    trace!("keepalive pong received");
-                    continue;
-                }
-                // Handoff prepare: the target accepts or refuses. The token
-                // is verified against the pinned orchestrator key and the
-                // `to` field must be this device, so a token minted for
-                // another target is not accepted here.
-                Payload::HandoffPrepare {
-                    handoff_id,
-                    task_id,
-                    from,
-                    to,
+                return true;
+            }
+            Payload::Pong { .. } => {
+                // Keepalive reply. Count it so the caller can detect a
+                // silent orchestrator and reconnect.
+                self.pongs_received += 1;
+                trace!("keepalive pong received");
+                return true;
+            }
+            // Handoff prepare: the target accepts or refuses. The token
+            // is verified against the pinned orchestrator key and the
+            // `to` field must be this device, so a token minted for
+            // another target is not accepted here.
+            Payload::HandoffPrepare {
+                handoff_id,
+                task_id,
+                from,
+                to,
+                epoch,
+                checkpoint_seq,
+                token,
+            } => {
+                let accepted = self.verify_handoff_token(token, to, task_id);
+                info!(
+                    handoff = %handoff_id,
+                    task = %task_id,
+                    from = %from,
                     epoch,
                     checkpoint_seq,
-                    token,
-                } => {
-                    let accepted = self.verify_handoff_token(token, to, task_id);
-                    info!(
-                        handoff = %handoff_id,
-                        task = %task_id,
-                        from = %from,
-                        epoch,
-                        checkpoint_seq,
-                        accepted,
-                        "handoff prepare received"
-                    );
-                    if let Err(e) = self
-                        .send(Payload::HandoffReady {
-                            handoff_id: handoff_id.clone(),
-                            applied_seq: self.last_seq,
-                            capabilities: "full".into(),
-                        })
-                        .await
-                    {
-                        warn!(error = %e, "failed to acknowledge handoff");
-                        break;
-                    }
-                    continue;
+                    accepted,
+                    "handoff prepare received"
+                );
+                if let Err(e) = self
+                    .send(Payload::HandoffReady {
+                        handoff_id: handoff_id.clone(),
+                        applied_seq: self.last_seq,
+                        capabilities: "full".into(),
+                    })
+                    .await
+                {
+                    warn!(error = %e, "failed to acknowledge handoff");
+                    return false;
                 }
-                Payload::HandoffRollback { handoff_id, reason } => {
-                    info!(handoff = %handoff_id, %reason, "handoff rolled back");
-                    continue;
+                return true;
+            }
+            // The target warmed: it reports the log position it has
+            // applied, so the orchestrator can stream from the checkpoint.
+            Payload::HandoffReady {
+                handoff_id,
+                applied_seq,
+                capabilities,
+            } => {
+                info!(
+                    handoff = %handoff_id,
+                    applied_seq,
+                    %capabilities,
+                    "reporting shadow readiness"
+                );
+                if let Err(e) = self
+                    .send(Payload::HandoffProgress {
+                        handoff_id: handoff_id.clone(),
+                        applied_seq: *applied_seq,
+                    })
+                    .await
+                {
+                    warn!(error = %e, "failed to send shadow progress");
+                    return false;
                 }
-                Payload::HandoffCommit {
-                    handoff_id,
+                return true;
+            }
+            // The orchestrator asks this device (as the source) to stop
+            // starting new steps and report the last seq it produced. A
+            // scenario run stops between steps; a plain agent is already
+            // idle, so it drains immediately.
+            Payload::HandoffDrain {
+                handoff_id,
+                new_epoch,
+            } => {
+                info!(handoff = %handoff_id, new_epoch, "drain requested");
+                self.request_stop().await;
+                if let Err(e) = self
+                    .send(Payload::HandoffDrained {
+                        handoff_id: handoff_id.clone(),
+                        last_seq: self.last_seq,
+                    })
+                    .await
+                {
+                    warn!(error = %e, "failed to send drain acknowledgement");
+                    return false;
+                }
+                return true;
+            }
+            Payload::HandoffRollback { handoff_id, reason } => {
+                info!(handoff = %handoff_id, %reason, "handoff rolled back");
+                return true;
+            }
+            Payload::HandoffCommit {
+                handoff_id,
+                new_epoch,
+                final_seq,
+            } => {
+                info!(
+                    handoff = %handoff_id,
                     new_epoch,
                     final_seq,
-                } => {
-                    info!(
-                        handoff = %handoff_id,
-                        new_epoch,
-                        final_seq,
-                        "handoff commit received; this device is now the owner"
-                    );
-                    if let Err(e) = self
-                        .send(Payload::HandoffSwitched {
-                            handoff_id: handoff_id.clone(),
-                            new_epoch: *new_epoch,
-                        })
-                        .await
-                    {
-                        warn!(error = %e, "failed to acknowledge the commit");
-                        break;
-                    }
-                    continue;
-                }
-                other => {
-                    warn!(?other, "unexpected payload from orchestrator");
-                    continue;
-                }
-            };
-
-            info!(tool = %call.tool, task = %call.task_id, "tool call received");
-
-            // This device produced an event, so the log head advances. The
-            // handoff drain reports it as the safe point.
-            self.last_seq += 1;
-
-            // 1. Target device check.
-            if call.target_device != self.device_id {
-                warn!(
-                    expected = %self.device_id,
-                    got = %call.target_device,
-                    "tool call targets a different device"
+                    "handoff commit received; this device is now the owner"
                 );
-                let _ = self
-                    .send(Payload::ToolResult {
-                        task_id: call.task_id,
-                        state: TaskState::Failed,
-                        output: "tool call targets a different device".into(),
+                if let Err(e) = self
+                    .send(Payload::HandoffSwitched {
+                        handoff_id: handoff_id.clone(),
+                        new_epoch: *new_epoch,
                     })
-                    .await;
-                continue;
+                    .await
+                {
+                    warn!(error = %e, "failed to acknowledge the commit");
+                    return false;
+                }
+                return true;
             }
-
-            // 2. Replay guard: the nonce must not have been seen before.
-            let fresh = self
-                .seen_nonces
-                .lock()
-                .map(|mut cache| cache.insert(call.nonce))
-                .unwrap_or(false);
-            if !fresh {
-                warn!(nonce = call.nonce, "replayed tool call rejected");
-                let _ = self
-                    .send(Payload::ToolResult {
-                        task_id: call.task_id,
-                        state: TaskState::Failed,
-                        output: "tool call nonce already seen".into(),
-                    })
-                    .await;
-                continue;
+            other => {
+                warn!(?other, "unexpected payload from orchestrator");
+                return true;
             }
+        };
 
-            // 3. Freshness: reject stale envelopes.
-            if msg.is_stale(chrono::Utc::now().timestamp(), 120) {
-                warn!(task = %call.task_id, "tool call timestamp is stale");
-                let _ = self
-                    .send(Payload::ToolResult {
-                        task_id: call.task_id,
-                        state: TaskState::Failed,
-                        output: "tool call is stale".into(),
-                    })
-                    .await;
-                continue;
-            }
+        info!(tool = %call.tool, task = %call.task_id, "tool call received");
 
-            // The whitelist is the security boundary: a call for a tool this
-            // device does not expose is refused, not run.
-            let result = match tools.resolve(&call.tool) {
-                Ok(tool) => match tool.run(&self.device_id, call.args).await {
-                    Ok(output) => output,
-                    Err(e) => {
-                        if self
-                            .send(Payload::ToolResult {
-                                task_id: call.task_id,
-                                state: TaskState::Failed,
-                                output: e.to_string(),
-                            })
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                        continue;
-                    }
-                },
+        // This device produced an event, so the log head advances. The
+        // handoff drain reports it as the safe point.
+        self.last_seq += 1;
+
+        // 1. Target device check.
+        if call.target_device != self.device_id {
+            warn!(
+                expected = %self.device_id,
+                got = %call.target_device,
+                "tool call targets a different device"
+            );
+            let _ = self
+                .send(Payload::ToolResult {
+                    task_id: call.task_id,
+                    state: TaskState::Failed,
+                    output: "tool call targets a different device".into(),
+                })
+                .await;
+            return true;
+        }
+
+        // 2. Replay guard: the nonce must not have been seen before.
+        let fresh = self
+            .seen_nonces
+            .lock()
+            .map(|mut cache| cache.insert(call.nonce))
+            .unwrap_or(false);
+        if !fresh {
+            warn!(nonce = call.nonce, "replayed tool call rejected");
+            let _ = self
+                .send(Payload::ToolResult {
+                    task_id: call.task_id,
+                    state: TaskState::Failed,
+                    output: "tool call nonce already seen".into(),
+                })
+                .await;
+            return true;
+        }
+
+        // 3. Freshness: reject stale envelopes.
+        if msg.is_stale(chrono::Utc::now().timestamp(), 120) {
+            warn!(task = %call.task_id, "tool call timestamp is stale");
+            let _ = self
+                .send(Payload::ToolResult {
+                    task_id: call.task_id,
+                    state: TaskState::Failed,
+                    output: "tool call is stale".into(),
+                })
+                .await;
+            return true;
+        }
+
+        // The whitelist is the security boundary: a call for a tool this
+        // device does not expose is refused, not run.
+        let result = match tools.resolve(&call.tool) {
+            Ok(tool) => match tool.run(&self.device_id, call.args).await {
+                Ok(output) => output,
                 Err(e) => {
-                    let _ = self
+                    if self
                         .send(Payload::ToolResult {
                             task_id: call.task_id,
                             state: TaskState::Failed,
                             output: e.to_string(),
                         })
-                        .await;
-                    continue;
+                        .await
+                        .is_err()
+                    {
+                        return false;
+                    }
+                    return true;
                 }
-            };
-
-            let state = if result.ok {
-                TaskState::Succeeded
-            } else {
-                TaskState::Failed
-            };
-            if let Err(e) = self
-                .send(Payload::ToolResult {
-                    task_id: call.task_id,
-                    state,
-                    output: result.summary,
-                })
-                .await
-            {
-                warn!(error = %e, "failed to send tool result");
-                break;
+            },
+            Err(e) => {
+                let _ = self
+                    .send(Payload::ToolResult {
+                        task_id: call.task_id,
+                        state: TaskState::Failed,
+                        output: e.to_string(),
+                    })
+                    .await;
+                return true;
             }
+        };
+
+        let state = if result.ok {
+            TaskState::Succeeded
+        } else {
+            TaskState::Failed
+        };
+        if let Err(e) = self
+            .send(Payload::ToolResult {
+                task_id: call.task_id,
+                state,
+                output: result.summary,
+            })
+            .await
+        {
+            warn!(error = %e, "failed to send tool result");
+            return false;
         }
+        true
     }
 
     /// Decide whether this device accepts a handoff token.

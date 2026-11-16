@@ -55,6 +55,22 @@ pub struct AgentSession {
     pub inbound_rx: Mutex<Option<mpsc::Receiver<WireMessage>>>,
 }
 
+/// A deterministic scenario task the orchestrator is driving.
+///
+/// AC-1 needs a task that is long enough to interrupt and exactly
+/// reproducible. The orchestrator owns the step counter: it dispatches one
+/// `scenario_step` tool call per step, so the source runs the prefix it was
+/// issued before the handoff and the target runs the rest after the commit.
+/// Exactly-once is therefore an orchestrator guarantee, observable in its own
+/// event log, rather than an accident of one process's loop.
+#[derive(Debug, Clone)]
+struct ScenarioRun {
+    owner: DeviceId,
+    total: u64,
+    /// Steps dispatched so far.
+    issued: u64,
+}
+
 /// Shared hub state.
 pub struct Hub {
     agents: Mutex<HashMap<DeviceId, AgentSession>>,
@@ -78,6 +94,18 @@ pub struct Hub {
     owners: Mutex<OwnerRegistry>,
     handoff_timeouts: HandoffTimeouts,
     retry_policy: RetryPolicy,
+    /// The orchestrator's own append-only task event log.
+    ///
+    /// The handoff checkpoint is derived from this log's head, never from a
+    /// client-supplied `applied_seq` (see docs/DECISIONS.md).
+    event_log: Mutex<crate::eventlog::EventLog>,
+    /// Deterministic scenario tasks in flight, keyed by task id.
+    scenarios: Mutex<HashMap<String, ScenarioRun>>,
+    /// Tasks whose source has been asked to drain.
+    ///
+    /// A drained source must not start a new step; the scenario loop parks
+    /// until the handoff commit moves ownership.
+    drained: Mutex<std::collections::HashSet<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -139,6 +167,9 @@ impl Hub {
             owners: Mutex::new(OwnerRegistry::new()),
             handoff_timeouts: HandoffTimeouts::default(),
             retry_policy: RetryPolicy::default(),
+            event_log: Mutex::new(crate::eventlog::EventLog::new()),
+            scenarios: Mutex::new(HashMap::new()),
+            drained: Mutex::new(std::collections::HashSet::new()),
         })
     }
 
@@ -412,7 +443,7 @@ impl Hub {
     ///
     /// This is the Phase 1 exit check path: text prompt -> tool call -> result.
     pub async fn dispatch(
-        &self,
+        self: &Arc<Self>,
         device_id: &DeviceId,
         prompt: &str,
     ) -> ProtoResult<DispatchResult> {
@@ -437,6 +468,10 @@ impl Hub {
         let (tool_name, args) = match prompt.to_lowercase() {
             p if p.contains("diagnose") => ("run_diagnostic", serde_json::json!({})),
             p if p.contains("status") => ("device_status", serde_json::json!({})),
+            // The deterministic scenario task. The orchestrator drives it: it
+            // issues one `scenario_step` tool call per step, so the step count
+            // is exact and observable in the orchestrator's own event log.
+            p if p.contains("scenario") => ("scenario_step", serde_json::json!({})),
             _ => {
                 return Ok(DispatchResult {
                     task_id: TaskId::new("none").to_string(),
@@ -521,6 +556,44 @@ impl Hub {
             store.set_state(&task_id, TaskState::Running);
         }
 
+        // A scenario task is driven by the orchestrator: one tool call per
+        // step, each with its own call id, so exactly-once is decided here.
+        if tool_name == "scenario_step" {
+            let total = call
+                .args
+                .get("total")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(20);
+            {
+                let mut runs = self.scenarios.lock().await;
+                runs.insert(
+                    task_id.to_string(),
+                    ScenarioRun {
+                        owner: device_id.clone(),
+                        total,
+                        issued: 0,
+                    },
+                );
+            }
+            // Drive the steps in the background; the HTTP caller gets the task
+            // id immediately and observes progress through the audit and the
+            // event log.
+            let hub = self.clone();
+            let task: String = task_id.to_string();
+            let device = device_id.clone();
+            tokio::spawn(async move {
+                if let Err(e) = hub.drive_scenario(&task, &device).await {
+                    warn!(error = %e, %task, "scenario run stopped");
+                }
+            });
+            return Ok(DispatchResult {
+                task_id: task_id.to_string(),
+                state: "running".into(),
+                output: format!("scenario of {total} steps dispatched"),
+                decision: "allow".into(),
+            });
+        }
+
         let message = self.build_message(device_id.clone(), Payload::ToolCall(call))?;
         session
             .tx
@@ -553,6 +626,107 @@ impl Hub {
             output,
             decision: "allow".into(),
         })
+    }
+
+    /// Drive a deterministic scenario task to completion.
+    ///
+    /// The orchestrator is the only writer: it dispatches one `scenario_step`
+    /// tool call per step and appends the corresponding event to its own log.
+    /// A drain stops the current owner from starting new steps, so the loop
+    /// parks until the handoff commit moves ownership; the new owner then runs
+    /// the remaining steps. That is exactly the AC-1 shape: the source runs a
+    /// prefix, the target runs the rest, and no step is issued twice.
+    async fn drive_scenario(&self, task_id: &str, device: &DeviceId) -> ProtoResult<()> {
+        loop {
+            // A drained source must not start a new step. Park here, before
+            // reserving a step number, so a parked loop neither consumes a
+            // step nor issues one to a device that has been told to stop.
+            if self.drained.lock().await.contains(task_id) {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    if !self.drained.lock().await.contains(task_id) {
+                        break;
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        return Ok(());
+                    }
+                }
+            }
+
+            // Who owns the task right now? After a handoff this is the target.
+            let owner = {
+                let owners = self.owners.lock().await;
+                owners
+                    .owner_of(task_id)
+                    .cloned()
+                    .unwrap_or_else(|| device.clone())
+            };
+
+            let (issued, total) = {
+                let mut runs = self.scenarios.lock().await;
+                let run = runs
+                    .get_mut(task_id)
+                    .ok_or_else(|| ProtoError::Policy(format!("no scenario run for {task_id}")))?;
+                if run.issued >= run.total {
+                    return Ok(());
+                }
+                run.owner = owner.clone();
+                run.issued += 1;
+                (run.issued, run.total)
+            };
+
+            let args = serde_json::json!({ "step": issued, "total": total });
+            let call = ToolCall {
+                task_id: TaskId::new(task_id),
+                target_device: owner.clone(),
+                tool: himan_proto::ToolName::new("scenario_step"),
+                args,
+                risk_tier: RiskTier::ReadOnly,
+                nonce: random_nonce(),
+            };
+            let message = self.build_message(owner.clone(), Payload::ToolCall(call))?;
+            let session = {
+                let agents = self.agents.lock().await;
+                agents.get(&owner).map(|s| AgentSession {
+                    device: s.device.clone(),
+                    tx: s.tx.clone(),
+                    inbound_tx: s.inbound_tx.clone(),
+                    inbound_rx: Mutex::new(None),
+                })
+            }
+            .ok_or_else(|| ProtoError::Policy(format!("device {owner} is not connected")))?;
+            session
+                .tx
+                .send(message)
+                .await
+                .map_err(|_| ProtoError::Policy("agent queue full or closed".into()))?;
+
+            // Record the issued step in the orchestrator's own log.
+            {
+                let mut log = self.event_log.lock().await;
+                let epoch = {
+                    let owners = self.owners.lock().await;
+                    owners.get(task_id).map(|o| o.epoch).unwrap_or(0)
+                };
+                let event = log.next_event(
+                    task_id.to_string(),
+                    epoch,
+                    owner,
+                    crate::eventlog::EventPayload::ToolCallIssued {
+                        call_id: format!("scenario-{task_id}-{issued}"),
+                        tool: "scenario_step".to_string(),
+                        args: serde_json::json!({ "step": issued, "total": total }),
+                        idempotency: crate::eventlog::Idempotency::Idempotent,
+                    },
+                );
+                log.append(event);
+            }
+
+            // The step's wall-clock cost, so the run lasts long enough to
+            // interrupt. Bounded so a failure cannot wedge the task.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
     }
 
     /// Remove a device from the live session table.
@@ -649,6 +823,11 @@ impl Hub {
         owners.get(task_id).cloned()
     }
 
+    /// Snapshot the orchestrator's own task event log.
+    pub async fn task_events(&self) -> Vec<crate::eventlog::TaskEvent> {
+        self.event_log.lock().await.events().to_vec()
+    }
+
     /// Ask for a handoff of `task_id` from `from` to `to`.
     ///
     /// This is the Requested -> Prepared step. It checks that both devices are
@@ -708,6 +887,9 @@ impl Hub {
         };
 
         let handoff_id = format!("handoff-{}", uuid::Uuid::new_v4().simple());
+        // The checkpoint is the orchestrator's own log head, never a
+        // client-supplied position. See docs/DECISIONS.md.
+        let checkpoint_seq = self.event_log.lock().await.head();
         let mut handoff = Handoff::new(
             handoff_id.clone(),
             task_id.clone(),
@@ -719,7 +901,7 @@ impl Hub {
         let line = handoff
             .apply(
                 HandoffEvent::Approved {
-                    checkpoint_seq: 0,
+                    checkpoint_seq,
                     epoch,
                 },
                 now,
@@ -760,15 +942,25 @@ impl Hub {
         event: HandoffEvent,
     ) -> ProtoResult<HandoffState> {
         let now = Utc::now().timestamp();
-        let (state, line, task_id, from, to) = {
+        let (state, line, task_id, from, to, committed_now) = {
             let mut handoffs = self.handoffs.lock().await;
             let handoff = handoffs
                 .get_mut(handoff_id)
                 .ok_or_else(|| ProtoError::Policy(format!("handoff {handoff_id} is not known")))?;
             let was_committed = handoff.committed;
+            let was_drained = matches!(&event, HandoffEvent::SourceDrained { .. });
             let line = handoff
                 .apply(event, now, &self.handoff_timeouts)
                 .map_err(|e: HandoffError| ProtoError::Policy(e.to_string()))?;
+
+            // The source has drained: it must not start another step. Marking
+            // this here (rather than where the message is sent) keeps the
+            // "stop starting new steps" decision on the same path as the state
+            // machine, so it cannot drift from the handoff's own view.
+            if was_drained {
+                let mut drained = self.drained.lock().await;
+                drained.insert(handoff.task_id.to_string());
+            }
 
             // The commit is the one event that moves ownership. It happens
             // here, inside the same critical section that records the
@@ -782,14 +974,27 @@ impl Hub {
                     .map_err(|e| ProtoError::Policy(e.to_string()))?;
             }
 
+            let committed_now = handoff.committed && !was_committed;
             (
                 handoff.state,
                 line,
                 handoff.task_id.clone(),
                 handoff.from.clone(),
                 handoff.to.clone(),
+                committed_now,
             )
         };
+
+        // Ownership moved: the drained source is no longer barred from the
+        // scenario loop, which now drives the remaining steps on the target.
+        if committed_now {
+            let mut drained = self.drained.lock().await;
+            drained.remove(task_id.as_str());
+            let mut runs = self.scenarios.lock().await;
+            if let Some(run) = runs.get_mut(task_id.as_str()) {
+                run.owner = to.clone();
+            }
+        }
 
         {
             let mut audit = self.audit.lock().await;
@@ -818,7 +1023,6 @@ impl Hub {
         task_id: &TaskId,
         from: &DeviceId,
         to: &DeviceId,
-        applied_seq: u64,
     ) -> ProtoResult<HandoffOutcome> {
         // Request records the attempt and issues the token.
         let token = self.request_handoff(task_id, from, to).await?;
@@ -886,6 +1090,20 @@ impl Hub {
             }
         };
 
+        // The checkpoint is the orchestrator's own log head for this task,
+        // never a client-supplied position (see docs/DECISIONS.md). A task the
+        // orchestrator has not logged yet is checkpointed at 0: that is the
+        // honest head, and the driver streams nothing for it.
+        let applied_seq = {
+            let log = self.event_log.lock().await;
+            log.events()
+                .iter()
+                .filter(|e| e.task_id == task_id.as_str())
+                .map(|e| e.seq)
+                .max()
+                .unwrap_or(0)
+        };
+
         let retries = self.retry_policy;
         let timeouts = self.handoff_timeouts;
         let outcome = HandoffDriver::new(attempt, source, target, timeouts, retries)
@@ -912,6 +1130,33 @@ impl Hub {
             owners
                 .commit(task_id.as_str(), to.clone(), outcome.epoch)
                 .map_err(|e| ProtoError::Policy(e.to_string()))?;
+            // Ownership moved: clear the drain so the scenario loop resumes on
+            // the new owner.
+            let mut drained = self.drained.lock().await;
+            drained.remove(task_id.as_str());
+            let mut runs = self.scenarios.lock().await;
+            if let Some(run) = runs.get_mut(task_id.as_str()) {
+                run.owner = to.clone();
+            }
+        }
+
+        // Record the transition timeline. The driver's local state machine is
+        // what actually moved, so its path is the audit trail; without this
+        // the API could only show "prepared" and "finished", which is not the
+        // confirmed-state sequence the spec asks for.
+        {
+            let mut audit = self.audit.lock().await;
+            for state in &outcome.path {
+                audit.append(
+                    format!("handoff_{}", state.as_str()),
+                    from.to_string(),
+                    format!(
+                        "handoff={handoff_id} epoch={} state={}",
+                        outcome.epoch,
+                        state.as_str()
+                    ),
+                );
+            }
         }
 
         let mut audit = self.audit.lock().await;

@@ -28,6 +28,8 @@
 //! harness.stop().await;
 //! ```
 
+#![allow(dead_code)] // helpers are used by whichever test target needs them
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -104,14 +106,9 @@ pub struct DeviceKey {
     pub key_file: PathBuf,
 }
 
-/// Generate `n` agent keys named `dev-0..dev-n-1` in `dir`, returning them in
-/// order. One call is the single place a test gets keys from, so the
-/// enrollment file and the agents always agree.
-pub fn make_devices(dir: &Path, n: usize) -> Vec<DeviceKey> {
-    make_devices_named(dir, n, |i| format!("dev-{i}"))
-}
-
 /// Generate `n` agent keys with caller-chosen ids, returning them in order.
+/// One call is the single place a test gets keys from, so the enrollment file
+/// and the agents always agree.
 pub fn make_devices_named<I, S>(dir: &Path, n: usize, ids: I) -> Vec<DeviceKey>
 where
     I: Fn(usize) -> S,
@@ -214,13 +211,12 @@ impl Child {
 pub struct E2ETest {
     orch: Child,
     agents: Vec<Child>,
+    /// Device id for each spawned agent, parallel to `agents`.
+    agent_ids: Vec<String>,
     port: u16,
     orch_key: String,
-    /// Set by [`E2ETest::new`]: the enrolled agent key it generated.
-    agent_key_file: Option<PathBuf>,
-    /// Set by [`E2ETest::new`]: the public half of that key.
-    agent_public_key: Option<String>,
-    log_dir: tempfile::TempDir,
+    /// Keys for the devices a test enrolled, in the order they were named.
+    device_keys: Vec<DeviceKey>,
     /// Owns the temp dirs backing the device key files. Dropping this would
     /// delete them while the agents still need them, so it must outlive the
     /// child processes.
@@ -230,21 +226,24 @@ pub struct E2ETest {
 }
 
 impl E2ETest {
-    /// Spawn a real orchestrator in Secure mode with a freshly generated
-    /// `pc-1` agent key, already enrolled, and wait for `GET /health` before
-    /// returning.
-    pub async fn new() -> Self {
+    /// Spawn a real orchestrator enrolled for the named devices, generating a
+    /// key for each. The returned harness exposes those keys.
+    pub async fn new_with_devices(ids: &[&str]) -> Self {
         let dir = tempfile::tempdir().expect("orch tempdir");
-        let devices = make_devices_named(dir.path(), 1, |_| "pc-1");
+        let devices = make_devices_named(dir.path(), ids.len(), |i| ids[i].to_string());
         let enrollment_file = dir.path().join("enrolled.json");
         write_enrollment(&enrollment_file, &devices);
         let key_file = dir.path().join("orchestrator.key");
 
         let mut harness = Self::spawn_orchestrator(key_file, enrollment_file).await;
-        harness.agent_key_file = Some(devices[0].key_file.clone());
-        harness.agent_public_key = Some(devices[0].public_key.clone());
+        harness.device_keys = devices;
         harness._dirs.push(dir);
         harness
+    }
+
+    /// The generated keys, in the order the devices were named.
+    pub fn devices(&self) -> &[DeviceKey] {
+        &self.device_keys
     }
 
     /// Spawn a real orchestrator with explicit key and enrollment files, so a
@@ -266,7 +265,7 @@ impl E2ETest {
 
     async fn spawn_orchestrator(key_file: PathBuf, enrollment_file: PathBuf) -> Self {
         let port = free_port();
-        let log_dir = tempfile::tempdir().expect("log dir");
+        let _log_dir = tempfile::tempdir().expect("log dir");
         let mut orch = Child::spawn(
             &binary("himan-orchestrator").expect("build himan-orchestrator first"),
             Vec::<String>::new(),
@@ -289,11 +288,10 @@ impl E2ETest {
             Ok(orch_key) => Self {
                 orch,
                 agents: Vec::new(),
+                agent_ids: Vec::new(),
                 port,
                 orch_key,
-                agent_key_file: None,
-                agent_public_key: None,
-                log_dir,
+                device_keys: Vec::new(),
                 _dirs: Vec::new(),
                 phase_start: Instant::now(),
                 phases: Vec::new(),
@@ -314,17 +312,6 @@ impl E2ETest {
     /// Alias for [`E2ETest::port`], kept for the existing e2e test wording.
     pub fn orchestrator_port(&self) -> u16 {
         self.port
-    }
-
-    /// The agent key file [`E2ETest::new`] generated, if that constructor was
-    /// used.
-    pub fn agent_key_file(&self) -> Option<PathBuf> {
-        self.agent_key_file.clone()
-    }
-
-    /// The public half of the agent key [`E2ETest::new`] generated.
-    pub fn agent_public_key(&self) -> Option<String> {
-        self.agent_public_key.clone()
     }
 
     /// The API token the orchestrator was started with.
@@ -381,11 +368,67 @@ impl E2ETest {
         &mut self,
         orch_port: u16,
         device_id: &str,
-        agent_key_file: &Path,
         orch_key: &str,
     ) -> Result<Value, String> {
-        self.spawn_agent_with(orch_port, device_id, agent_key_file, orch_key, Vec::new())
+        let key_file = self
+            .device_keys
+            .iter()
+            .find(|d| d.device == device_id)
+            .map(|d| d.key_file.clone())
+            .ok_or_else(|| format!("no key generated for device {device_id}"))?;
+        self.spawn_agent_with(orch_port, device_id, &key_file, orch_key, Vec::new())
             .await
+    }
+
+    /// Spawn a real agent that registers and then runs the deterministic
+    /// scenario task.
+    ///
+    /// The orchestrator drives the steps (one `scenario_step` tool call per
+    /// step), so the agent itself just registers and executes what it is
+    /// issued. That keeps a single writer: the step count and the exactly-once
+    /// guarantee live in the orchestrator's event log, not in a process-local
+    /// counter.
+    pub async fn spawn_agent_scenario(
+        &mut self,
+        orch_port: u16,
+        device_id: &str,
+        steps: u64,
+        step_ms: u64,
+        orch_key: &str,
+    ) -> Result<Value, String> {
+        let _ = (steps, step_ms);
+        self.spawn_agent(orch_port, device_id, orch_key).await
+    }
+
+    /// The stdout of each spawned agent, keyed by device id.
+    ///
+    /// The scenario runner prints one line per executed step, which is how a
+    /// test observes exactly-once execution on the real binary.
+    pub fn agent_logs(&self) -> Vec<(String, String)> {
+        self.agent_ids
+            .iter()
+            .zip(self.agents.iter())
+            .map(|(id, child)| {
+                (
+                    id.clone(),
+                    std::fs::read_to_string(&child.out).unwrap_or_default(),
+                )
+            })
+            .collect()
+    }
+
+    /// The stderr of each spawned agent, keyed by device id.
+    pub fn agent_err_logs(&self) -> Vec<(String, String)> {
+        self.agent_ids
+            .iter()
+            .zip(self.agents.iter())
+            .map(|(id, child)| {
+                (
+                    id.clone(),
+                    std::fs::read_to_string(&child.err).unwrap_or_default(),
+                )
+            })
+            .collect()
     }
 
     /// Spawn a real agent with extra CLI args (for example the deterministic
@@ -416,6 +459,7 @@ impl E2ETest {
         let expected = self.agents.len() + 1;
         match wait_for_registration(orch_port, expected, HARD_TIMEOUT).await {
             Ok(agents) => {
+                self.agent_ids.push(device_id.to_string());
                 self.agents.push(child);
                 Ok(agents)
             }

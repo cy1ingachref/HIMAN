@@ -71,9 +71,17 @@ pub struct HandoffRequest {
     pub task_id: String,
     pub from: String,
     pub to: String,
-    /// Highest log seq the target has applied. The driver reports it as shadow
-    /// progress; a target that has not warmed reports 0.
+    /// Deprecated and ignored: the checkpoint is the orchestrator's own log
+    /// head, never a client-supplied position.
+    ///
+    /// A handoff is a request to move a task, not a request to pick which log
+    /// prefix the target must apply. If the HTTP caller could set
+    /// `applied_seq`, it could make the switch commit at a position that drops
+    /// events (too low) or stall waiting for a position the source never
+    /// reached (too high). The orchestrator therefore derives the checkpoint
+    /// from its own append-only log and ignores anything the client sends.
     #[serde(default)]
+    #[allow(dead_code)]
     pub applied_seq: u64,
 }
 
@@ -103,6 +111,7 @@ pub fn router(hub: Arc<Hub>, _config: HubConfig) -> Router {
         .route("/api/v1/prompt", post(prompt))
         .route("/api/v1/handoff", post(handoff))
         .route("/api/v1/tasks/{task_id}/owner", get(task_owner))
+        .route("/api/v1/tasks/{task_id}/events", get(task_events))
         .route("/ws", get(ws_handler))
         .with_state(state)
 }
@@ -131,6 +140,7 @@ pub fn router_with_auth(
         .route("/prompt", post(prompt))
         .route("/handoff", post(handoff))
         .route("/tasks/{task_id}/owner", get(task_owner))
+        .route("/tasks/{task_id}/events", get(task_events))
         .route_layer(axum::middleware::from_fn_with_state(
             token,
             crate::api_auth::require_token,
@@ -161,6 +171,7 @@ pub fn router_with_limits(hub: Arc<Hub>, limits: WsLimits) -> Router {
         .route("/api/v1/prompt", post(prompt))
         .route("/api/v1/handoff", post(handoff))
         .route("/api/v1/tasks/{task_id}/owner", get(task_owner))
+        .route("/api/v1/tasks/{task_id}/events", get(task_events))
         .route("/ws", get(ws_handler))
         .with_state(state)
 }
@@ -233,11 +244,7 @@ async fn handoff(
     // Drive the real procedure over the live sockets. This is the path AC-1
     // exercises: the driver sends HandoffPrepare, waits for HandoffReady,
     // drains the source, commits, and acks.
-    match state
-        .hub
-        .drive_handoff(&task_id, &from, &to, req.applied_seq)
-        .await
-    {
+    match state.hub.drive_handoff(&task_id, &from, &to).await {
         Ok(outcome) => {
             info!(
                 "handoff driver finished: state={} epoch={} commits={} reason={:?}",
@@ -267,6 +274,34 @@ async fn handoff(
                 .into_response()
         }
     }
+}
+
+/// Report the orchestrator's own event log for a task, with its continuity.
+async fn task_events(
+    State(state): State<AppState>,
+    axum::extract::Path(task_id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let events: Vec<_> = state
+        .hub
+        .task_events()
+        .await
+        .into_iter()
+        .filter(|e| e.task_id == task_id)
+        .collect();
+    let seqs: Vec<u64> = events.iter().map(|e| e.seq).collect();
+    let contiguous = seqs.iter().enumerate().all(|(i, s)| *s == i as u64 + 1);
+    let devices: Vec<String> = events
+        .iter()
+        .map(|e| e.device.as_str().to_string())
+        .collect();
+    Json(serde_json::json!({
+        "task_id": task_id,
+        "events": events.len(),
+        "seqs": seqs,
+        "contiguous": contiguous,
+        "devices": devices,
+    }))
+    .into_response()
 }
 
 /// Report the owner and epoch recorded for a task (fencing state).
@@ -618,6 +653,38 @@ mod tests {
 
         let attempts = hub.handoffs_snapshot().await;
         assert_eq!(attempts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn handoff_route_ignores_a_client_supplied_applied_seq() {
+        // A client-supplied checkpoint must not be able to move the switch
+        // point. The orchestrator derives it from its own event log
+        // (docs/DECISIONS.md), so a bogus value is ignored rather than trusted.
+        let hub = Hub::new(HubConfig::default());
+        hub_with_device(&hub, "pc-1").await;
+        hub_with_device(&hub, "phone-1").await;
+        let app = router(hub.clone(), HubConfig::default());
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/handoff")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        r#"{"task_id":"t1","from":"pc-1","to":"phone-1","applied_seq":999}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // The attempt was recorded, and its checkpoint is the orchestrator's
+        // own log head (0 here — no events yet), not the caller's 999.
+        let attempts = hub.handoffs_snapshot().await;
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].checkpoint_seq, 0);
     }
 
     #[tokio::test]

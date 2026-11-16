@@ -9,6 +9,8 @@
 //! orchestrator moves ownership. Keeping the two apart is what makes
 //! "exactly once" a meaningful assertion rather than a tautology.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,6 +22,9 @@ use himan_agent_core::tool::Tool;
 use himan_proto::DeviceId;
 
 use crate::scenario::{step_request, ScenarioBackend, ScenarioStepTool};
+
+/// A boxed, `'static` future returned by a drain hook.
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// One executed step, as reported by a running scenario.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,6 +118,25 @@ impl ScenarioRun {
             started,
             stop,
             shutdown_tx,
+        }
+    }
+
+    /// A boxed `async` handle that stops the run between steps.
+    ///
+    /// The agent installs this as its drain hook, so a handoff drains the
+    /// scenario exactly where the spec wants: at a step boundary. It shares
+    /// the run's stop flag and sender rather than cloning the handle, because
+    /// the report receiver is single-consumer.
+    pub fn stop_handle(&self) -> impl Fn() -> BoxFuture<'static, ()> + Send + Sync + 'static {
+        let stop = self.stop.clone();
+        let tx = self.shutdown_tx.clone();
+        move || {
+            let stop = stop.clone();
+            let tx = tx.clone();
+            Box::pin(async move {
+                let _ = tx.send(()).await;
+                stop.store(true, Ordering::SeqCst);
+            })
         }
     }
 

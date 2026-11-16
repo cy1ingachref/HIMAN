@@ -25,6 +25,9 @@ matters more than the prose.
 | 2026-11-12 | HTTP API requires a constant-time bearer token | The API dispatched tool calls to every enrolled device with no auth | No auth, or a timing-vulnerable comparison |
 | 2026-11-12 | WebSocket limits: handshake timeout, frame cap, connection semaphore, invalid-message budget | A silent or oversized connection holds a task and a socket indefinitely | No limits |
 | 2026-11-12 | CI actions pinned by SHA; audit + gitleaks + dependabot | A moved tag would run arbitrary code in CI | Floating tags |
+| 2026-11-16 | Handoff checkpoint is the orchestrator's own event-log head; a client-supplied `applied_seq` is accepted on the wire but ignored | A handoff is a request to move a task, not a request to pick the log prefix the target applies. A caller that could set the position could commit below the real head (dropping steps) or above it (stalling the switch). Only the orchestrator's append-only log is authoritative | Trust the caller's `applied_seq`; reject the request outright (breaks existing clients) |
+| 2026-11-16 | A drained source is barred from starting new steps; the scenario loop parks until the commit clears the drain, then resumes on the new owner | AC-1 requires the source to be drained *and* the target to run the remaining steps. Without the bar, the source keeps issuing steps after the switch; without the park-then-resume, the target never runs anything | Let both devices race; stop the source only after the commit |
+| 2026-11-16 | The handoff driver's `wait_for` skips `ToolResult` and `Pong`, but reports any other unexpected reply | A mid-task device keeps sending tool results during the handoff, so treating one as a refusal broke AC-1. Swallowing *everything* would hide a genuinely wrong reply | Treat every interleaved message as fatal; skip all messages |
 
 ## Conventions
 

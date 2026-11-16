@@ -344,16 +344,33 @@ impl HandoffDriver {
     where
         F: Fn(&Payload) -> bool,
     {
-        match tokio::time::timeout(limit, mailbox.inbound.recv()).await {
-            Ok(Some(msg)) => {
-                if predicate(&msg.payload) {
-                    Reply::Matched
-                } else {
-                    Reply::Other(msg.payload.kind_name())
-                }
+        // A device that is mid-task keeps sending `ToolResult`s while the
+        // handoff is in flight, and keepalive `Pong`s arrive on their own
+        // schedule. Those are not refusals to answer, so they are skipped.
+        // The deadline covers the whole window, not one message. Anything
+        // else is a wrong reply and is reported, not swallowed.
+        let deadline = std::time::Instant::now() + limit;
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Reply::Silent;
             }
-            Ok(None) => Reply::Silent,
-            Err(_) => Reply::Silent,
+            match tokio::time::timeout(remaining, mailbox.inbound.recv()).await {
+                Ok(Some(msg)) => {
+                    if predicate(&msg.payload) {
+                        return Reply::Matched;
+                    }
+                    if matches!(
+                        &msg.payload,
+                        Payload::ToolResult { .. } | Payload::Pong { .. }
+                    ) {
+                        continue;
+                    }
+                    return Reply::Other(msg.payload.kind_name());
+                }
+                Ok(None) => return Reply::Silent,
+                Err(_) => return Reply::Silent,
+            }
         }
     }
 
