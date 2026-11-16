@@ -21,12 +21,10 @@
 //! Usage:
 //!
 //! ```ignore
-//! let mut harness = common::E2ETest::new().await;
+//! let devices = common::make_devices(2);          // keys for dev-0, dev-1
+//! let mut harness = common::E2ETest::with_devices(&devices).await;
 //! let port = harness.port();
-//! let agents = harness
-//!     .spawn_agent(port, &agent_bin, &key_file, &orch_key)
-//!     .await
-//!     .expect("agent registers");
+//! harness.spawn_agent(port, "dev-0", &devices["dev-0"].key_file, &orch_key).await?;
 //! harness.stop().await;
 //! ```
 
@@ -94,6 +92,53 @@ pub fn free_port() -> u16 {
 pub struct Phase {
     pub name: String,
     pub elapsed: Duration,
+}
+
+/// A key pair generated for one device, plus its device id and public half.
+#[derive(Debug, Clone)]
+pub struct DeviceKey {
+    pub device: String,
+    /// Base64 verifying key, as the enrollment file wants it.
+    pub public_key: String,
+    /// The seed file the agent reads (`HIMAN_AGENT_KEY_FILE`).
+    pub key_file: PathBuf,
+}
+
+/// Generate `n` agent keys named `dev-0..dev-n-1` in `dir`, returning them in
+/// order. One call is the single place a test gets keys from, so the
+/// enrollment file and the agents always agree.
+pub fn make_devices(dir: &Path, n: usize) -> Vec<DeviceKey> {
+    make_devices_named(dir, n, |i| format!("dev-{i}"))
+}
+
+/// Generate `n` agent keys with caller-chosen ids, returning them in order.
+pub fn make_devices_named<I, S>(dir: &Path, n: usize, ids: I) -> Vec<DeviceKey>
+where
+    I: Fn(usize) -> S,
+    S: Into<String>,
+{
+    let agent_bin = binary("himan-agent-pc").expect("build himan-agent-pc first");
+    (0..n)
+        .map(|i| {
+            let device: String = ids(i).into();
+            let key_file = dir.join(format!("{device}.key"));
+            let (public_key, key_file) = generate_agent_key(&agent_bin, &key_file);
+            DeviceKey {
+                device,
+                public_key,
+                key_file,
+            }
+        })
+        .collect()
+}
+
+/// Write an enrollment file listing every device in `devices`.
+pub fn write_enrollment(path: &Path, devices: &[DeviceKey]) {
+    let map: Vec<String> = devices
+        .iter()
+        .map(|d| format!(r#""{}":"{}""#, d.device, d.public_key))
+        .collect();
+    std::fs::write(path, format!("{{{}}}", map.join(","))).expect("write enrollment file");
 }
 
 /// A child process whose stdout and stderr go to files, never pipes.
@@ -166,19 +211,20 @@ impl Child {
 }
 
 /// The real-binaries e2e harness: one orchestrator process plus any agents.
-#[allow(dead_code)] // several accessors exist for the e2e suite, not this test
 pub struct E2ETest {
     orch: Child,
     agents: Vec<Child>,
     port: u16,
     orch_key: String,
+    /// Set by [`E2ETest::new`]: the enrolled agent key it generated.
     agent_key_file: Option<PathBuf>,
+    /// Set by [`E2ETest::new`]: the public half of that key.
     agent_public_key: Option<String>,
-    /// Owns the temp dirs backing `agent_key_file` / `orch_key_file`. Dropping
-    /// this would delete the files while the agent still needs them, so it must
-    /// outlive the child processes.
-    _dirs: Vec<tempfile::TempDir>,
     log_dir: tempfile::TempDir,
+    /// Owns the temp dirs backing the device key files. Dropping this would
+    /// delete them while the agents still need them, so it must outlive the
+    /// child processes.
+    _dirs: Vec<tempfile::TempDir>,
     phase_start: Instant,
     phases: Vec<Phase>,
 }
@@ -187,37 +233,35 @@ impl E2ETest {
     /// Spawn a real orchestrator in Secure mode with a freshly generated
     /// `pc-1` agent key, already enrolled, and wait for `GET /health` before
     /// returning.
-    ///
-    /// The generated agent key is available through [`E2ETest::agent_key_file`]
-    /// and its public half through [`E2ETest::agent_public_key`], so a test can
-    /// go straight from `new()` to a real registered agent.
     pub async fn new() -> Self {
         let dir = tempfile::tempdir().expect("orch tempdir");
-        let key_file = dir.path().join("orchestrator.key");
-        let agent_key_file = dir.path().join("agent.key");
-
-        let agent_bin = binary("himan-agent-pc").expect("build himan-agent-pc first");
-        let (agent_public_key, agent_key_file) = generate_agent_key(&agent_bin, &agent_key_file);
-
+        let devices = make_devices_named(dir.path(), 1, |_| "pc-1");
         let enrollment_file = dir.path().join("enrolled.json");
-        std::fs::write(
-            &enrollment_file,
-            format!(r#"{{"pc-1":"{agent_public_key}"}}"#),
-        )
-        .expect("write enrollment file");
+        write_enrollment(&enrollment_file, &devices);
+        let key_file = dir.path().join("orchestrator.key");
 
         let mut harness = Self::spawn_orchestrator(key_file, enrollment_file).await;
-        harness.agent_key_file = Some(agent_key_file);
-        harness.agent_public_key = Some(agent_public_key);
+        harness.agent_key_file = Some(devices[0].key_file.clone());
+        harness.agent_public_key = Some(devices[0].public_key.clone());
         harness._dirs.push(dir);
         harness
     }
 
     /// Spawn a real orchestrator with explicit key and enrollment files, so a
     /// test can enroll exactly the devices it needs.
-    #[allow(dead_code)] // used by the e2e suite, not by fast_roundtrip
     pub async fn with_key_file(key_file: &Path, enrollment_file: &Path) -> Self {
         Self::spawn_orchestrator(key_file.to_path_buf(), enrollment_file.to_path_buf()).await
+    }
+
+    /// Spawn a real orchestrator enrolled for every device in `devices`.
+    pub async fn with_devices(devices: &[DeviceKey]) -> Self {
+        let dir = tempfile::tempdir().expect("orch tempdir");
+        let enrollment_file = dir.path().join("enrolled.json");
+        write_enrollment(&enrollment_file, devices);
+        let key_file = dir.path().join("orchestrator.key");
+        let mut harness = Self::spawn_orchestrator(key_file, enrollment_file).await;
+        harness._dirs.push(dir);
+        harness
     }
 
     async fn spawn_orchestrator(key_file: PathBuf, enrollment_file: PathBuf) -> Self {
@@ -249,8 +293,8 @@ impl E2ETest {
                 orch_key,
                 agent_key_file: None,
                 agent_public_key: None,
-                _dirs: Vec::new(),
                 log_dir,
+                _dirs: Vec::new(),
                 phase_start: Instant::now(),
                 phases: Vec::new(),
             },
@@ -268,16 +312,8 @@ impl E2ETest {
     }
 
     /// Alias for [`E2ETest::port`], kept for the existing e2e test wording.
-    #[allow(dead_code)] // used by the e2e suite, not by fast_roundtrip
     pub fn orchestrator_port(&self) -> u16 {
         self.port
-    }
-
-    /// A file holding the orchestrator's advertised verifying key (base64),
-    /// suitable for an agent to pin via `HIMAN_ORCH_KEY`.
-    #[allow(dead_code)] // used by the e2e suite, not by fast_roundtrip
-    pub fn orch_key_file(&self) -> PathBuf {
-        self.log_dir.path().join("orchestrator.pub")
     }
 
     /// The agent key file [`E2ETest::new`] generated, if that constructor was
@@ -292,7 +328,6 @@ impl E2ETest {
     }
 
     /// The API token the orchestrator was started with.
-    #[allow(dead_code)] // used by the e2e suite, not by fast_roundtrip
     pub fn api_token(&self) -> &str {
         API_TOKEN
     }
@@ -316,7 +351,6 @@ impl E2ETest {
     }
 
     /// The recorded phases, in order.
-    #[allow(dead_code)] // used by the e2e suite, not by fast_roundtrip
     pub fn phases(&self) -> &[Phase] {
         &self.phases
     }
@@ -338,23 +372,39 @@ impl E2ETest {
         eprintln!("=== end timings ===");
     }
 
-    /// Spawn a real agent as `pc-1` and wait until the orchestrator reports it
-    /// in `/api/v1/agents`, polling every 100 ms under a hard timeout.
+    /// Spawn a real agent as `device_id` and wait until the orchestrator reports
+    /// it in `/api/v1/agents`, polling every 100 ms under a hard timeout.
     ///
     /// On timeout the child is killed and the last 40 lines of the agent's
     /// stdout/stderr are included in the error.
     pub async fn spawn_agent(
         &mut self,
         orch_port: u16,
-        agent_bin: &Path,
+        device_id: &str,
         agent_key_file: &Path,
         orch_key: &str,
     ) -> Result<Value, String> {
+        self.spawn_agent_with(orch_port, device_id, agent_key_file, orch_key, Vec::new())
+            .await
+    }
+
+    /// Spawn a real agent with extra CLI args (for example the deterministic
+    /// scenario task), under `device_id`.
+    pub async fn spawn_agent_with(
+        &mut self,
+        orch_port: u16,
+        device_id: &str,
+        agent_key_file: &Path,
+        orch_key: &str,
+        extra_args: Vec<String>,
+    ) -> Result<Value, String> {
+        let mut args = vec!["--ws".to_string(), format!("ws://127.0.0.1:{orch_port}/ws")];
+        args.extend(extra_args);
         let mut child = Child::spawn(
-            agent_bin,
-            vec!["--ws".to_string(), format!("ws://127.0.0.1:{orch_port}/ws")],
+            &binary("himan-agent-pc").expect("build himan-agent-pc first"),
+            args,
             vec![
-                ("HIMAN_DEVICE_ID".to_string(), "pc-1".to_string()),
+                ("HIMAN_DEVICE_ID".to_string(), device_id.to_string()),
                 (
                     "HIMAN_AGENT_KEY_FILE".to_string(),
                     agent_key_file.display().to_string(),
@@ -381,7 +431,6 @@ impl E2ETest {
     /// devices, polling every 100 ms under `timeout_secs` (capped at
     /// [`HARD_TIMEOUT`]). On timeout the last 40 lines of every child log are
     /// included in the panic message.
-    #[allow(dead_code)] // used by the e2e suite, not by fast_roundtrip
     pub async fn wait_for_registration(&mut self, count: usize, timeout_secs: u64) {
         let hard = Duration::from_secs(timeout_secs.min(HARD_TIMEOUT.as_secs()));
         if let Err(message) = wait_for_registration(self.port, count, hard).await {
@@ -508,6 +557,27 @@ pub fn http_get_json(port: u16, path: &str) -> Value {
     serde_json::from_str(&body).expect("json")
 }
 
+/// `GET` a JSON route and return `(status, body)`, so a test can assert a
+/// refusal without panicking.
+pub fn http_get(port: u16, path: &str) -> (u16, Value) {
+    let url = format!("http://127.0.0.1:{port}{path}");
+    match ureq::get(&url)
+        .set("Authorization", &format!("Bearer {API_TOKEN}"))
+        .call()
+    {
+        Ok(response) => {
+            let status = response.status();
+            let text = response.into_string().unwrap_or_default();
+            (status, serde_json::from_str(&text).unwrap_or(Value::Null))
+        }
+        Err(ureq::Error::Status(code, response)) => {
+            let text = response.into_string().unwrap_or_default();
+            (code, serde_json::from_str(&text).unwrap_or(Value::Null))
+        }
+        Err(error) => panic!("GET {path} on port {port} failed: {error}"),
+    }
+}
+
 /// `POST` a JSON body to a route on the test orchestrator with the harness
 /// token and return the parsed response.
 pub fn http_post_json(port: u16, path: &str, body: Value) -> Value {
@@ -522,6 +592,27 @@ pub fn http_post_json(port: u16, path: &str, body: Value) -> Value {
         }
         Err(ureq::Error::Status(code, response)) => {
             panic!("POST {path} on port {port} returned HTTP {code}: {response:?}");
+        }
+        Err(error) => panic!("POST {path} on port {port} failed: {error}"),
+    }
+}
+
+/// `POST` a JSON body and return `(status, body)`, so a test can assert a
+/// refusal without panicking.
+pub fn http_post(port: u16, path: &str, body: Value) -> (u16, Value) {
+    let url = format!("http://127.0.0.1:{port}{path}");
+    match ureq::post(&url)
+        .set("Authorization", &format!("Bearer {API_TOKEN}"))
+        .send_json(body)
+    {
+        Ok(response) => {
+            let status = response.status();
+            let text = response.into_string().unwrap_or_default();
+            (status, serde_json::from_str(&text).unwrap_or(Value::Null))
+        }
+        Err(ureq::Error::Status(code, response)) => {
+            let text = response.into_string().unwrap_or_default();
+            (code, serde_json::from_str(&text).unwrap_or(Value::Null))
         }
         Err(error) => panic!("POST {path} on port {port} failed: {error}"),
     }

@@ -33,12 +33,7 @@ async fn fast_roundtrip_real_binaries() {
 
     // The real agent registers over a real WebSocket.
     let agents: Value = harness
-        .spawn_agent(
-            orch_port,
-            &common::binary("himan-agent-pc").expect("agent binary"),
-            &agent_key_file,
-            &orch_key,
-        )
+        .spawn_agent(orch_port, "pc-1", &agent_key_file, &orch_key)
         .await
         .expect("agent registers");
     harness.record_phase("agent registered");
