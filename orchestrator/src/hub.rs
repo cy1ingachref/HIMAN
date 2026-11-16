@@ -49,10 +49,10 @@ pub struct AgentSession {
     pub device: DeviceInfo,
     pub tx: mpsc::Sender<WireMessage>,
     /// The agent's inbound messages, retained so the handoff driver can read
-    /// its replies. The socket handler owns the stream and forwards into this
-    /// receiver's sender half; the driver takes the receiver half.
-    pub inbound_tx: mpsc::Sender<WireMessage>,
-    pub inbound_rx: Mutex<Option<mpsc::Receiver<WireMessage>>>,
+    /// its replies. The socket handler publishes into `inbound_tx`; the driver
+    /// subscribes with `inbound Subscribe` and never takes the receiver away,
+    /// so a reply is never dropped while a handoff is in flight.
+    pub inbound_tx: tokio::sync::broadcast::Sender<WireMessage>,
 }
 
 /// A deterministic scenario task the orchestrator is driving.
@@ -257,14 +257,15 @@ impl Hub {
         }
 
         keys.insert(info.id.clone(), claimed);
-        let (inbound_tx, inbound_rx) = mpsc::channel(self.config.agent_queue);
+        // Broadcast so the handoff driver can subscribe without taking the
+        // receiver away from the socket handler.
+        let (inbound_tx, _inbound_rx) = tokio::sync::broadcast::channel(self.config.agent_queue);
         agents.insert(
             info.id.clone(),
             AgentSession {
                 device: info.clone(),
                 tx,
                 inbound_tx,
-                inbound_rx: Mutex::new(Some(inbound_rx)),
             },
         );
 
@@ -457,7 +458,6 @@ impl Hub {
                     device: session.device.clone(),
                     tx: session.tx.clone(),
                     inbound_tx: session.inbound_tx.clone(),
-                    inbound_rx: Mutex::new(None),
                 },
                 session.device.clone(),
             )
@@ -558,12 +558,16 @@ impl Hub {
 
         // A scenario task is driven by the orchestrator: one tool call per
         // step, each with its own call id, so exactly-once is decided here.
+        // The total comes from the prompt ("... of N steps"), not from the
+        // caller-supplied arguments, so a test cannot quietly change the run
+        // length through the wire.
         if tool_name == "scenario_step" {
-            let total = call
-                .args
-                .get("total")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(20);
+            let total = prompt
+                .split_whitespace()
+                .map(str::parse::<u64>)
+                .find_map(Result::ok)
+                .unwrap_or(20)
+                .clamp(1, 200);
             {
                 let mut runs = self.scenarios.lock().await;
                 runs.insert(
@@ -692,7 +696,6 @@ impl Hub {
                     device: s.device.clone(),
                     tx: s.tx.clone(),
                     inbound_tx: s.inbound_tx.clone(),
-                    inbound_rx: Mutex::new(None),
                 })
             }
             .ok_or_else(|| ProtoError::Policy(format!("device {owner} is not connected")))?;
@@ -767,19 +770,27 @@ impl Hub {
         audit.events().to_vec()
     }
 
-    /// Take a device's inbound receiver, so the handoff driver can read that
-    /// agent's replies. Returns `None` if the receiver was already taken or the
-    /// device is not connected.
-    pub async fn take_inbound(&self, device: &DeviceId) -> Option<mpsc::Receiver<WireMessage>> {
+    /// Subscribe to a device's inbound messages so the handoff driver can read
+    /// that agent's replies.
+    ///
+    /// A broadcast subscription, not a taken receiver: the socket handler must
+    /// keep publishing while a handoff is in flight, and a reply must never be
+    /// dropped because the driver is reading.
+    pub async fn subscribe_inbound(
+        &self,
+        device: &DeviceId,
+    ) -> Option<tokio::sync::broadcast::Receiver<WireMessage>> {
         let agents = self.agents.lock().await;
         let session = agents.get(device)?;
-        let mut guard = session.inbound_rx.lock().await;
-        guard.take()
+        Some(session.inbound_tx.subscribe())
     }
 
     /// Clone the sender that feeds a device's inbound stream. The socket
     /// handler forwards agent messages through it.
-    pub async fn inbound_sender(&self, device: &DeviceId) -> Option<mpsc::Sender<WireMessage>> {
+    pub async fn inbound_sender(
+        &self,
+        device: &DeviceId,
+    ) -> Option<tokio::sync::broadcast::Sender<WireMessage>> {
         let agents = self.agents.lock().await;
         agents.get(device).map(|s| s.inbound_tx.clone())
     }
@@ -798,14 +809,13 @@ impl Hub {
         let claimed = VerifyingKey::from_b64(&info.verifying_key)
             .expect("a registered device must carry a valid key");
         self.keys.lock().await.insert(info.id.clone(), claimed);
-        let (inbound_tx, inbound_rx) = mpsc::channel(self.config.agent_queue);
+        let (inbound_tx, _inbound_rx) = tokio::sync::broadcast::channel(self.config.agent_queue);
         self.agents.lock().await.insert(
             info.id.clone(),
             AgentSession {
                 device: info.clone(),
                 tx,
                 inbound_tx,
-                inbound_rx: Mutex::new(Some(inbound_rx)),
             },
         );
         self.presence.lock().await.register(info);
@@ -1045,11 +1055,11 @@ impl Hub {
         // The driver reads the agents' replies; the socket handler forwards
         // each inbound message into these channels.
         let source_rx = self
-            .take_inbound(from)
+            .subscribe_inbound(from)
             .await
             .ok_or_else(|| ProtoError::Policy(format!("{from} has no inbound channel")))?;
         let target_rx = self
-            .take_inbound(to)
+            .subscribe_inbound(to)
             .await
             .ok_or_else(|| ProtoError::Policy(format!("{to} has no inbound channel")))?;
 
@@ -1070,11 +1080,11 @@ impl Hub {
 
         let source = Mailbox {
             outbound: source_tx,
-            inbound: source_rx,
+            inbound: Box::new(source_rx),
         };
         let target = Mailbox {
             outbound: target_tx,
-            inbound: target_rx,
+            inbound: Box::new(target_rx),
         };
 
         let signer = {
@@ -1159,6 +1169,50 @@ impl Hub {
             }
         }
 
+        // A failed attempt must not leave the task ownerless or the epoch
+        // moved. If the driver did not reach the commit point, roll back the
+        // recorded attempt so the source keeps the task and stays usable.
+        if !outcome.committed {
+            if let Some(reason) = outcome.reason.clone() {
+                let now = Utc::now().timestamp();
+                let rolled_back = {
+                    let mut handoffs = self.handoffs.lock().await;
+                    match handoffs.get_mut(&handoff_id) {
+                        Some(record) => {
+                            let line = record.apply(
+                                HandoffEvent::Rollback {
+                                    reason: reason.clone(),
+                                },
+                                now,
+                                &self.handoff_timeouts,
+                            );
+                            match line {
+                                Ok(l) => {
+                                    let mut audit = self.audit.lock().await;
+                                    audit.append(l.action, from.to_string(), l.detail);
+                                    true
+                                }
+                                Err(e) => {
+                                    warn!(handoff = %handoff_id, error = %e, "rollback refused");
+                                    false
+                                }
+                            }
+                        }
+                        None => false,
+                    }
+                };
+                let mut drained = self.drained.lock().await;
+                drained.remove(task_id.as_str());
+                if rolled_back {
+                    warn!(
+                        handoff = %handoff_id,
+                        reason = %reason,
+                        "handoff rolled back; the source keeps the task"
+                    );
+                }
+            }
+        }
+
         let mut audit = self.audit.lock().await;
         audit.append(
             "handoff_driver_finished".into(),
@@ -1232,14 +1286,13 @@ mod tests {
         // sends fail with "agent queue full or closed", which is a test
         // artifact rather than a hub bug.
         std::mem::forget(rx);
-        let (inbound_tx, inbound_rx) = mpsc::channel(8);
+        let (inbound_tx, _inbound_rx) = tokio::sync::broadcast::channel(8);
         hub.agents.lock().await.insert(
             dev.id.clone(),
             AgentSession {
                 device: dev.clone(),
                 tx,
                 inbound_tx,
-                inbound_rx: Mutex::new(Some(inbound_rx)),
             },
         );
         hub.presence.lock().await.register(dev);
@@ -1461,8 +1514,7 @@ mod tests {
                 AgentSession {
                     device: dev.clone(),
                     tx,
-                    inbound_tx: mpsc::channel(8).0,
-                    inbound_rx: Mutex::new(None),
+                    inbound_tx: tokio::sync::broadcast::channel(8).0,
                 },
             );
             hub.presence.lock().await.register(dev);

@@ -287,6 +287,34 @@ impl E2ETest {
         enrollment_file: PathBuf,
         insecure_dev: bool,
     ) -> Self {
+        Self::spawn_orchestrator_env(key_file, enrollment_file, insecure_dev, Vec::new()).await
+    }
+
+    /// Spawn a real orchestrator enrolled for `devices`, with extra
+    /// orchestrator environment (for example a short handoff timeout).
+    pub async fn with_devices_env(
+        devices: &[DeviceKey],
+        extra_envs: Vec<(String, String)>,
+    ) -> Self {
+        let dir = tempfile::tempdir().expect("orch tempdir");
+        let enrollment_file = dir.path().join("enrolled.json");
+        write_enrollment(&enrollment_file, devices);
+        let key_file = dir.path().join("orchestrator.key");
+        let mut harness =
+            Self::spawn_orchestrator_env(key_file, enrollment_file, false, extra_envs).await;
+        harness.device_keys = devices.to_vec();
+        harness._dirs.push(dir);
+        harness
+    }
+
+    /// Spawn the real orchestrator with extra environment, so a test can set
+    /// the handoff timeouts it needs (for example a short warming window).
+    pub async fn spawn_orchestrator_env(
+        key_file: PathBuf,
+        enrollment_file: PathBuf,
+        insecure_dev: bool,
+        extra_envs: Vec<(String, String)>,
+    ) -> Self {
         let port = free_port();
         let _log_dir = tempfile::tempdir().expect("log dir");
         let mut envs: Vec<(String, String)> = vec![
@@ -307,6 +335,7 @@ impl E2ETest {
         } else {
             envs.push(("HIMAN_INSECURE_DEV".to_string(), "1".to_string()));
         }
+        envs.extend(extra_envs);
         let mut orch = Child::spawn(
             &binary("himan-orchestrator").expect("build himan-orchestrator first"),
             Vec::<String>::new(),
@@ -471,19 +500,46 @@ impl E2ETest {
         orch_key: &str,
         extra_args: Vec<String>,
     ) -> Result<Value, String> {
+        self.spawn_agent_full(
+            orch_port,
+            device_id,
+            agent_key_file,
+            orch_key,
+            extra_args,
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// Spawn a real agent with extra CLI args and extra environment.
+    ///
+    /// `extra_envs` is how a test makes a device behave a specific way (for
+    /// example `HIMAN_TEST_NEVER_READY=1` for the rollback scenario) without
+    /// changing the agent's production defaults.
+    pub async fn spawn_agent_full(
+        &mut self,
+        orch_port: u16,
+        device_id: &str,
+        agent_key_file: &Path,
+        orch_key: &str,
+        extra_args: Vec<String>,
+        extra_envs: Vec<(String, String)>,
+    ) -> Result<Value, String> {
         let mut args = vec!["--ws".to_string(), format!("ws://127.0.0.1:{orch_port}/ws")];
         args.extend(extra_args);
+        let mut envs = vec![
+            ("HIMAN_DEVICE_ID".to_string(), device_id.to_string()),
+            (
+                "HIMAN_AGENT_KEY_FILE".to_string(),
+                agent_key_file.display().to_string(),
+            ),
+            ("HIMAN_ORCH_KEY".to_string(), orch_key.to_string()),
+        ];
+        envs.extend(extra_envs);
         let mut child = Child::spawn(
             &binary("himan-agent-pc").expect("build himan-agent-pc first"),
             args,
-            vec![
-                ("HIMAN_DEVICE_ID".to_string(), device_id.to_string()),
-                (
-                    "HIMAN_AGENT_KEY_FILE".to_string(),
-                    agent_key_file.display().to_string(),
-                ),
-                ("HIMAN_ORCH_KEY".to_string(), orch_key.to_string()),
-            ],
+            envs,
         );
 
         let expected = self.agents.len() + 1;

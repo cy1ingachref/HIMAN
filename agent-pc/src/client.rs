@@ -411,6 +411,17 @@ impl AgentClient {
                     accepted,
                     "handoff prepare received"
                 );
+                // AC-3 needs a target that never sends Ready, so the
+                // orchestrator's warming timeout fires and the handoff rolls
+                // back. This switch exists only to make that failure
+                // reachable from a real binary; it is never set in production.
+                if std::env::var("HIMAN_TEST_NEVER_READY").as_deref() == Ok("1") {
+                    warn!(
+                        handoff = %handoff_id,
+                        "HIMAN_TEST_NEVER_READY=1: not sending HandoffReady"
+                    );
+                    return true;
+                }
                 if let Err(e) = self
                     .send(Payload::HandoffReady {
                         handoff_id: handoff_id.clone(),

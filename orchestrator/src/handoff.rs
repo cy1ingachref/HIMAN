@@ -121,11 +121,25 @@ pub struct HandoffTimeouts {
 
 impl Default for HandoffTimeouts {
     fn default() -> Self {
-        Self {
-            prepared: Duration::from_secs(5),
-            warming: Duration::from_secs(5),
-            shadowing: Duration::from_secs(20),
-            switching: Duration::from_secs(10),
+        // `HIMAN_TEST_HANDOFF_TIMEOUT_SECS` exists so an acceptance test can
+        // force a rollback quickly instead of waiting out the production
+        // window. Unset, the spec's values apply.
+        let secs = std::env::var("HIMAN_TEST_HANDOFF_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok());
+        match secs {
+            Some(s) if s > 0 => Self {
+                prepared: Duration::from_secs(s),
+                warming: Duration::from_secs(s),
+                shadowing: Duration::from_secs(s),
+                switching: Duration::from_secs(s),
+            },
+            _ => Self {
+                prepared: Duration::from_secs(5),
+                warming: Duration::from_secs(5),
+                shadowing: Duration::from_secs(20),
+                switching: Duration::from_secs(10),
+            },
         }
     }
 }

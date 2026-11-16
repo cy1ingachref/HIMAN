@@ -236,7 +236,7 @@ async fn prompt(
 async fn handoff(
     State(state): State<AppState>,
     Json(req): Json<HandoffRequest>,
-) -> impl IntoResponse {
+) -> axum::response::Response {
     let task_id = TaskId::new(req.task_id);
     let from = DeviceId::new(req.from);
     let to = DeviceId::new(req.to);
@@ -516,7 +516,7 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
         // reads. A message is never copied; the hub sees the original and the
         // driver gets a clone, so neither blocks the other.
         if let Some(sender) = state.hub.inbound_sender(&msg.meta.from).await {
-            let _ = sender.send(msg.clone()).await;
+            let _ = sender.send(msg.clone());
         }
 
         match state.hub.handle_message(msg).await {

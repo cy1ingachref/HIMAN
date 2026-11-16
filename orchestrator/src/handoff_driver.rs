@@ -44,7 +44,39 @@ impl Default for RetryPolicy {
 /// the driver send and receive without borrowing a session twice.
 pub struct Mailbox {
     pub outbound: mpsc::Sender<WireMessage>,
-    pub inbound: mpsc::Receiver<WireMessage>,
+    /// Receives that agent's replies. A trait object so the production path can
+    /// hand the driver a broadcast subscription (which cannot be "taken away"
+    /// from the socket handler) while the unit tests use a plain channel pair.
+    pub inbound: Box<dyn Inbound + Send + Sync>,
+}
+
+/// One inbound message source: the next reply from an agent.
+#[async_trait::async_trait]
+pub trait Inbound: Send + Sync {
+    async fn recv(&mut self) -> Option<WireMessage>;
+}
+
+#[async_trait::async_trait]
+impl Inbound for mpsc::Receiver<WireMessage> {
+    async fn recv(&mut self) -> Option<WireMessage> {
+        self.recv().await
+    }
+}
+
+#[async_trait::async_trait]
+impl Inbound for tokio::sync::broadcast::Receiver<WireMessage> {
+    async fn recv(&mut self) -> Option<WireMessage> {
+        loop {
+            match self.recv().await {
+                Ok(msg) => return Some(msg),
+                // A lagging subscriber has missed messages; the driver is
+                // waiting for a reply that was never produced, so keep waiting
+                // rather than reporting the channel closed.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    }
 }
 
 impl Mailbox {
@@ -59,11 +91,11 @@ impl Mailbox {
         (
             Self {
                 outbound: a_tx,
-                inbound: b_rx,
+                inbound: Box::new(b_rx),
             },
             Self {
                 outbound: b_tx,
-                inbound: a_rx,
+                inbound: Box::new(a_rx),
             },
         )
     }
