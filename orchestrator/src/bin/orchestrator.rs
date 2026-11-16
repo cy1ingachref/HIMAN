@@ -29,7 +29,21 @@ async fn main() {
         }
     };
 
-    let hub = Hub::with_key(HubConfig::default(), orchestrator_key);
+    // The per-device inbound queue size. A small queue is what makes a lag
+    // reachable, so it is configurable rather than hard-coded; the default is
+    // the production value.
+    let agent_queue: usize = std::env::var("HIMAN_AGENT_QUEUE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(64);
+
+    let hub = Hub::with_key(
+        HubConfig {
+            agent_queue,
+            ..HubConfig::default()
+        },
+        orchestrator_key,
+    );
     let hub = match himan_orchestrator::server::load_enrollment(hub) {
         Ok(h) => h,
         Err(e) => {

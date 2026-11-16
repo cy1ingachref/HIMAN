@@ -50,31 +50,45 @@ pub struct Mailbox {
     pub inbound: Box<dyn Inbound + Send + Sync>,
 }
 
+/// The result of waiting for the next inbound message.
+#[derive(Debug)]
+pub enum InboundEvent {
+    /// A message arrived. Boxed so a small variant (Lagged) does not inflate
+    /// the enum to the size of a whole wire message.
+    Message(Box<WireMessage>),
+    /// The stream ended: the peer is gone.
+    Closed,
+    /// This subscriber fell behind and lost messages.
+    ///
+    /// A lag is not a timeout and not a closed channel. It means the driver
+    /// cannot prove it saw every reply, so the caller must record it rather
+    /// than silently carrying on.
+    Lagged(u64),
+}
+
 /// One inbound message source: the next reply from an agent.
 #[async_trait::async_trait]
 pub trait Inbound: Send + Sync {
-    async fn recv(&mut self) -> Option<WireMessage>;
+    async fn recv(&mut self) -> InboundEvent;
 }
 
 #[async_trait::async_trait]
 impl Inbound for mpsc::Receiver<WireMessage> {
-    async fn recv(&mut self) -> Option<WireMessage> {
-        self.recv().await
+    async fn recv(&mut self) -> InboundEvent {
+        match self.recv().await {
+            Some(msg) => InboundEvent::Message(Box::new(msg)),
+            None => InboundEvent::Closed,
+        }
     }
 }
 
 #[async_trait::async_trait]
 impl Inbound for tokio::sync::broadcast::Receiver<WireMessage> {
-    async fn recv(&mut self) -> Option<WireMessage> {
-        loop {
-            match self.recv().await {
-                Ok(msg) => return Some(msg),
-                // A lagging subscriber has missed messages; the driver is
-                // waiting for a reply that was never produced, so keep waiting
-                // rather than reporting the channel closed.
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
-            }
+    async fn recv(&mut self) -> InboundEvent {
+        match self.recv().await {
+            Ok(msg) => InboundEvent::Message(Box::new(msg)),
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => InboundEvent::Lagged(n),
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => InboundEvent::Closed,
         }
     }
 }
@@ -227,6 +241,9 @@ impl HandoffDriver {
             }
             Reply::Other(kind) => Some(format!("expected HandoffReady, got {kind}")),
             Reply::Silent => Some("target never sent HandoffReady".into()),
+            Reply::Lagged(n) => Some(format!(
+                "lost {n} inbound message(s) waiting for HandoffReady"
+            )),
         }
     }
 
@@ -265,6 +282,9 @@ impl HandoffDriver {
             }
             Reply::Other(kind) => Some(format!("expected HandoffDrained, got {kind}")),
             Reply::Silent => Some("source never drained".into()),
+            Reply::Lagged(n) => Some(format!(
+                "lost {n} inbound message(s) waiting for HandoffDrained"
+            )),
         }
     }
 
@@ -317,6 +337,15 @@ impl HandoffDriver {
                         start,
                         attempts,
                         Some(format!("expected HandoffSwitched, got {kind}")),
+                    );
+                }
+                Reply::Lagged(n) => {
+                    return self.finish(
+                        start,
+                        attempts,
+                        Some(format!(
+                            "lost {n} inbound message(s) waiting for HandoffSwitched"
+                        )),
                     );
                 }
                 Reply::Silent => {
@@ -388,7 +417,7 @@ impl HandoffDriver {
                 return Reply::Silent;
             }
             match tokio::time::timeout(remaining, mailbox.inbound.recv()).await {
-                Ok(Some(msg)) => {
+                Ok(InboundEvent::Message(msg)) => {
                     if predicate(&msg.payload) {
                         return Reply::Matched;
                     }
@@ -400,7 +429,11 @@ impl HandoffDriver {
                     }
                     return Reply::Other(msg.payload.kind_name());
                 }
-                Ok(None) => return Reply::Silent,
+                Ok(InboundEvent::Closed) => return Reply::Silent,
+                // A lag means the driver cannot prove it saw every reply.
+                // Report it so the caller records `inbound_lagged` instead of
+                // silently continuing as if nothing was missed.
+                Ok(InboundEvent::Lagged(n)) => return Reply::Lagged(n),
                 Err(_) => return Reply::Silent,
             }
         }
@@ -430,6 +463,8 @@ enum Reply {
     Matched,
     Other(&'static str),
     Silent,
+    /// The inbound subscription fell behind and lost `n` messages.
+    Lagged(u64),
 }
 
 #[cfg(test)]

@@ -1213,6 +1213,24 @@ impl Hub {
             }
         }
 
+        // A lagging inbound subscription means the driver cannot prove it saw
+        // every reply. Record it in the audit: silently carrying on would hide
+        // exactly the evidence a handoff failure needs.
+        if let Some(reason) = outcome.reason.as_deref() {
+            if let Some(rest) = reason
+                .strip_prefix("lost ")
+                .and_then(|r| r.split(" inbound").next())
+                .and_then(|n| n.parse::<u64>().ok())
+            {
+                let mut audit = self.audit.lock().await;
+                audit.append(
+                    "inbound_lagged".into(),
+                    from.to_string(),
+                    format!("handoff={handoff_id} lost={rest} message(s)"),
+                );
+            }
+        }
+
         let mut audit = self.audit.lock().await;
         audit.append(
             "handoff_driver_finished".into(),

@@ -40,7 +40,7 @@ async fn peer(
     seen: Arc<Mutex<Vec<&'static str>>>,
 ) {
     let mut mailbox = mailbox;
-    while let Some(msg) = mailbox.inbound.recv().await {
+    while let crate::handoff_driver::InboundEvent::Message(msg) = mailbox.inbound.recv().await {
         seen.lock().await.push(msg.payload.kind_name());
         for (trigger, reply) in &replies {
             if msg.payload.kind_name() == *trigger {
@@ -169,7 +169,10 @@ async fn a_silent_target_never_sends_ready_so_the_handoff_does_not_commit() {
     // The peer stays silent: it receives the prepare and replies with nothing.
     tokio::spawn(async move {
         let mut m = peer_target;
-        while m.inbound.recv().await.is_some() {}
+        while matches!(
+            m.inbound.recv().await,
+            crate::handoff_driver::InboundEvent::Message(_)
+        ) {}
     });
 
     let outcome = HandoffDriver::new(
@@ -269,7 +272,7 @@ async fn the_commit_is_retried_after_the_first_ack_is_lost() {
     let t = tokio::spawn(async move {
         let mut m = peer_target;
         let mut commits = 0;
-        while let Some(msg) = m.inbound.recv().await {
+        while let crate::handoff_driver::InboundEvent::Message(msg) = m.inbound.recv().await {
             match msg.payload.kind_name() {
                 "handoff_prepare" => {
                     let meta = WireMeta {
@@ -458,4 +461,81 @@ async fn an_unexpected_reply_is_reported_not_swallowed() {
     assert!(!outcome.committed);
     let reason = outcome.reason.unwrap();
     assert!(reason.contains("expected HandoffReady"), "got: {reason}");
+}
+
+#[tokio::test]
+async fn a_lagging_subscription_is_reported_not_swallowed() {
+    // A broadcast channel of capacity 1: the driver subscribes, the peer fills
+    // the slot with a message the driver is not waiting for, then sends the
+    // reply. The next recv() reports Lagged rather than silently skipping.
+    let key = SigningKey::generate();
+    let (drv_source, _peer_source) = Mailbox::pair(4);
+    let (tx, drv_target_rx) = tokio::sync::broadcast::channel::<WireMessage>(1);
+    let (out_tx, mut out_rx) = mpsc::channel(4);
+    // Keep the outbound receiver alive: dropping it makes every send fail.
+    tokio::spawn(async move { while out_rx.recv().await.is_some() {} });
+    let drv_target = Mailbox {
+        outbound: out_tx,
+        inbound: Box::new(drv_target_rx),
+    };
+    let peer_target = tx.clone();
+    let peer_key = key.clone();
+
+    tokio::spawn(async move {
+        // Fill the single slot, then send the real reply: the subscriber falls
+        // behind and the lag surfaces on the recv after the reply.
+        let noise = WireMessage::sign(
+            WireMeta {
+                seq: 1,
+                ts: 1_700_000_000,
+                from: DeviceId::new("peer"),
+                to: "orchestrator".into(),
+            },
+            Payload::Ping { nonce: 1 },
+            &peer_key,
+        )
+        .expect("sign");
+        let _ = peer_target.send(noise);
+        let reply = WireMessage::sign(
+            WireMeta {
+                seq: 2,
+                ts: 1_700_000_000,
+                from: DeviceId::new("peer"),
+                to: "orchestrator".into(),
+            },
+            Payload::HandoffReady {
+                handoff_id: "h7".into(),
+                applied_seq: 0,
+                capabilities: "full".into(),
+            },
+            &peer_key,
+        )
+        .expect("sign");
+        let _ = peer_target.send(reply);
+    });
+
+    let outcome = HandoffDriver::new(
+        Handoff::prepared(
+            "h7",
+            TaskId::new("t1"),
+            DeviceId::new("pc-1"),
+            DeviceId::new("phone-1"),
+            0,
+            0,
+            0,
+        ),
+        drv_source,
+        drv_target,
+        fast_timeouts(),
+        RetryPolicy::default(),
+    )
+    .run(&token("t1", "pc-1", "phone-1"), 0, signer(&key), || 0)
+    .await;
+
+    assert!(!outcome.committed);
+    let reason = outcome.reason.expect("a lag must produce a reason");
+    assert!(
+        reason.contains("lost 1 inbound message"),
+        "the lag must be reported with the count: {reason}"
+    );
 }
