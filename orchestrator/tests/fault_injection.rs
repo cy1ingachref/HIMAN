@@ -12,7 +12,9 @@ use serde_json::json;
 #[tokio::test]
 async fn a_default_build_has_no_fault_injection_hook() {
     let mut harness = common::E2ETest::new_with_devices(&["dev-a", "dev-b"]).await;
-    // Deliberately NOT calling use_fault_injection_agent().
+    // Deliberately NOT calling use_fault_injection_agent(). Force the default
+    // build so the test does not depend on whatever ran before it.
+    harness.use_default_agent();
     let port = harness.port();
     let orch_key = harness.orchestrator_key().expect("orchestrator key");
 

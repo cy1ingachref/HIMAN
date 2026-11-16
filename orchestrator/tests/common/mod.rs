@@ -119,6 +119,31 @@ pub fn build_agent_with_faults() -> PathBuf {
     fault_target.join("debug").join(exe)
 }
 
+/// Ensure the default agent binary is built WITHOUT any feature, and return it.
+///
+/// Cargo features are additive and share one artifact path, so a previous
+/// `--features fault-injection` build in the default target dir would leave a
+/// hooked binary in place. Rebuilding here makes the "default build has no
+/// hook" test hermetic rather than dependent on what ran before it.
+pub fn build_default_agent() -> PathBuf {
+    let root = workspace_root();
+    let status = Command::new("cargo")
+        .args(["build", "-p", "himan-agent-pc", "--bin", "himan-agent-pc"])
+        .current_dir(&root)
+        .status()
+        .expect("run cargo build for himan-agent-pc");
+    assert!(
+        status.success(),
+        "failed to build the default himan-agent-pc"
+    );
+    let exe = if cfg!(windows) {
+        "himan-agent-pc.exe"
+    } else {
+        "himan-agent-pc"
+    };
+    root.join("target/debug").join(exe)
+}
+
 /// Bind an ephemeral port on loopback and return it.
 ///
 /// The listener is dropped before the caller binds it, so a fast restart can
@@ -422,6 +447,13 @@ impl E2ETest {
     /// `cargo build` product; this is the only way a test gets the hooks.
     pub fn use_fault_injection_agent(&mut self) -> PathBuf {
         let bin = build_agent_with_faults();
+        self.agent_bin = Some(bin.clone());
+        bin
+    }
+
+    /// Drive an explicitly built default agent binary (no features).
+    pub fn use_default_agent(&mut self) -> PathBuf {
+        let bin = build_default_agent();
         self.agent_bin = Some(bin.clone());
         bin
     }

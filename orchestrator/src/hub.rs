@@ -353,6 +353,30 @@ impl Hub {
                 state,
                 output,
             } => {
+                // Fencing: only the current owner may report a result. A stale
+                // old owner that writes after the switch is rejected and
+                // audit-logged, which is the section-8 "stale epoch" row.
+                let fenced = {
+                    let owners = self.owners.lock().await;
+                    match owners.get(task_id.as_str()) {
+                        Some(current) if current.owner != msg.meta.from => Err(format!(
+                            "device {} reported a result for task {task_id} but {} owns it",
+                            msg.meta.from, current.owner
+                        )),
+                        _ => Ok(()),
+                    }
+                };
+                if let Err(reason) = fenced {
+                    let mut audit = self.audit.lock().await;
+                    audit.append(
+                        "stale_epoch_write".into(),
+                        msg.meta.from.to_string(),
+                        reason.clone(),
+                    );
+                    warn!("{reason}");
+                    return Ok(None);
+                }
+
                 // A result may arrive for a task the store does not know (the
                 // orchestrator restarted, or the agent is reporting a task it
                 // initiated). Upsert rather than drop: losing a result is
@@ -1736,5 +1760,66 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not known"));
+    }
+
+    #[tokio::test]
+    async fn a_stale_owner_write_is_rejected_and_audited() {
+        // AC-4 "stale epoch write from the old owner after the switch". The
+        // old owner reports a result after the commit; the hub must refuse it
+        // and record `stale_epoch_write` rather than silently applying it.
+        let (hub, a, b) = hub_with_two().await;
+        let task = TaskId::new("t1");
+        // The target owns at epoch 1 after the switch.
+        hub.owners
+            .lock()
+            .await
+            .register("t1".to_owned(), DeviceId::new("pc-1"))
+            .unwrap();
+        hub.owners
+            .lock()
+            .await
+            .commit("t1", DeviceId::new("phone-1"), 1)
+            .unwrap();
+
+        // The old owner (pc-1) forges a result for the task it no longer owns.
+        let msg = WireMessage::sign(
+            WireMeta {
+                seq: 1,
+                ts: Utc::now().timestamp(),
+                from: DeviceId::new("pc-1"),
+                to: "orchestrator".into(),
+            },
+            Payload::ToolResult {
+                task_id: task.clone(),
+                state: TaskState::Succeeded,
+                output: "stale".into(),
+            },
+            &a,
+        )
+        .unwrap();
+        let before = {
+            let audit = hub.audit.lock().await;
+            audit
+                .events()
+                .iter()
+                .filter(|l| l.action == "stale_epoch_write")
+                .count()
+        };
+        hub.handle_message(msg).await.unwrap();
+        let after = {
+            let audit = hub.audit.lock().await;
+            audit
+                .events()
+                .iter()
+                .filter(|l| l.action == "stale_epoch_write")
+                .count()
+        };
+        assert_eq!(after, before + 1, "the stale write must be audit-logged");
+
+        // The fencing state did not move.
+        let owner = hub.owner("t1").await.unwrap();
+        assert_eq!(owner.owner, DeviceId::new("phone-1"));
+        assert_eq!(owner.epoch, 1);
+        let _ = b;
     }
 }

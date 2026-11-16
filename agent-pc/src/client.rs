@@ -470,6 +470,17 @@ impl AgentClient {
                 new_epoch,
             } => {
                 info!(handoff = %handoff_id, new_epoch, "drain requested");
+                // AC-4 "kill the source in Shadowing": the source stops
+                // answering at the drain, so the switch times out and rolls
+                // back. Feature-gated.
+                #[cfg(feature = "fault-injection")]
+                if std::env::var("HIMAN_TEST_DRAIN_SILENT").as_deref() == Ok("1") {
+                    warn!(
+                        handoff = %handoff_id,
+                        "HIMAN_TEST_DRAIN_SILENT=1: not sending HandoffDrained"
+                    );
+                    return true;
+                }
                 self.request_stop().await;
                 if let Err(e) = self
                     .send(Payload::HandoffDrained {
@@ -498,6 +509,21 @@ impl AgentClient {
                     final_seq,
                     "handoff commit received; this device is now the owner"
                 );
+                // AC-4 "duplicate SwitchCommit": acknowledge twice so the
+                // driver sees the same commit acknowledged two times. The
+                // handoff must still be idempotent. Feature-gated.
+                #[cfg(feature = "fault-injection")]
+                let duplicate = std::env::var("HIMAN_TEST_DUPLICATE_COMMIT").as_deref() == Ok("1");
+                #[cfg(not(feature = "fault-injection"))]
+                let duplicate = false;
+                if duplicate {
+                    let _ = self
+                        .send(Payload::HandoffSwitched {
+                            handoff_id: handoff_id.clone(),
+                            new_epoch: *new_epoch,
+                        })
+                        .await;
+                }
                 if let Err(e) = self
                     .send(Payload::HandoffSwitched {
                         handoff_id: handoff_id.clone(),
@@ -607,6 +633,7 @@ impl AgentClient {
         } else {
             TaskState::Failed
         };
+
         if let Err(e) = self
             .send(Payload::ToolResult {
                 task_id: call.task_id,
