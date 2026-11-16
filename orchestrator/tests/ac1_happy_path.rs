@@ -60,13 +60,13 @@ async fn ac1_mid_run_handoff_is_atomic_and_complete() {
     let handoff = common::http_post(
         port,
         "/api/v1/handoff",
+        // Deliberately no `applied_seq`: the checkpoint is the orchestrator's
+        // own event-log head, never a caller-supplied position
+        // (docs/DECISIONS.md). Sending one here would assert nothing.
         json!({
             "task_id": task_id,
             "from": "dev-a",
             "to": "dev-b",
-            // A stale client-supplied checkpoint. The orchestrator must ignore
-            // it and use its own log head (see docs/DECISIONS.md).
-            "applied_seq": 1,
         }),
     );
     assert_eq!(
@@ -171,6 +171,46 @@ async fn ac1_mid_run_handoff_is_atomic_and_complete() {
     assert!(
         last_a < first_b,
         "the target re-ran steps the source already did (last_a={last_a}, first_b={first_b})"
+    );
+
+    // 4b. Single owner, from the orchestrator's own event log: every step the
+    //     source executed has a lower seq than every step the target executed.
+    //     This is stronger than comparing step numbers, because the seq is
+    //     assigned by the orchestrator at issue time — two owners writing
+    //     interleaved would show up as an interleaving here.
+    let events = common::http_get_json(port, &format!("/api/v1/tasks/{task_id}/events"));
+    let per_device: std::collections::BTreeMap<String, Vec<u64>> = events["devices"]
+        .as_array()
+        .map(|a| {
+            let seqs: Vec<u64> = events["seqs"].as_array().map_or(Vec::new(), |s| {
+                s.iter().filter_map(|v| v.as_u64()).collect()
+            });
+            let mut map: std::collections::BTreeMap<String, Vec<u64>> =
+                std::collections::BTreeMap::new();
+            for (device, seq) in a.iter().zip(seqs.iter()) {
+                map.entry(device.as_str().unwrap_or_default().to_string())
+                    .or_default()
+                    .push(*seq);
+            }
+            map
+        })
+        .unwrap_or_default();
+
+    let a_seqs = per_device.get("dev-a").cloned().unwrap_or_default();
+    let b_seqs = per_device.get("dev-b").cloned().unwrap_or_default();
+    assert!(
+        !a_seqs.is_empty(),
+        "the source produced no events: {events}"
+    );
+    assert!(
+        !b_seqs.is_empty(),
+        "the target produced no events: {events}"
+    );
+    let max_a = a_seqs.iter().max().copied().unwrap_or(0);
+    let min_b = b_seqs.iter().min().copied().unwrap_or(u64::MAX);
+    assert!(
+        max_a < min_b,
+        "the two owners' step events interleave (source max seq {max_a}, target min seq {min_b})"
     );
 
     // 5. The orchestrator's event log for the task is continuous.
