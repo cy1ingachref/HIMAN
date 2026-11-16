@@ -129,6 +129,7 @@ jobs:
           cargo test -p himan-orchestrator --test fast_roundtrip -- --nocapture
           cargo test -p himan-orchestrator --test handoff_http -- --nocapture
           cargo test -p himan-orchestrator --test ac1_happy_path -- --nocapture
+          cargo test -p himan-orchestrator --test ac2_ac3 -- --nocapture
 
   # Dependency audit: fail on any known-vulnerable crate.
   audit:
