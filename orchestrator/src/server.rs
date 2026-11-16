@@ -239,6 +239,13 @@ async fn handoff(
         .await
     {
         Ok(outcome) => {
+            info!(
+                "handoff driver finished: state={} epoch={} commits={} reason={:?}",
+                outcome.state.as_str(),
+                outcome.epoch,
+                outcome.commit_attempts,
+                outcome.reason
+            );
             let body = HandoffResponse {
                 handoff_id: outcome.handoff_id,
                 state: outcome.state.as_str().to_string(),
@@ -249,13 +256,16 @@ async fn handoff(
             };
             (StatusCode::OK, Json(body)).into_response()
         }
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )
-            .into_response(),
+        Err(e) => {
+            warn!("handoff driver error: {e}");
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: e.to_string(),
+                }),
+            )
+                .into_response()
+        }
     }
 }
 

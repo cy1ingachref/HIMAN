@@ -182,6 +182,7 @@ impl HandoffDriver {
         .await
         {
             Reply::Matched => {
+                info!("driver: received HandoffReady from target");
                 self.apply(HandoffEvent::PrepareAccepted, clock);
                 self.apply(
                     HandoffEvent::TargetReady {
@@ -221,6 +222,7 @@ impl HandoffDriver {
         .await
         {
             Reply::Matched => {
+                info!("driver: received HandoffDrained from source");
                 self.apply(
                     HandoffEvent::SourceDrained {
                         last_seq: applied_seq,

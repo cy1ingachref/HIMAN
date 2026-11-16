@@ -355,50 +355,6 @@ impl AgentClient {
                     info!(handoff = %handoff_id, %reason, "handoff rolled back");
                     continue;
                 }
-                // The target warmed: it reports the log position it has applied
-                // so the orchestrator can stream from the checkpoint.
-                Payload::HandoffReady {
-                    handoff_id,
-                    applied_seq,
-                    capabilities,
-                } => {
-                    info!(
-                        handoff = %handoff_id,
-                        applied_seq,
-                        %capabilities,
-                        "reporting shadow readiness"
-                    );
-                    if let Err(e) = self
-                        .send(Payload::HandoffProgress {
-                            handoff_id: handoff_id.clone(),
-                            applied_seq: *applied_seq,
-                        })
-                        .await
-                    {
-                        warn!(error = %e, "failed to send shadow progress");
-                        break;
-                    }
-                    continue;
-                }
-                // The orchestrator asks this device (as the source) to stop
-                // starting new steps and report the last seq it produced.
-                Payload::HandoffDrain {
-                    handoff_id,
-                    new_epoch,
-                } => {
-                    info!(handoff = %handoff_id, new_epoch, "drain requested");
-                    if let Err(e) = self
-                        .send(Payload::HandoffDrained {
-                            handoff_id: handoff_id.clone(),
-                            last_seq: self.last_seq,
-                        })
-                        .await
-                    {
-                        warn!(error = %e, "failed to send drain acknowledgement");
-                        break;
-                    }
-                    continue;
-                }
                 Payload::HandoffCommit {
                     handoff_id,
                     new_epoch,

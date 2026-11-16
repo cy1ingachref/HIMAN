@@ -381,9 +381,19 @@ impl Hub {
                 agents.remove(&msg.meta.from);
                 Ok(None)
             }
-            other => Err(ProtoError::Policy(format!(
-                "unexpected payload from agent: {other:?}"
-            ))),
+            other => match other {
+                // Handoff protocol messages are consumed by the driver, which
+                // reads from the session's inbound channel. The hub just drops
+                // them here with no error so the socket handler doesn't break.
+                Payload::HandoffReady { .. }
+                | Payload::HandoffProgress { .. }
+                | Payload::HandoffDrained { .. }
+                | Payload::HandoffSwitched { .. }
+                | Payload::HandoffAck { .. } => Ok(None),
+                _ => Err(ProtoError::Policy(format!(
+                    "unexpected payload from agent: {other:?}"
+                ))),
+            },
         }
     }
 
