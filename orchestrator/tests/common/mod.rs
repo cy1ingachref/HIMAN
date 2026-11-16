@@ -79,6 +79,46 @@ pub fn binary(name: &str) -> Option<PathBuf> {
     .find(|candidate| candidate.exists())
 }
 
+/// Ensure a workspace binary is built with the features a test needs.
+///
+/// The fault-injection hooks live behind `agent-pc`'s `fault-injection`
+/// feature, so the real binaries the e2e tests drive must be rebuilt with it.
+/// A default build must NOT contain them: `build_agent_with_faults` is only
+/// called from tests that need the hooks, and the default `binary()` path is
+/// used everywhere else.
+///
+/// Cargo features are additive and the artifact path is the same either way,
+/// so a feature build cannot be told apart from a default one by filename.
+/// A separate `CARGO_TARGET_DIR` gives the two builds distinct binaries.
+pub fn build_agent_with_faults() -> PathBuf {
+    let root = workspace_root();
+    let fault_target = root.join("target/fault-injection");
+    let status = Command::new("cargo")
+        .args([
+            "build",
+            "-p",
+            "himan-agent-pc",
+            "--features",
+            "fault-injection",
+            "--bin",
+            "himan-agent-pc",
+        ])
+        .env("CARGO_TARGET_DIR", &fault_target)
+        .current_dir(&root)
+        .status()
+        .expect("run cargo build for himan-agent-pc with fault-injection");
+    assert!(
+        status.success(),
+        "failed to build himan-agent-pc with the fault-injection feature"
+    );
+    let exe = if cfg!(windows) {
+        "himan-agent-pc.exe"
+    } else {
+        "himan-agent-pc"
+    };
+    fault_target.join("debug").join(exe)
+}
+
 /// Bind an ephemeral port on loopback and return it.
 ///
 /// The listener is dropped before the caller binds it, so a fast restart can
@@ -213,6 +253,10 @@ pub struct E2ETest {
     agents: Vec<Child>,
     /// Device id for each spawned agent, parallel to `agents`.
     agent_ids: Vec<String>,
+    /// The agent binary this harness drives. Tests that need the
+    /// `fault-injection` hooks set it to that build; otherwise the plain
+    /// default binary is used, which must not contain the hooks.
+    agent_bin: Option<PathBuf>,
     port: u16,
     orch_key: String,
     /// Keys for the devices a test enrolled, in the order they were named.
@@ -348,6 +392,7 @@ impl E2ETest {
                 orch,
                 agents: Vec::new(),
                 agent_ids: Vec::new(),
+                agent_bin: None,
                 port,
                 orch_key,
                 device_keys: Vec::new(),
@@ -361,6 +406,24 @@ impl E2ETest {
                 panic!("{message}\n{tail}");
             }
         }
+    }
+
+    /// The agent binary spawned by this harness.
+    pub fn agent_binary(&self) -> PathBuf {
+        self.agent_bin
+            .clone()
+            .or_else(|| binary("himan-agent-pc"))
+            .expect("build himan-agent-pc first")
+    }
+
+    /// Drive the `fault-injection` agent build instead of the default one.
+    ///
+    /// Call before spawning any agent. The default binary is the ordinary
+    /// `cargo build` product; this is the only way a test gets the hooks.
+    pub fn use_fault_injection_agent(&mut self) -> PathBuf {
+        let bin = build_agent_with_faults();
+        self.agent_bin = Some(bin.clone());
+        bin
     }
 
     /// The orchestrator's HTTP port.
@@ -536,11 +599,7 @@ impl E2ETest {
             ("HIMAN_ORCH_KEY".to_string(), orch_key.to_string()),
         ];
         envs.extend(extra_envs);
-        let mut child = Child::spawn(
-            &binary("himan-agent-pc").expect("build himan-agent-pc first"),
-            args,
-            envs,
-        );
+        let mut child = Child::spawn(&self.agent_binary(), args, envs);
 
         let expected = self.agents.len() + 1;
         match wait_for_registration(orch_port, expected, HARD_TIMEOUT).await {

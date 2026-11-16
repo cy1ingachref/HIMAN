@@ -413,8 +413,9 @@ impl AgentClient {
                 );
                 // AC-3 needs a target that never sends Ready, so the
                 // orchestrator's warming timeout fires and the handoff rolls
-                // back. This switch exists only to make that failure
-                // reachable from a real binary; it is never set in production.
+                // back. Compiled only under the `fault-injection` feature: a
+                // production device must never refuse to answer a handoff.
+                #[cfg(feature = "fault-injection")]
                 if std::env::var("HIMAN_TEST_NEVER_READY").as_deref() == Ok("1") {
                     warn!(
                         handoff = %handoff_id,

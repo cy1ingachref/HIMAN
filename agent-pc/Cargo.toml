@@ -29,3 +29,9 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "macros"] }
 tempfile = "3"
+
+[features]
+# Fault injection for the acceptance tests. OFF by default: a production build
+# must not contain the switches that make a real device refuse to answer a
+# handoff. The e2e tests and the CI e2e job enable it explicitly.
+fault-injection = []

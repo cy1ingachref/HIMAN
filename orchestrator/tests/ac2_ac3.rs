@@ -138,6 +138,9 @@ async fn ac3_a_target_that_never_sends_ready_rolls_back_and_the_source_keeps_wor
         )],
     )
     .await;
+    // The never-ready hook lives behind the `fault-injection` feature, so the
+    // target must be the feature-enabled build.
+    harness.use_fault_injection_agent();
     let port = harness.port();
     let orch_key = harness.orchestrator_key().expect("orchestrator key");
 
