@@ -264,23 +264,53 @@ impl E2ETest {
     }
 
     async fn spawn_orchestrator(key_file: PathBuf, enrollment_file: PathBuf) -> Self {
+        Self::spawn_orchestrator_with_mode(key_file, enrollment_file, false).await
+    }
+
+    /// Spawn the real orchestrator in insecure dev mode: no API token is set
+    /// and enrollment is not enforced, which is the escape hatch the startup
+    /// tests exercise.
+    pub async fn new_insecure_dev() -> Self {
+        let dir = tempfile::tempdir().expect("orch tempdir");
+        let devices = make_devices_named(dir.path(), 1, |_| "pc-1");
+        let enrollment_file = dir.path().join("enrolled.json");
+        write_enrollment(&enrollment_file, &devices);
+        let key_file = dir.path().join("orchestrator.key");
+        let mut harness = Self::spawn_orchestrator_with_mode(key_file, enrollment_file, true).await;
+        harness.device_keys = devices;
+        harness._dirs.push(dir);
+        harness
+    }
+
+    async fn spawn_orchestrator_with_mode(
+        key_file: PathBuf,
+        enrollment_file: PathBuf,
+        insecure_dev: bool,
+    ) -> Self {
         let port = free_port();
         let _log_dir = tempfile::tempdir().expect("log dir");
+        let mut envs: Vec<(String, String)> = vec![
+            ("HIMAN_PORT".to_string(), port.to_string()),
+            (
+                "HIMAN_ORCH_KEY_FILE".to_string(),
+                key_file.display().to_string(),
+            ),
+            (
+                "HIMAN_ENROLLED_FILE".to_string(),
+                enrollment_file.display().to_string(),
+            ),
+        ];
+        // In dev mode the orchestrator needs no token, and the API routes are
+        // open. Setting it anyway would hide a dev-mode regression.
+        if !insecure_dev {
+            envs.push(("HIMAN_API_TOKEN".to_string(), API_TOKEN.to_string()));
+        } else {
+            envs.push(("HIMAN_INSECURE_DEV".to_string(), "1".to_string()));
+        }
         let mut orch = Child::spawn(
             &binary("himan-orchestrator").expect("build himan-orchestrator first"),
             Vec::<String>::new(),
-            vec![
-                ("HIMAN_PORT".to_string(), port.to_string()),
-                (
-                    "HIMAN_ORCH_KEY_FILE".to_string(),
-                    key_file.display().to_string(),
-                ),
-                (
-                    "HIMAN_ENROLLED_FILE".to_string(),
-                    enrollment_file.display().to_string(),
-                ),
-                ("HIMAN_API_TOKEN".to_string(), API_TOKEN.to_string()),
-            ],
+            envs,
         );
 
         // Health must answer BEFORE any agent is spawned.
