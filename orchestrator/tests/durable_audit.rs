@@ -74,7 +74,7 @@ async fn audit_entries_survive_a_restart() {
             &key_b,
             &harness.orchestrator_key().expect("key"),
             Vec::new(),
-            vec![("HIMAN_TEST_SLOW_READY_MS".to_string(), "30000".to_string())],
+            vec![("HIMAN_TEST_SLOW_READY_MS".to_string(), "15000".to_string())],
         )
         .await
         .expect("dev-b re-registers");
@@ -128,20 +128,10 @@ async fn a_tampered_audit_row_is_detected_at_startup() {
     let state = _dir.path().join("state.db");
     tamper_audit_row(&state);
 
-    // A restart without the recovery flag must refuse to start.
-    let refused = !harness.try_restart_orchestrator_env(&[]).await;
-    assert!(
-        refused,
-        "the orchestrator started despite a tampered audit row"
-    );
-    let reason = harness
-        .last_restart_refused()
-        .unwrap_or_default()
-        .to_string();
-    assert!(
-        reason.contains("audit chain verification failed"),
-        "unexpected refusal reason: {reason}"
-    );
+    // A restart without the recovery flag must refuse to start. The process
+    // exits on its own, so the assertion is on the exit and the reason.
+    let mut failed = harness.start_orchestrator_with(&[]);
+    failed.expect_startup_failure("audit chain verification failed", Duration::from_secs(5));
 
     // With the explicit flag it starts, and records why.
     let started = harness
