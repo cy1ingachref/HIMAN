@@ -294,7 +294,66 @@ impl Hub {
         .await;
 
         info!(device = %info.id, class = info.class.as_str(), "agent registered");
+        drop(presence);
+        // A newly connected device is a candidate for any task that stalled
+        // with no owner available. Offer them now.
+        self.offer_stalled_to(&info.id).await;
         Ok(info)
+    }
+
+    /// Offer every persisted stalled task to a device that just connected.
+    ///
+    /// A task whose owner died with no other device online stays stalled; this
+    /// is what picks it up when one comes back.
+    async fn offer_stalled_to(&self, device: &DeviceId) {
+        let stalled: Vec<crate::durable::StalledRecord> = {
+            let guard = self.durable.lock().expect("durable lock");
+            match guard.as_ref() {
+                None => return,
+                Some(store) => match store.stalled() {
+                    Ok(rows) => rows,
+                    Err(e) => {
+                        tracing::error!(error = %e, "failed to read stalled tasks");
+                        return;
+                    }
+                },
+            }
+        };
+        for record in stalled {
+            // The device that died is not a candidate.
+            if record.owner == device.as_str() {
+                continue;
+            }
+            // Take the epoch from the live registry, not the persisted row: the
+            // stall already moved it, and `commit` requires exactly +1.
+            let new_epoch = {
+                let owners = self.owners.lock().await;
+                owners
+                    .get(&record.task_id)
+                    .map(|o| o.epoch + 1)
+                    .unwrap_or(record.epoch + 1)
+            };
+            {
+                let mut owners = self.owners.lock().await;
+                let _ = owners.commit(&record.task_id, device.clone(), new_epoch);
+            }
+            {
+                let guard = self.durable.lock().expect("durable lock");
+                if let Some(store) = guard.as_ref() {
+                    let _ = store.set_stalled_offered(&record.task_id, device.as_str());
+                }
+            }
+            self.audit(
+                "task_offered".to_string(),
+                "orchestrator".to_string(),
+                format!(
+                    "task={} to={} epoch={} reason=an enrolled device connected",
+                    record.task_id, device, new_epoch
+                ),
+            )
+            .await;
+            tracing::info!(task = %record.task_id, to = %device, "stalled task offered");
+        }
     }
 
     /// Record a registration rejection. Never includes key material.
@@ -604,6 +663,15 @@ impl Hub {
                 if let Err(e) = store.ensure_task(task_id.as_str(), device_id.as_str()) {
                     tracing::error!(error = %e, "failed to persist the task record");
                 }
+            }
+        }
+
+        // The owner registry is what stall detection scans, so the task must
+        // be registered here, not only when a handoff is requested.
+        {
+            let mut owners = self.owners.lock().await;
+            if let Err(e) = owners.register(task_id.as_str().to_owned(), device_id.clone()) {
+                tracing::error!(error = %e, task = %task_id, "failed to register the owner");
             }
         }
 
@@ -1018,6 +1086,22 @@ impl Hub {
                         format!("task={task_id} no candidate owner epoch={new_epoch}"),
                     )
                     .await;
+                    // Persist it: with no candidate the task stays stalled, and
+                    // it is offered when a device connects. The in-memory epoch
+                    // moves too, so the later offer can take the next value
+                    // instead of being refused as stale.
+                    {
+                        let mut owners = self.owners.lock().await;
+                        let _ = owners.commit(&task_id, device.clone(), new_epoch);
+                    }
+                    let guard = self.durable.lock().expect("durable lock");
+                    if let Some(store) = guard.as_ref() {
+                        if let Err(e) =
+                            store.save_stalled(&task_id, new_epoch, &device.to_string(), &reason)
+                        {
+                            tracing::error!(error = %e, task = %task_id, "failed to persist the stall");
+                        }
+                    }
                 }
             }
             // A non-idempotent call with no result cannot be replayed blindly.

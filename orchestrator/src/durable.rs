@@ -23,6 +23,17 @@ use tracing::info;
 
 use crate::eventlog::{EventLog, EventPayload, TaskEvent};
 
+/// A task whose owner died with no device available to take it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StalledRecord {
+    pub task_id: String,
+    pub epoch: u64,
+    pub owner: String,
+    pub unresolved: bool,
+    pub reason: String,
+    pub offered_to: Option<String>,
+}
+
 /// One durable audit entry, as stored in SQLite.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DurableAuditEvent {
@@ -134,7 +145,73 @@ impl DurableStore {
                 CREATE TABLE IF NOT EXISTS meta (
                     key   TEXT PRIMARY KEY,
                     value TEXT NOT NULL
+                );
+                -- Tasks whose owner died and no device was available to take
+                -- them. They stay stalled and are offered when a device
+                -- connects.
+                CREATE TABLE IF NOT EXISTS stalled (
+                    task_id     TEXT PRIMARY KEY,
+                    epoch       INTEGER NOT NULL,
+                    owner       TEXT NOT NULL,
+                    unresolved  INTEGER NOT NULL DEFAULT 0,
+                    reason      TEXT NOT NULL,
+                    offered_to  TEXT
                 );",
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Record a task as stalled with no available owner.
+    pub fn save_stalled(
+        &self,
+        task_id: &str,
+        epoch: u64,
+        owner: &str,
+        reason: &str,
+    ) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO stalled
+                 (task_id, epoch, owner, unresolved, reason, offered_to)
+                 VALUES (?1, ?2, ?3, 1, ?4, NULL)",
+                params![task_id, epoch as i64, owner, reason],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Every stalled task.
+    pub fn stalled(&self) -> Result<Vec<StalledRecord>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT task_id, epoch, owner, unresolved, reason, offered_to
+                 FROM stalled ORDER BY task_id",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(StalledRecord {
+                    task_id: row.get(0)?,
+                    epoch: row.get::<_, i64>(1)? as u64,
+                    owner: row.get(2)?,
+                    unresolved: row.get::<_, i64>(3)? != 0,
+                    reason: row.get(4)?,
+                    offered_to: row.get(5)?,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
+    }
+
+    /// Record which device a stalled task was offered to.
+    pub fn set_stalled_offered(&self, task_id: &str, offered_to: &str) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE stalled SET offered_to = ?2 WHERE task_id = ?1",
+                params![task_id, offered_to],
             )
             .map_err(|e| e.to_string())?;
         Ok(())
