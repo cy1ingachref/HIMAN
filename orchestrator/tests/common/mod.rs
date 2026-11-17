@@ -297,6 +297,8 @@ pub struct E2ETest {
     enrollment_file: Option<PathBuf>,
     /// Set by `restartable`: the durable state file, if the test uses one.
     state_file: Option<PathBuf>,
+    /// Set by `try_restart_orchestrator_env` when the new process refused to start.
+    last_restart_refused: Option<String>,
     port: u16,
     orch_key: String,
     /// Keys for the devices a test enrolled, in the order they were named.
@@ -488,6 +490,107 @@ impl E2ETest {
         }
     }
 
+    /// Stop the orchestrator and try to start it again, reporting whether the
+    /// new process came up. Does not panic on failure: the tamper test needs to
+    /// observe the refusal.
+    pub async fn try_restart_orchestrator_env(&mut self, extra: &[(String, String)]) -> bool {
+        self.orch.kill();
+        let key_file = self.key_file.clone().expect("restartable harness");
+        let enrollment_file = self.enrollment_file.clone().expect("restartable harness");
+        let mut envs: Vec<(String, String)> = vec![
+            ("HIMAN_PORT".to_string(), self.port.to_string()),
+            (
+                "HIMAN_ORCH_KEY_FILE".to_string(),
+                key_file.display().to_string(),
+            ),
+            (
+                "HIMAN_ENROLLED_FILE".to_string(),
+                enrollment_file.display().to_string(),
+            ),
+            ("HIMAN_API_TOKEN".to_string(), API_TOKEN.to_string()),
+        ];
+        if let Some(path) = &self.state_file {
+            envs.push(("HIMAN_STATE_FILE".to_string(), path.display().to_string()));
+        }
+        envs.extend(extra.iter().cloned());
+        let mut orch = Child::spawn(
+            &binary("himan-orchestrator").expect("build himan-orchestrator first"),
+            Vec::<String>::new(),
+            envs,
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        match wait_for_health(self.port).await {
+            Ok(key) => {
+                self.orch_key = key;
+                self.orch = orch;
+                true
+            }
+            Err(message) => {
+                let tail = orch.tail(LOG_TAIL_LINES);
+                orch.kill();
+                // Prefer the process's own stderr: it says why it refused (for
+                // example the audit chain check), whereas the health check only
+                // says it never came up.
+                let reason = if tail.contains("refusing to start") || tail.contains("audit chain") {
+                    tail
+                } else {
+                    format!("{message}\n{tail}")
+                };
+                self.last_restart_refused = Some(reason);
+                false
+            }
+        }
+    }
+
+    /// Why the last `try_restart_orchestrator_env` failed, if it did.
+    pub fn last_restart_refused(&self) -> Option<&str> {
+        self.last_restart_refused.as_deref()
+    }
+
+    /// Stop the orchestrator and start it again, with extra environment.
+    ///
+    /// Used by the tamper test to set `HIMAN_ALLOW_AUDIT_RECOVERY`.
+    pub async fn restart_orchestrator_nowait_env(&mut self, extra: &[(String, String)]) {
+        self.orch.kill();
+        let key_file = self.key_file.clone().expect("restartable harness");
+        let enrollment_file = self.enrollment_file.clone().expect("restartable harness");
+        let mut envs: Vec<(String, String)> = vec![
+            ("HIMAN_PORT".to_string(), self.port.to_string()),
+            (
+                "HIMAN_ORCH_KEY_FILE".to_string(),
+                key_file.display().to_string(),
+            ),
+            (
+                "HIMAN_ENROLLED_FILE".to_string(),
+                enrollment_file.display().to_string(),
+            ),
+            ("HIMAN_API_TOKEN".to_string(), API_TOKEN.to_string()),
+        ];
+        if let Some(path) = &self.state_file {
+            envs.push(("HIMAN_STATE_FILE".to_string(), path.display().to_string()));
+        }
+        envs.extend(extra.iter().cloned());
+        let mut orch = Child::spawn(
+            &binary("himan-orchestrator").expect("build himan-orchestrator first"),
+            Vec::<String>::new(),
+            envs,
+        );
+        // A process that refuses to start exits immediately; wait briefly so
+        // the failure is observed rather than racing the health check.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        match wait_for_health(self.port).await {
+            Ok(key) => {
+                self.orch_key = key;
+                self.orch = orch;
+            }
+            Err(message) => {
+                let tail = orch.tail(LOG_TAIL_LINES);
+                orch.kill();
+                panic!("{message}\n{tail}");
+            }
+        }
+    }
+
     /// Stop the orchestrator and start it again on the same data directory, key
     /// file and port. Agents are left running: they reconnect on their own.
     pub async fn restart_orchestrator(&mut self) {
@@ -540,6 +643,7 @@ impl E2ETest {
                 key_file: None,
                 enrollment_file: None,
                 state_file: None,
+                last_restart_refused: None,
                 port,
                 orch_key,
                 device_keys: Vec::new(),
