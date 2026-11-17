@@ -4,7 +4,7 @@ Secure Multi-Device AI Agent Orchestration — a zero-trust architecture for
 autonomous cross-device task execution, with an embodied 3D character.
 
 Repository: https://github.com/cy1ingachref/HIMAN
-Phase: 3 — Phone and handoff (in progress, 275 tests)
+Phase: 3 — Phone and handoff (in progress, 281 tests)
 
 ## What this is
 
@@ -50,6 +50,7 @@ Test layers:
 | Red team | `orchestrator/tests/redteam.rs` | each named attack is refused |
 | End to end | `orchestrator/tests/*.rs` | the real binaries work together |
 | Handoff acceptance | `orchestrator/tests/{ac1_happy_path,ac2_ac3,ac4_matrix}.rs` | AC-1/AC-2/AC-3, the failure matrix |
+| Handoff red team | `orchestrator/tests/redteam.rs` | RT-01..RT-14 |
 | Durability | `orchestrator/tests/{durability,durable_audit,stalled_owner,stalled_pending,non_idempotent}.rs` | restarts, the audit chain, dead owners |
 | Logging | `orchestrator/tests/logging.rs` | logs appear without `RUST_LOG` |
 
@@ -64,6 +65,17 @@ handoff state and the audit log in SQLite (WAL). Unset means in-memory only.
 On startup the audit chain is verified; a broken chain refuses to start unless
 `HIMAN_ALLOW_AUDIT_RECOVERY=1` is set, which is recorded. See
 `docs/HANDOFF.md` sections 13 and 14.
+
+## Handoff metrics
+
+    cargo run -p himan-orchestrator --example handoff_metrics
+
+30 runs of the AC-1 scenario (~500 s), writing
+`orchestrator/results/handoff-metrics.csv` and a markdown summary with p50/p95
+for switch time, total time, replay lag, owner gap and inter-step gap. It is an
+example rather than a test so the per-commit gate stays fast; a nightly CI job
+runs it and uploads the CSV. Latest measured: switch p50 350 ms / p95 362 ms,
+owner gap 0, 0 rollbacks of 30.
 
 ## Running it
 

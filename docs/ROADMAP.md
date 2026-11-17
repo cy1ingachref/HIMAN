@@ -96,9 +96,41 @@ and report `applied_seq`). Until that lands, the e2e exit check
       (`orchestrator/tests/durability.rs`, `durable_audit.rs`)
 - [x] Fault-injection hooks are behind the `fault-injection` feature and a CI
       guard fails the job if any reaches the release binary
+- [x] AC-5 handoff red team, RT-09 to RT-14
+      (`orchestrator/tests/redteam.rs`, `docs/REDTEAM.md`)
+- [x] AC-6 metrics as audit events, CSV + p50/p95, nightly job
+      (`orchestrator/examples/handoff_metrics.rs`)
 - [ ] Handoff state itself survives a restart *uncommitted* (rolls back, by
       design) and committed-unacked resumes — covered, but a target-side
       re-offer after the new owner dies is not implemented
+
+### Phase 3 exit check
+
+| AC | Meaning | Status |
+|---|---|---|
+| AC-1 | mid-run handoff, one owner, every step once | PASS |
+| AC-2 | no owner-less interval in the audit timeline | PASS |
+| AC-3 | a target that never readies rolls back at the timeout | PASS |
+| AC-4 | the failure matrix | **5 of 8 rows** — see below |
+| AC-5 | handoff red team RT-09..RT-14 | PASS |
+| AC-6 | metrics recorded and reported | PASS |
+
+AC-1, AC-2, AC-3, AC-5 and AC-6 pass. The exit check "task started on PC finishes
+on phone" is claimable **for the PC-to-PC stand-in** used by the tests; the
+phone shell itself is still Phase 3's unfinished Android work.
+
+**AC-4 is not complete: 5 of 8 rows.** Covered: stale-epoch write from the old
+owner (hub unit test), duplicate `SwitchCommit`, drop `SwitchCommit`, source
+dies in Shadowing, target dies before commit, plus the non-idempotent effect in
+flight (`non_idempotent.rs`). Not covered:
+
+- kill the target **after** commit — there is no re-offer path for a task
+  whose new owner dies;
+- orchestrator restart mid-handoff — the durable store rolls an uncommitted
+  handoff back and resumes a committed-unacked one, but a *target-side* ack
+  lost across the restart has no recovery path.
+
+
 
 ## Phase 4: Character
 

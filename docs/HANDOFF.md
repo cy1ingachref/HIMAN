@@ -251,3 +251,42 @@ Covered by real-binary tests on the shared harness:
 - `orchestrator/tests/non_idempotent.rs` — an effect in flight at the switch
   runs exactly once; an effect longer than the timeout rolls back.
 
+## 15. Metrics (AC-6)
+
+Recorded as audit events, so they are queryable and survive a restart:
+
+| Event | Meaning |
+|---|---|
+| `handoff_switch_time_ms` | the driver's measure of the switch |
+| `handoff_total_time_ms` | wall clock for the whole attempt |
+| `handoff_replay_lag` | log events the target had not applied at the switch |
+| `handoff_rollback_cause` | why a failed attempt rolled back |
+| `step_issued` | one per scenario step, with the issuing owner and `ts_ms` |
+
+The owner gap is derived from the ownership timeline (`task_created`,
+`handoff_prepared`, `handoff_committed`, `task_stalled`). The audit carries a
+`ts_ms` column for sub-second gaps; it is deliberately NOT part of the hash, so
+the chain is unchanged.
+
+Collected by `cargo run -p himan-orchestrator --example handoff_metrics`
+(30 runs, ~500 s). It writes `orchestrator/results/handoff-metrics.csv` and a
+markdown summary with p50/p95, and runs in the nightly CI job which uploads the
+CSV. It is an example rather than a test so the per-commit gate stays fast.
+
+Measured on 30 runs (this machine, 2026-11-17):
+
+| Metric | p50 | p95 | Max |
+|---|---:|---:|---:|
+| switch time (ms) | 350 | 362 | 365 |
+| total handoff time (ms) | 350 | 362 | 365 |
+| replay lag (events) | 0 | 0 | 0 |
+| owner gap (ms) | 0 | 0 | 0 |
+| longest inter-step gap (ms) | 108 | 111 | 117 |
+| normal inter-step gap (ms) | 108 | 109 | 109 |
+
+Rollbacks: 0 of 30. The longest inter-step gap equals the normal gap: the
+switch happens between steps, so the commit adds no measurable delay beyond the
+100 ms step cadence. A non-zero owner gap would mean a window with no owner
+(AC-2) and is the number to watch.
+
+
