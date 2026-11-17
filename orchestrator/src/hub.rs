@@ -69,6 +69,9 @@ struct ScenarioRun {
     total: u64,
     /// Steps dispatched so far.
     issued: u64,
+    /// The tool this run issues: `scenario_step` (idempotent) or
+    /// `scenario_effect` (non-idempotent).
+    tool: String,
 }
 
 /// Shared hub state.
@@ -505,6 +508,9 @@ impl Hub {
             // The deterministic scenario task. The orchestrator drives it: it
             // issues one `scenario_step` tool call per step, so the step count
             // is exact and observable in the orchestrator's own event log.
+            // The non-idempotent variant must be matched before the plain
+            // scenario arm: a prompt can contain both words.
+            p if p.contains("effect") => ("scenario_effect", serde_json::json!({})),
             p if p.contains("scenario") => ("scenario_step", serde_json::json!({})),
             _ => {
                 return Ok(DispatchResult {
@@ -606,7 +612,7 @@ impl Hub {
         // The total comes from the prompt ("... of N steps"), not from the
         // caller-supplied arguments, so a test cannot quietly change the run
         // length through the wire.
-        if tool_name == "scenario_step" {
+        if tool_name == "scenario_step" || tool_name == "scenario_effect" {
             let total = prompt
                 .split_whitespace()
                 .map(str::parse::<u64>)
@@ -619,6 +625,7 @@ impl Hub {
                     task_id.to_string(),
                     ScenarioRun {
                         owner: device_id.clone(),
+                        tool: tool_name.to_string(),
                         total,
                         issued: 0,
                     },
@@ -712,7 +719,7 @@ impl Hub {
                     .unwrap_or_else(|| device.clone())
             };
 
-            let (issued, total) = {
+            let (issued, total, run_tool, run_is_effect) = {
                 let mut runs = self.scenarios.lock().await;
                 let run = runs
                     .get_mut(task_id)
@@ -722,16 +729,32 @@ impl Hub {
                 }
                 run.owner = owner.clone();
                 run.issued += 1;
-                (run.issued, run.total)
+                (
+                    run.issued,
+                    run.total,
+                    run.tool.clone(),
+                    run.tool == "scenario_effect",
+                )
             };
 
-            let args = serde_json::json!({ "step": issued, "total": total });
+            // The effect variant carries no `total`: it is a one-shot
+            // irreversible call, and the run length still comes from the
+            // prompt so a test cannot change it over the wire.
+            let args = if run_is_effect {
+                serde_json::json!({ "step": issued })
+            } else {
+                serde_json::json!({ "step": issued, "total": total })
+            };
             let call = ToolCall {
                 task_id: TaskId::new(task_id),
                 target_device: owner.clone(),
-                tool: himan_proto::ToolName::new("scenario_step"),
-                args,
-                risk_tier: RiskTier::ReadOnly,
+                tool: himan_proto::ToolName::new(run_tool.as_str()),
+                args: args.clone(),
+                risk_tier: if run_is_effect {
+                    RiskTier::Destructive
+                } else {
+                    RiskTier::ReadOnly
+                },
                 nonce: random_nonce(),
             };
             let message = self.build_message(owner.clone(), Payload::ToolCall(call))?;
@@ -763,9 +786,13 @@ impl Hub {
                     owner,
                     crate::eventlog::EventPayload::ToolCallIssued {
                         call_id: format!("scenario-{task_id}-{issued}"),
-                        tool: "scenario_step".to_string(),
-                        args: serde_json::json!({ "step": issued, "total": total }),
-                        idempotency: crate::eventlog::Idempotency::Idempotent,
+                        tool: run_tool.clone(),
+                        args: args.clone(),
+                        idempotency: if run_is_effect {
+                            crate::eventlog::Idempotency::NonIdempotent
+                        } else {
+                            crate::eventlog::Idempotency::Idempotent
+                        },
                     },
                 );
                 log.append(event.clone());

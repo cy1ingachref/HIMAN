@@ -716,6 +716,18 @@ impl E2ETest {
         API_TOKEN
     }
 
+    /// The stdout of the agent running as `device_id`.
+    ///
+    /// The agent prints one line per executed tool, which is how a test proves
+    /// exactly-once execution on the real binary.
+    pub fn agent_stdout(&self, device_id: &str) -> String {
+        let pos = match self.agent_ids.iter().position(|id| id == device_id) {
+            Some(p) => p,
+            None => return String::new(),
+        };
+        std::fs::read_to_string(&self.agents[pos].out).unwrap_or_default()
+    }
+
     /// Stop the agent running as `device_id`. Returns false if it was not
     /// running (for example it had already been killed).
     pub fn kill_agent(&mut self, device_id: &str) -> bool {
