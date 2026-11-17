@@ -1192,6 +1192,32 @@ impl Hub {
             .map(|store| store.audit_log().unwrap_or_default())
     }
 
+    /// Test support: register `owner` for `task` at epoch 0.
+    ///
+    /// The red-team tests need to set up an ownership state directly, and the
+    /// registry is private. This is the same call `dispatch` makes.
+    pub async fn register_task_for_test(&self, task_id: &str, owner: &str) {
+        let mut owners = self.owners.lock().await;
+        if let Err(e) = owners.register(task_id.to_owned(), DeviceId::new(owner)) {
+            tracing::error!(error = %e, task = %task_id, "test owner registration failed");
+        }
+    }
+
+    /// Test support: move `task` to `owner` at `epoch`, asserting the monotonic
+    /// rule. Used to model "the switch has already happened".
+    pub async fn commit_task_for_test(&self, task_id: &str, owner: &str, epoch: u64) {
+        let mut owners = self.owners.lock().await;
+        owners
+            .commit(task_id, DeviceId::new(owner), epoch)
+            .expect("test commit must be accepted");
+    }
+
+    /// Test support: the owner id of `task`.
+    pub async fn owner_name(&self, task_id: &str) -> Option<String> {
+        let owners = self.owners.lock().await;
+        owners.owner_of(task_id).map(|d| d.to_string())
+    }
+
     /// Whether durable state is enabled.
     pub fn durable_enabled(&self) -> bool {
         self.durable.lock().expect("durable lock").is_some()
