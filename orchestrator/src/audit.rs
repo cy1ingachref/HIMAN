@@ -15,6 +15,9 @@ use sha2::{Digest, Sha256};
 pub struct AuditEvent {
     pub seq: u64,
     pub ts: i64,
+    /// Millisecond timestamp. The hash covers `ts`, not this field, so the
+    /// chain is unchanged; this exists only for sub-second gap metrics.
+    pub ts_ms: i64,
     /// What happened, e.g. "tool_call_allowed", "handoff_issued".
     pub action: String,
     /// Device that caused the event, if any.
@@ -59,6 +62,18 @@ impl AuditLog {
         detail: String,
         ts: i64,
     ) -> &AuditEvent {
+        self.append_at_ms(action, actor, detail, ts, ts * 1000)
+    }
+
+    /// As `append_at`, with an explicit millisecond timestamp for metrics.
+    pub fn append_at_ms(
+        &mut self,
+        action: String,
+        actor: String,
+        detail: String,
+        ts: i64,
+        ts_ms: i64,
+    ) -> &AuditEvent {
         let seq = self.events.len() as u64;
         let prev_hash = self
             .events
@@ -69,6 +84,7 @@ impl AuditLog {
         let mut event = AuditEvent {
             seq,
             ts,
+            ts_ms,
             action,
             actor,
             detail,

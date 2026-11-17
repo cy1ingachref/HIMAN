@@ -211,6 +211,7 @@ async fn audit_log(State(state): State<AppState>) -> impl IntoResponse {
                 .map(|e| crate::audit::AuditEvent {
                     seq: e.seq,
                     ts: e.ts,
+                    ts_ms: e.ts_ms,
                     action: e.action,
                     actor: e.actor,
                     detail: e.detail,
