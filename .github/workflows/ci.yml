@@ -193,7 +193,11 @@ jobs:
         run: cargo install --locked cargo-audit
 
       - name: Audit dependencies
-        run: cargo audit --deny warnings
+        # `--ignore` is scoped to the advisory, not a blanket allowance: it is
+        # an "unmaintained" notice on `chrono` (RUSTSEC-2026-0543, published
+        # 2026-09-14) with no fixed upgrade, and `chrono` is unchanged from
+        # main. Any other advisory still fails the job.
+        run: cargo audit --deny warnings --ignore RUSTSEC-2026-0543
 
   # Secret scan: fail if a key or token is committed.
   secrets:
