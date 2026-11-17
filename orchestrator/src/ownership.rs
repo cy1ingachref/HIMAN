@@ -101,6 +101,26 @@ impl OwnerRegistry {
         self.tasks.get(task_id).map(|o| &o.owner)
     }
 
+    /// Every task this registry knows, as `(task_id, owner, epoch)`.
+    ///
+    /// Used by stall detection, which has to find all tasks a dead device
+    /// owned; the registry is small, so a linear scan is fine.
+    pub fn all(&self) -> Vec<(String, DeviceId, u64)> {
+        self.tasks
+            .iter()
+            .map(|(task_id, o)| (task_id.clone(), o.owner.clone(), o.epoch))
+            .collect()
+    }
+
+    /// The ids of every task owned by `owner`.
+    pub fn tasks_of(&self, owner: &DeviceId) -> Vec<String> {
+        self.tasks
+            .iter()
+            .filter(|(_, o)| o.owner == *owner)
+            .map(|(task_id, _)| task_id.clone())
+            .collect()
+    }
+
     pub fn len(&self) -> usize {
         self.tasks.len()
     }

@@ -40,6 +40,11 @@ impl EnrollmentFile {
         self.0.get(device.as_str()).map(|s| s.as_str())
     }
 
+    /// The ids of every enrolled device.
+    pub fn devices(&self) -> Vec<DeviceId> {
+        self.0.keys().map(|id| DeviceId::new(id.clone())).collect()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }

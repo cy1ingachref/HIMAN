@@ -612,6 +612,19 @@ impl E2ETest {
         API_TOKEN
     }
 
+    /// Stop the agent running as `device_id`. Returns false if it was not
+    /// running (for example it had already been killed).
+    pub fn kill_agent(&mut self, device_id: &str) -> bool {
+        if let Some(pos) = self.agent_ids.iter().position(|id| id == device_id) {
+            self.agent_ids.remove(pos);
+            let mut child = self.agents.remove(pos);
+            child.kill();
+            true
+        } else {
+            false
+        }
+    }
+
     /// The orchestrator's advertised verifying key (base64), as `/health`
     /// reports it. Agents pin this.
     pub fn orchestrator_key(&self) -> Option<String> {

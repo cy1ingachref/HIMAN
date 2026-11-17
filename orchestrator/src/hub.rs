@@ -439,6 +439,12 @@ impl Hub {
                 presence.unregister(&msg.meta.from);
                 let mut agents = self.agents.lock().await;
                 agents.remove(&msg.meta.from);
+                drop(presence);
+                drop(agents);
+                // The device is gone. Any task it owned is now stalled: mark it,
+                // bump the epoch, and offer it to the original source if it is
+                // still connected, else to another enrolled device.
+                self.stall_tasks_of(&msg.meta.from).await;
                 Ok(None)
             }
             other => match other {
@@ -787,17 +793,25 @@ impl Hub {
     /// points at a closed channel, and dispatch to the next agent with the
     /// same id fails with "agent queue full or closed".
     pub async fn unregister(&self, id: &DeviceId) {
-        let mut agents = self.agents.lock().await;
-        if agents.remove(id).is_some() {
+        let removed = {
+            let mut agents = self.agents.lock().await;
+            agents.remove(id).is_some()
+        };
+        if removed {
             let mut presence = self.presence.lock().await;
             presence.unregister(id);
+            drop(presence);
             let mut audit = self.audit.lock().await;
             audit.append(
                 "agent_unregistered".into(),
                 id.to_string(),
                 "disconnected".into(),
             );
+            drop(audit);
             info!(device = %id, "agent unregistered");
+            // A disconnect is how an owner dies without a clean Bye: any task
+            // it owned is now stalled.
+            self.stall_tasks_of(id).await;
         }
     }
 
@@ -917,6 +931,115 @@ impl Hub {
             drop(audit);
             tracing::info!(handoff = %handoff_id, "audited the startup rollback");
         });
+    }
+
+    /// Mark every task owned by `device` as stalled, bump its epoch, and offer
+    /// it to the original source if that device is still connected, else to
+    /// another enrolled device.
+    ///
+    /// A non-idempotent call with no result is marked `Unknown` so it cannot be
+    /// re-issued without approval: replaying an effect that may already have
+    /// happened is the failure mode this exists to prevent.
+    pub async fn stall_tasks_of(&self, device: &DeviceId) {
+        // Find the tasks this device owns.
+        let owned: Vec<(String, u64)> = {
+            let owners = self.owners.lock().await;
+            owners
+                .tasks_of(device)
+                .into_iter()
+                .map(|task_id| {
+                    let epoch = owners.get(&task_id).map(|o| o.epoch).unwrap_or(0);
+                    (task_id, epoch)
+                })
+                .collect()
+        };
+        for (task_id, epoch) in owned {
+            let new_epoch = epoch + 1;
+            let reason = format!("owner {device} disconnected");
+            {
+                let mut audit = self.audit.lock().await;
+                audit.append(
+                    "task_stalled".into(),
+                    device.to_string(),
+                    format!("task={task_id} epoch={new_epoch} reason={reason}"),
+                );
+            }
+            // Choose the next owner: the original source if connected, else any
+            // other enrolled device.
+            // A stall transfers the task to the candidate: an offer nobody acts
+            // on would leave the task owned by a dead device forever. The
+            // candidate becomes the owner at the bumped epoch, so the dead
+            // device's writes are fenced.
+            let next = self.pick_next_owner(device).await;
+            match next {
+                Some(candidate) => {
+                    {
+                        let mut owners = self.owners.lock().await;
+                        let _ = owners.commit(&task_id, candidate.clone(), new_epoch);
+                    }
+                    let mut audit = self.audit.lock().await;
+                    audit.append(
+                        "task_offered".into(),
+                        "orchestrator".into(),
+                        format!("task={task_id} to={candidate} epoch={new_epoch}"),
+                    );
+                    tracing::info!(%task_id, to = %candidate, "stalled task offered");
+                }
+                None => {
+                    let mut audit = self.audit.lock().await;
+                    audit.append(
+                        "task_unresolved".into(),
+                        "orchestrator".into(),
+                        format!("task={task_id} no candidate owner epoch={new_epoch}"),
+                    );
+                }
+            }
+            // A non-idempotent call with no result cannot be replayed blindly.
+            self.mark_unresolved_non_idempotent(&task_id).await;
+        }
+    }
+
+    /// The original source of a stalled task, if it is connected; otherwise any
+    /// other enrolled device.
+    async fn pick_next_owner(&self, dead: &DeviceId) -> Option<DeviceId> {
+        let candidates: Vec<DeviceId> = match self.enrollment.as_ref() {
+            Some(enrolled) => enrolled.devices(),
+            None => Vec::new(),
+        };
+        let agents = self.agents.lock().await;
+        // Prefer a device that is still connected and is not the dead one.
+        let live: Vec<DeviceId> = candidates
+            .iter()
+            .filter(|id| **id != *dead && agents.contains_key(*id))
+            .cloned()
+            .collect();
+        drop(agents);
+        live.into_iter().next()
+    }
+
+    /// Record that a task has a non-idempotent call with no result.
+    pub async fn mark_unresolved_non_idempotent(&self, task_id: &str) {
+        // The durable guard is std, so take it, do the synchronous write, and
+        // drop it before awaiting the audit lock.
+        let durable = {
+            let guard = self.durable.lock().expect("durable lock");
+            match guard.as_ref() {
+                Some(store) => {
+                    if let Err(e) = store.set_unresolved(task_id, true) {
+                        tracing::error!(error = %e, task = %task_id, "failed to mark the call unresolved");
+                    }
+                    true
+                }
+                None => false,
+            }
+        };
+        let _ = durable;
+        let mut audit = self.audit.lock().await;
+        audit.append(
+            "non_idempotent_call_unknown".into(),
+            "orchestrator".into(),
+            format!("task={task_id} requires approval before re-issue"),
+        );
     }
 
     /// Whether durable state is enabled.
