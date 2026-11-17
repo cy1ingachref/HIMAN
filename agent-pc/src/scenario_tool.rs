@@ -130,7 +130,7 @@ impl Tool for NonIdempotentStepTool {
     }
 
     fn risk_tier(&self) -> RiskTier {
-        RiskTier::Destructive
+        RiskTier::Reversible
     }
 
     /// Deliberately non-idempotent: the orchestrator must not replay it.

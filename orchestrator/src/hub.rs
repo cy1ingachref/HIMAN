@@ -819,7 +819,7 @@ impl Hub {
                 tool: himan_proto::ToolName::new(run_tool.as_str()),
                 args: args.clone(),
                 risk_tier: if run_is_effect {
-                    RiskTier::Destructive
+                    RiskTier::Reversible
                 } else {
                     RiskTier::ReadOnly
                 },
