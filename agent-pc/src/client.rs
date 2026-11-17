@@ -423,6 +423,14 @@ impl AgentClient {
                     );
                     return true;
                 }
+                // Durability test: stay in Warming long enough for the
+                // orchestrator to be restarted mid-handoff.
+                #[cfg(feature = "fault-injection")]
+                if let Ok(ms) = std::env::var("HIMAN_TEST_SLOW_READY_MS") {
+                    if let Ok(ms) = ms.parse::<u64>() {
+                        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                    }
+                }
                 if let Err(e) = self
                     .send(Payload::HandoffReady {
                         handoff_id: handoff_id.clone(),

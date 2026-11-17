@@ -106,6 +106,9 @@ pub struct Hub {
     /// A drained source must not start a new step; the scenario loop parks
     /// until the handoff commit moves ownership.
     drained: Mutex<std::collections::HashSet<String>>,
+    /// Durable state, when `HIMAN_STATE_FILE` was set. `None` means the
+    /// orchestrator runs in memory only.
+    durable: std::sync::Mutex<Option<crate::durable::DurableStore>>,
 }
 
 #[derive(Debug, Clone)]
@@ -170,6 +173,7 @@ impl Hub {
             event_log: Mutex::new(crate::eventlog::EventLog::new()),
             scenarios: Mutex::new(HashMap::new()),
             drained: Mutex::new(std::collections::HashSet::new()),
+            durable: std::sync::Mutex::new(None),
         })
     }
 
@@ -580,6 +584,17 @@ impl Hub {
             store.set_state(&task_id, TaskState::Running);
         }
 
+        // Record the task durably, so a restart can load its owner and log even
+        // if no handoff ever happens.
+        {
+            let guard = self.durable.lock().expect("durable lock");
+            if let Some(store) = guard.as_ref() {
+                if let Err(e) = store.ensure_task(task_id.as_str(), device_id.as_str()) {
+                    tracing::error!(error = %e, "failed to persist the task record");
+                }
+            }
+        }
+
         // A scenario task is driven by the orchestrator: one tool call per
         // step, each with its own call id, so exactly-once is decided here.
         // The total comes from the prompt ("... of N steps"), not from the
@@ -747,7 +762,17 @@ impl Hub {
                         idempotency: crate::eventlog::Idempotency::Idempotent,
                     },
                 );
-                log.append(event);
+                log.append(event.clone());
+                // Persist the step event too, so the event log survives a
+                // restart and the seq continues. The durable write is
+                // synchronous (rusqlite) and must not outlive this scope.
+                drop(log);
+                let guard = self.durable.lock().expect("durable lock");
+                if let Some(store) = guard.as_ref() {
+                    if let Err(e) = store.append_event(&event) {
+                        tracing::error!(error = %e, "failed to persist the step event");
+                    }
+                }
             }
 
             // The step's wall-clock cost, so the run lasts long enough to
@@ -851,7 +876,142 @@ impl Hub {
         handoffs.values().cloned().collect()
     }
 
-    /// Read the owner and epoch recorded for a task.
+    /// Install the durable store and report what recovery found.
+    ///
+    /// Called once at startup, before the server accepts connections. The
+    /// recovered handoffs are rolled back (and audited) by the caller.
+    pub fn install_durable(
+        &self,
+        store: crate::durable::DurableStore,
+        rolled_back: usize,
+        resume_pending: bool,
+    ) {
+        let mut slot = self.durable.lock().expect("durable lock");
+        *slot = Some(store);
+        info!(
+            rolled_back,
+            resume_pending, "durable state attached and recovery complete"
+        );
+    }
+
+    /// Whether durable state is enabled.
+    pub fn durable_enabled(&self) -> bool {
+        self.durable.lock().expect("durable lock").is_some()
+    }
+
+    /// Load durable state into the live maps: owner, epoch, event log.
+    ///
+    /// Called at startup after the store is attached. The epoch comes from the
+    /// durable record, never recomputed, so it cannot decrease across a
+    /// restart.
+    pub async fn load_durable_state(&self) -> usize {
+        // Read everything under the std guard, drop it, then do the async work.
+        let tasks = {
+            let guard = self.durable.lock().expect("durable lock");
+            match guard.as_ref() {
+                None => return 0,
+                Some(store) => match store.tasks() {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::error!(error = %e, "failed to read durable tasks");
+                        return 0;
+                    }
+                },
+            }
+        };
+        let mut loaded = 0;
+        for record in tasks {
+            let mut owners = self.owners.lock().await;
+            if let Err(e) = owners.register(record.task_id.clone(), DeviceId::new(&record.owner)) {
+                tracing::warn!(error = %e, task = %record.task_id, "failed to reload owner");
+                continue;
+            }
+            // The durable epoch is authoritative. `commit` refuses a decrease,
+            // which is exactly the property we need here.
+            let _ = owners.commit(&record.task_id, DeviceId::new(&record.owner), record.epoch);
+            drop(owners);
+
+            // Load the log under the std guard, then drop it before awaiting.
+            let log = {
+                let guard = self.durable.lock().expect("durable lock");
+                match guard.as_ref() {
+                    Some(store) => store.event_log(&record.task_id),
+                    None => continue,
+                }
+            };
+            match log {
+                Ok(log) => {
+                    let head = log.head();
+                    let mut event_log = self.event_log.lock().await;
+                    for event in log.events() {
+                        event_log.append(event.clone());
+                    }
+                    tracing::info!(task = %record.task_id, head, "reloaded the event log");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, task = %record.task_id, "failed to reload events")
+                }
+            }
+            loaded += 1;
+        }
+        loaded
+    }
+
+    /// Persist the commit point: epoch bump, owner change and `OwnerChanged`.
+    ///
+    /// The durable store performs all three in one transaction, so a crash
+    /// between them is impossible and the epoch cannot decrease across a
+    /// restart.
+    async fn persist_commit(
+        &self,
+        task_id: &TaskId,
+        from: &DeviceId,
+        to: &DeviceId,
+        outcome: &crate::handoff_driver::DriveOutcome,
+    ) {
+        // The durable store is behind a std mutex and `DurableStore` is not
+        // Clone, so take the guard only to read the flag, drop it, then do the
+        // async work. A std guard held across `.await` makes the caller's
+        // future non-Send, which breaks every axum handler.
+        let durable = self.durable.lock().expect("durable lock").is_some();
+        if !durable {
+            return;
+        }
+        // Re-take the guard for the synchronous writes only: rusqlite is
+        // blocking, so this must not be awaited on anyway.
+        let event = {
+            let log = self.event_log.lock().await;
+            log.next_event(
+                task_id.to_string(),
+                outcome.epoch,
+                to.clone(),
+                crate::eventlog::EventPayload::OwnerChanged {
+                    from: from.to_string(),
+                    to: to.to_string(),
+                    epoch: outcome.epoch,
+                },
+            )
+        };
+        let guard = self.durable.lock().expect("durable lock");
+        let Some(store) = guard.as_ref() else {
+            return;
+        };
+        if let Err(e) = store.commit_owner(task_id.as_str(), to.as_str(), outcome.epoch, &event) {
+            tracing::error!(error = %e, %task_id, "failed to persist the commit");
+        }
+        if let Err(e) = store.append_event(&event) {
+            tracing::error!(error = %e, %task_id, "failed to append OwnerChanged");
+        }
+        if let Err(e) = store.set_handoff_state(
+            &outcome.handoff_id,
+            outcome.state.as_str(),
+            outcome.committed,
+            outcome.reason.as_deref(),
+        ) {
+            tracing::error!(error = %e, %task_id, "failed to persist the handoff state");
+        }
+    }
+
     pub async fn owner(&self, task_id: &str) -> Option<crate::ownership::Ownership> {
         let owners = self.owners.lock().await;
         owners.get(task_id).cloned()
@@ -946,6 +1106,33 @@ impl Hub {
         {
             let mut handoffs = self.handoffs.lock().await;
             handoffs.insert(handoff_id.clone(), handoff);
+        }
+
+        // Persist the attempt so a restart knows it was in flight.
+        {
+            let guard = self.durable.lock().expect("durable lock");
+            if let Some(store) = guard.as_ref() {
+                // The task row must exist before any event references it, so a
+                // restart can load the owner and then the log.
+                if let Err(e) = store.ensure_task(task_id.as_str(), from.as_str()) {
+                    tracing::error!(error = %e, "failed to persist the task record");
+                }
+                let record = crate::durable::HandoffRecord {
+                    handoff_id: handoff_id.clone(),
+                    task_id: task_id.to_string(),
+                    from_device: from.to_string(),
+                    to_device: to.to_string(),
+                    state: "prepared".into(),
+                    epoch,
+                    checkpoint_seq,
+                    applied_seq: 0,
+                    committed: false,
+                    end_reason: None,
+                };
+                if let Err(e) = store.save_handoff(&record) {
+                    tracing::error!(error = %e, "failed to persist the handoff attempt");
+                }
+            }
         }
 
         {
@@ -1164,6 +1351,12 @@ impl Hub {
             owners
                 .commit(task_id.as_str(), to.clone(), outcome.epoch)
                 .map_err(|e| ProtoError::Policy(e.to_string()))?;
+            drop(owners);
+            // Persist the commit: epoch bump, owner change and `OwnerChanged`
+            // in one transaction. Doing it here, after the in-memory commit,
+            // keeps the durable path from being able to move ownership ahead of
+            // the state machine that actually decided it.
+            self.persist_commit(task_id, from, to, &outcome).await;
             // Ownership moved: clear the drain so the scenario loop resumes on
             // the new owner.
             let mut drained = self.drained.lock().await;

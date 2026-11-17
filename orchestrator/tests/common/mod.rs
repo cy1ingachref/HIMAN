@@ -144,6 +144,15 @@ pub fn build_default_agent() -> PathBuf {
     root.join("target/debug").join(exe)
 }
 
+/// Whether something is still accepting TCP connections on `port`.
+fn port_is_open(port: u16) -> bool {
+    std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        std::time::Duration::from_millis(200),
+    )
+    .is_ok()
+}
+
 /// Bind an ephemeral port on loopback and return it.
 ///
 /// The listener is dropped before the caller binds it, so a fast restart can
@@ -282,6 +291,12 @@ pub struct E2ETest {
     /// `fault-injection` hooks set it to that build; otherwise the plain
     /// default binary is used, which must not contain the hooks.
     agent_bin: Option<PathBuf>,
+    /// Set by `restartable`: the orchestrator key file, reused after a restart.
+    key_file: Option<PathBuf>,
+    /// Set by `restartable`: the enrollment file, reused after a restart.
+    enrollment_file: Option<PathBuf>,
+    /// Set by `restartable`: the durable state file, if the test uses one.
+    state_file: Option<PathBuf>,
     port: u16,
     orch_key: String,
     /// Keys for the devices a test enrolled, in the order they were named.
@@ -361,6 +376,10 @@ impl E2ETest {
 
     /// Spawn a real orchestrator enrolled for `devices`, with extra
     /// orchestrator environment (for example a short handoff timeout).
+    ///
+    /// The enrollment file, key file and optional state file live in a single
+    /// data directory the harness remembers, so a test can stop the
+    /// orchestrator and start it again on the same state.
     pub async fn with_devices_env(
         devices: &[DeviceKey],
         extra_envs: Vec<(String, String)>,
@@ -374,6 +393,106 @@ impl E2ETest {
         harness.device_keys = devices.to_vec();
         harness._dirs.push(dir);
         harness
+    }
+
+    /// Build a harness whose data dir and key file survive a restart.
+    ///
+    /// `state_file` is `Some` when the test wants durable (SQLite) state, which
+    /// is what the restart tests need.
+    pub async fn restartable(
+        devices: &[DeviceKey],
+        state_file: Option<PathBuf>,
+        extra_envs: Vec<(String, String)>,
+    ) -> Self {
+        let dir = tempfile::tempdir().expect("orch tempdir");
+        let enrollment_file = dir.path().join("enrolled.json");
+        write_enrollment(&enrollment_file, devices);
+        let key_file = dir.path().join("orchestrator.key");
+        let mut envs = extra_envs;
+        if let Some(path) = &state_file {
+            envs.push(("HIMAN_STATE_FILE".to_string(), path.display().to_string()));
+        }
+        let mut harness =
+            Self::spawn_orchestrator_env(key_file.clone(), enrollment_file.clone(), false, envs)
+                .await;
+        harness.device_keys = devices.to_vec();
+        harness._dirs.push(dir);
+        harness.key_file = Some(key_file);
+        harness.enrollment_file = Some(enrollment_file);
+        harness.state_file = state_file;
+        harness
+    }
+
+    /// Stop the orchestrator and start it again on the same data directory, key
+    /// file and port, WITHOUT waiting for the agents to re-register.
+    ///
+    /// The waiting variant is right for tests that assert on the live agent
+    /// list; a mid-handoff restart must not wait, because waiting would block
+    /// until the handoff's own HTTP call returns.
+    pub async fn restart_orchestrator_nowait(&mut self) {
+        self.orch.kill();
+        let key_file = self.key_file.clone().expect("restartable harness");
+        let enrollment_file = self.enrollment_file.clone().expect("restartable harness");
+        let mut envs: Vec<(String, String)> = vec![
+            ("HIMAN_PORT".to_string(), self.port.to_string()),
+            (
+                "HIMAN_ORCH_KEY_FILE".to_string(),
+                key_file.display().to_string(),
+            ),
+            (
+                "HIMAN_ENROLLED_FILE".to_string(),
+                enrollment_file.display().to_string(),
+            ),
+            ("HIMAN_API_TOKEN".to_string(), API_TOKEN.to_string()),
+        ];
+        if let Some(path) = &self.state_file {
+            envs.push(("HIMAN_STATE_FILE".to_string(), path.display().to_string()));
+        }
+        let mut orch = Child::spawn(
+            &binary("himan-orchestrator").expect("build himan-orchestrator first"),
+            Vec::<String>::new(),
+            envs,
+        );
+        // The port must be free before the new process binds it: a TIME_WAIT
+        // socket would otherwise let `wait_for_health` succeed against the old
+        // process, which would then finish the work the restart was meant to
+        // interrupt.
+        for _ in 0..50 {
+            if !port_is_open(self.port) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        match wait_for_health(self.port).await {
+            Ok(key) => {
+                self.orch_key = key;
+                self.orch = orch;
+            }
+            Err(message) => {
+                let tail = orch.tail(LOG_TAIL_LINES);
+                orch.kill();
+                panic!("{message}\n{tail}");
+            }
+        }
+    }
+
+    /// Wait until the agents are registered again after a restart.
+    pub async fn wait_for_agents(&mut self) {
+        let expected = self.agents.len();
+        if let Err(message) = wait_for_registration(self.port, expected, HARD_TIMEOUT).await {
+            let mut tail = String::new();
+            for child in &self.agents {
+                tail.push_str(&child.tail(LOG_TAIL_LINES));
+            }
+            panic!("{message}\n{tail}");
+        }
+    }
+
+    /// Stop the orchestrator and start it again on the same data directory, key
+    /// file and port. Agents are left running: they reconnect on their own.
+    pub async fn restart_orchestrator(&mut self) {
+        self.restart_orchestrator_nowait().await;
+        self.wait_for_agents().await;
     }
 
     /// Spawn the real orchestrator with extra environment, so a test can set
@@ -418,6 +537,9 @@ impl E2ETest {
                 agents: Vec::new(),
                 agent_ids: Vec::new(),
                 agent_bin: None,
+                key_file: None,
+                enrollment_file: None,
+                state_file: None,
                 port,
                 orch_key,
                 device_keys: Vec::new(),

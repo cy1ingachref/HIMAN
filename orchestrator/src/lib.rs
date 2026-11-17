@@ -5,6 +5,7 @@
 
 pub mod api_auth;
 pub mod audit;
+pub mod durable;
 pub mod enrollment;
 pub mod eventlog;
 pub mod handoff;

@@ -30,6 +30,9 @@ axum = { version = "0.8", features = ["ws"] }
 futures-util = "0.3"
 tracing.workspace = true
 tracing-subscriber.workspace = true
+# `bundled` builds SQLite from the amalgamated source, so the orchestrator has
+# no system-library dependency. WAL is enabled at runtime in `durable.rs`.
+rusqlite = { version = "0.43", features = ["bundled", "serde_json"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "macros"] }
