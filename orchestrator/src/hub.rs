@@ -69,6 +69,9 @@ struct ScenarioRun {
     total: u64,
     /// Steps dispatched so far.
     issued: u64,
+    /// The tool this run issues: `scenario_step` (idempotent) or
+    /// `scenario_effect` (non-idempotent).
+    tool: String,
 }
 
 /// Shared hub state.
@@ -78,7 +81,7 @@ pub struct Hub {
     policy: Mutex<PolicyEngine>,
     presence: Mutex<PresenceManager>,
     store: Mutex<StateStore>,
-    audit: Mutex<AuditLog>,
+    audit: Arc<Mutex<AuditLog>>,
     orchestrator_key: SigningKey,
     config: HubConfig,
     enrollment: Option<EnrollmentFile>,
@@ -106,6 +109,9 @@ pub struct Hub {
     /// A drained source must not start a new step; the scenario loop parks
     /// until the handoff commit moves ownership.
     drained: Mutex<std::collections::HashSet<String>>,
+    /// Durable state, when `HIMAN_STATE_FILE` was set. `None` means the
+    /// orchestrator runs in memory only.
+    durable: std::sync::Mutex<Option<crate::durable::DurableStore>>,
 }
 
 #[derive(Debug, Clone)]
@@ -158,7 +164,7 @@ impl Hub {
             policy: Mutex::new(policy),
             presence: Mutex::new(PresenceManager::new(PolicyEngine::default())),
             store: Mutex::new(StateStore::new()),
-            audit: Mutex::new(AuditLog::new()),
+            audit: Arc::new(Mutex::new(AuditLog::new())),
             orchestrator_key,
             config,
             enrollment: None,
@@ -170,6 +176,7 @@ impl Hub {
             event_log: Mutex::new(crate::eventlog::EventLog::new()),
             scenarios: Mutex::new(HashMap::new()),
             drained: Mutex::new(std::collections::HashSet::new()),
+            durable: std::sync::Mutex::new(None),
         })
     }
 
@@ -279,15 +286,74 @@ impl Hub {
             last.insert(info.id.clone(), 0);
         }
 
-        let mut audit = self.audit.lock().await;
-        audit.append(
-            "agent_registered".into(),
+        self.audit(
+            "agent_registered".to_string(),
             info.id.to_string(),
             format!("class={}", info.class.as_str()),
-        );
+        )
+        .await;
 
         info!(device = %info.id, class = info.class.as_str(), "agent registered");
+        drop(presence);
+        // A newly connected device is a candidate for any task that stalled
+        // with no owner available. Offer them now.
+        self.offer_stalled_to(&info.id).await;
         Ok(info)
+    }
+
+    /// Offer every persisted stalled task to a device that just connected.
+    ///
+    /// A task whose owner died with no other device online stays stalled; this
+    /// is what picks it up when one comes back.
+    async fn offer_stalled_to(&self, device: &DeviceId) {
+        let stalled: Vec<crate::durable::StalledRecord> = {
+            let guard = self.durable.lock().expect("durable lock");
+            match guard.as_ref() {
+                None => return,
+                Some(store) => match store.stalled() {
+                    Ok(rows) => rows,
+                    Err(e) => {
+                        tracing::error!(error = %e, "failed to read stalled tasks");
+                        return;
+                    }
+                },
+            }
+        };
+        for record in stalled {
+            // The device that died is not a candidate.
+            if record.owner == device.as_str() {
+                continue;
+            }
+            // Take the epoch from the live registry, not the persisted row: the
+            // stall already moved it, and `commit` requires exactly +1.
+            let new_epoch = {
+                let owners = self.owners.lock().await;
+                owners
+                    .get(&record.task_id)
+                    .map(|o| o.epoch + 1)
+                    .unwrap_or(record.epoch + 1)
+            };
+            {
+                let mut owners = self.owners.lock().await;
+                let _ = owners.commit(&record.task_id, device.clone(), new_epoch);
+            }
+            {
+                let guard = self.durable.lock().expect("durable lock");
+                if let Some(store) = guard.as_ref() {
+                    let _ = store.set_stalled_offered(&record.task_id, device.as_str());
+                }
+            }
+            self.audit(
+                "task_offered".to_string(),
+                "orchestrator".to_string(),
+                format!(
+                    "task={} to={} epoch={} reason=an enrolled device connected",
+                    record.task_id, device, new_epoch
+                ),
+            )
+            .await;
+            tracing::info!(task = %record.task_id, to = %device, "stalled task offered");
+        }
     }
 
     /// Record a registration rejection. Never includes key material.
@@ -367,12 +433,12 @@ impl Hub {
                     }
                 };
                 if let Err(reason) = fenced {
-                    let mut audit = self.audit.lock().await;
-                    audit.append(
-                        "stale_epoch_write".into(),
+                    self.audit(
+                        "stale_epoch_write".to_string(),
                         msg.meta.from.to_string(),
                         reason.clone(),
-                    );
+                    )
+                    .await;
                     warn!("{reason}");
                     return Ok(None);
                 }
@@ -394,21 +460,21 @@ impl Hub {
                 store.set_output(task_id, output.clone());
                 drop(store);
 
-                let mut audit = self.audit.lock().await;
-                audit.append(
-                    "tool_result".into(),
+                self.audit(
+                    "tool_result".to_string(),
                     msg.meta.from.to_string(),
                     format!("task={task_id} state={}", state.as_str()),
-                );
+                )
+                .await;
                 Ok(None)
             }
             Payload::Status { state, detail } => {
-                let mut audit = self.audit.lock().await;
-                audit.append(
-                    "status".into(),
+                self.audit(
+                    "status".to_string(),
                     msg.meta.from.to_string(),
                     format!("{state}: {detail}"),
-                );
+                )
+                .await;
                 Ok(None)
             }
             Payload::Ping { nonce } => {
@@ -425,16 +491,22 @@ impl Hub {
                 Ok(None)
             }
             Payload::Bye { reason } => {
-                let mut audit = self.audit.lock().await;
-                audit.append(
-                    "agent_bye".into(),
+                self.audit(
+                    "agent_bye".to_string(),
                     msg.meta.from.to_string(),
                     reason.clone(),
-                );
+                )
+                .await;
                 let mut presence = self.presence.lock().await;
                 presence.unregister(&msg.meta.from);
                 let mut agents = self.agents.lock().await;
                 agents.remove(&msg.meta.from);
+                drop(presence);
+                drop(agents);
+                // The device is gone. Any task it owned is now stalled: mark it,
+                // bump the epoch, and offer it to the original source if it is
+                // still connected, else to another enrolled device.
+                self.stall_tasks_of(&msg.meta.from).await;
                 Ok(None)
             }
             other => match other {
@@ -495,6 +567,9 @@ impl Hub {
             // The deterministic scenario task. The orchestrator drives it: it
             // issues one `scenario_step` tool call per step, so the step count
             // is exact and observable in the orchestrator's own event log.
+            // The non-idempotent variant must be matched before the plain
+            // scenario arm: a prompt can contain both words.
+            p if p.contains("effect") => ("scenario_effect", serde_json::json!({})),
             p if p.contains("scenario") => ("scenario_step", serde_json::json!({})),
             _ => {
                 return Ok(DispatchResult {
@@ -533,12 +608,12 @@ impl Hub {
         };
 
         {
-            let mut audit = self.audit.lock().await;
-            audit.append(
-                "tool_call_policy".into(),
+            self.audit(
+                "tool_call_policy".to_string(),
                 device_id.to_string(),
                 format!("task={task_id} tool={tool_name} decision={:?}", decision),
-            );
+            )
+            .await;
         }
 
         match decision {
@@ -580,12 +655,32 @@ impl Hub {
             store.set_state(&task_id, TaskState::Running);
         }
 
+        // Record the task durably, so a restart can load its owner and log even
+        // if no handoff ever happens.
+        {
+            let guard = self.durable.lock().expect("durable lock");
+            if let Some(store) = guard.as_ref() {
+                if let Err(e) = store.ensure_task(task_id.as_str(), device_id.as_str()) {
+                    tracing::error!(error = %e, "failed to persist the task record");
+                }
+            }
+        }
+
+        // The owner registry is what stall detection scans, so the task must
+        // be registered here, not only when a handoff is requested.
+        {
+            let mut owners = self.owners.lock().await;
+            if let Err(e) = owners.register(task_id.as_str().to_owned(), device_id.clone()) {
+                tracing::error!(error = %e, task = %task_id, "failed to register the owner");
+            }
+        }
+
         // A scenario task is driven by the orchestrator: one tool call per
         // step, each with its own call id, so exactly-once is decided here.
         // The total comes from the prompt ("... of N steps"), not from the
         // caller-supplied arguments, so a test cannot quietly change the run
         // length through the wire.
-        if tool_name == "scenario_step" {
+        if tool_name == "scenario_step" || tool_name == "scenario_effect" {
             let total = prompt
                 .split_whitespace()
                 .map(str::parse::<u64>)
@@ -598,6 +693,7 @@ impl Hub {
                     task_id.to_string(),
                     ScenarioRun {
                         owner: device_id.clone(),
+                        tool: tool_name.to_string(),
                         total,
                         issued: 0,
                     },
@@ -691,7 +787,7 @@ impl Hub {
                     .unwrap_or_else(|| device.clone())
             };
 
-            let (issued, total) = {
+            let (issued, total, run_tool, run_is_effect) = {
                 let mut runs = self.scenarios.lock().await;
                 let run = runs
                     .get_mut(task_id)
@@ -701,16 +797,32 @@ impl Hub {
                 }
                 run.owner = owner.clone();
                 run.issued += 1;
-                (run.issued, run.total)
+                (
+                    run.issued,
+                    run.total,
+                    run.tool.clone(),
+                    run.tool == "scenario_effect",
+                )
             };
 
-            let args = serde_json::json!({ "step": issued, "total": total });
+            // The effect variant carries no `total`: it is a one-shot
+            // irreversible call, and the run length still comes from the
+            // prompt so a test cannot change it over the wire.
+            let args = if run_is_effect {
+                serde_json::json!({ "step": issued })
+            } else {
+                serde_json::json!({ "step": issued, "total": total })
+            };
             let call = ToolCall {
                 task_id: TaskId::new(task_id),
                 target_device: owner.clone(),
-                tool: himan_proto::ToolName::new("scenario_step"),
-                args,
-                risk_tier: RiskTier::ReadOnly,
+                tool: himan_proto::ToolName::new(run_tool.as_str()),
+                args: args.clone(),
+                risk_tier: if run_is_effect {
+                    RiskTier::Reversible
+                } else {
+                    RiskTier::ReadOnly
+                },
                 nonce: random_nonce(),
             };
             let message = self.build_message(owner.clone(), Payload::ToolCall(call))?;
@@ -742,12 +854,26 @@ impl Hub {
                     owner,
                     crate::eventlog::EventPayload::ToolCallIssued {
                         call_id: format!("scenario-{task_id}-{issued}"),
-                        tool: "scenario_step".to_string(),
-                        args: serde_json::json!({ "step": issued, "total": total }),
-                        idempotency: crate::eventlog::Idempotency::Idempotent,
+                        tool: run_tool.clone(),
+                        args: args.clone(),
+                        idempotency: if run_is_effect {
+                            crate::eventlog::Idempotency::NonIdempotent
+                        } else {
+                            crate::eventlog::Idempotency::Idempotent
+                        },
                     },
                 );
-                log.append(event);
+                log.append(event.clone());
+                // Persist the step event too, so the event log survives a
+                // restart and the seq continues. The durable write is
+                // synchronous (rusqlite) and must not outlive this scope.
+                drop(log);
+                let guard = self.durable.lock().expect("durable lock");
+                if let Some(store) = guard.as_ref() {
+                    if let Err(e) = store.append_event(&event) {
+                        tracing::error!(error = %e, "failed to persist the step event");
+                    }
+                }
             }
 
             // The step's wall-clock cost, so the run lasts long enough to
@@ -762,17 +888,24 @@ impl Hub {
     /// points at a closed channel, and dispatch to the next agent with the
     /// same id fails with "agent queue full or closed".
     pub async fn unregister(&self, id: &DeviceId) {
-        let mut agents = self.agents.lock().await;
-        if agents.remove(id).is_some() {
+        let removed = {
+            let mut agents = self.agents.lock().await;
+            agents.remove(id).is_some()
+        };
+        if removed {
             let mut presence = self.presence.lock().await;
             presence.unregister(id);
-            let mut audit = self.audit.lock().await;
-            audit.append(
-                "agent_unregistered".into(),
+            drop(presence);
+            self.audit(
+                "agent_unregistered".to_string(),
                 id.to_string(),
-                "disconnected".into(),
-            );
+                "disconnected".to_string(),
+            )
+            .await;
             info!(device = %id, "agent unregistered");
+            // A disconnect is how an owner dies without a clean Bye: any task
+            // it owned is now stalled.
+            self.stall_tasks_of(id).await;
         }
     }
 
@@ -851,7 +984,332 @@ impl Hub {
         handoffs.values().cloned().collect()
     }
 
-    /// Read the owner and epoch recorded for a task.
+    /// Install the durable store and report what recovery found.
+    ///
+    /// Called once at startup, before the server accepts connections. The
+    /// recovered handoffs are rolled back (and audited) by the caller.
+    pub fn install_durable(
+        &self,
+        store: crate::durable::DurableStore,
+        rolled_back: usize,
+        resume_pending: bool,
+    ) {
+        let mut slot = self.durable.lock().expect("durable lock");
+        *slot = Some(store);
+        info!(
+            rolled_back,
+            resume_pending, "durable state attached and recovery complete"
+        );
+    }
+
+    /// Write a `handoff_rolled_back` line into the audit for a handoff that
+    /// recovery found uncommitted.
+    ///
+    /// Called at startup, after the store is attached. The audit log is
+    /// in-memory, so without this the rollback would leave no trace the API can
+    /// report.
+    pub fn audit_handoff_rolled_back(&self, record: &crate::durable::HandoffRecord) {
+        let rt = tokio::runtime::Handle::current();
+        let audit = self.audit.clone();
+        let handoff_id = record.handoff_id.clone();
+        let task_id = record.task_id.clone();
+        let from = record.from_device.clone();
+        let to = record.to_device.clone();
+        rt.spawn(async move {
+            let mut audit = audit.lock().await;
+            audit.append_at(
+                "handoff_rolled_back".to_string(),
+                "orchestrator".to_string(),
+                format!("task={task_id} from={from} to={to} reason=orchestrator restarted before the commit"),
+                chrono::Utc::now().timestamp(),
+            );
+                        tracing::info!(handoff = %handoff_id, "audited the startup rollback");
+        });
+    }
+
+    /// Mark every task owned by `device` as stalled, bump its epoch, and offer
+    /// it to the original source if that device is still connected, else to
+    /// another enrolled device.
+    ///
+    /// A non-idempotent call with no result is marked `Unknown` so it cannot be
+    /// re-issued without approval: replaying an effect that may already have
+    /// happened is the failure mode this exists to prevent.
+    pub async fn stall_tasks_of(&self, device: &DeviceId) {
+        // Find the tasks this device owns.
+        let owned: Vec<(String, u64)> = {
+            let owners = self.owners.lock().await;
+            owners
+                .tasks_of(device)
+                .into_iter()
+                .map(|task_id| {
+                    let epoch = owners.get(&task_id).map(|o| o.epoch).unwrap_or(0);
+                    (task_id, epoch)
+                })
+                .collect()
+        };
+        for (task_id, epoch) in owned {
+            let new_epoch = epoch + 1;
+            let reason = format!("owner {device} disconnected");
+            {
+                self.audit(
+                    "task_stalled".to_string(),
+                    device.to_string(),
+                    format!("task={task_id} epoch={new_epoch} reason={reason}"),
+                )
+                .await;
+            }
+            // Choose the next owner: the original source if connected, else any
+            // other enrolled device.
+            // A stall transfers the task to the candidate: an offer nobody acts
+            // on would leave the task owned by a dead device forever. The
+            // candidate becomes the owner at the bumped epoch, so the dead
+            // device's writes are fenced.
+            let next = self.pick_next_owner(device).await;
+            match next {
+                Some(candidate) => {
+                    {
+                        let mut owners = self.owners.lock().await;
+                        let _ = owners.commit(&task_id, candidate.clone(), new_epoch);
+                    }
+                    self.audit(
+                        "task_offered".to_string(),
+                        "orchestrator".to_string(),
+                        format!("task={task_id} to={candidate} epoch={new_epoch}"),
+                    )
+                    .await;
+                    tracing::info!(%task_id, to = %candidate, "stalled task offered");
+                }
+                None => {
+                    self.audit(
+                        "task_unresolved".to_string(),
+                        "orchestrator".to_string(),
+                        format!("task={task_id} no candidate owner epoch={new_epoch}"),
+                    )
+                    .await;
+                    // Persist it: with no candidate the task stays stalled, and
+                    // it is offered when a device connects. The in-memory epoch
+                    // moves too, so the later offer can take the next value
+                    // instead of being refused as stale.
+                    {
+                        let mut owners = self.owners.lock().await;
+                        let _ = owners.commit(&task_id, device.clone(), new_epoch);
+                    }
+                    let guard = self.durable.lock().expect("durable lock");
+                    if let Some(store) = guard.as_ref() {
+                        if let Err(e) =
+                            store.save_stalled(&task_id, new_epoch, &device.to_string(), &reason)
+                        {
+                            tracing::error!(error = %e, task = %task_id, "failed to persist the stall");
+                        }
+                    }
+                }
+            }
+            // A non-idempotent call with no result cannot be replayed blindly.
+            self.mark_unresolved_non_idempotent(&task_id).await;
+        }
+    }
+
+    /// The original source of a stalled task, if it is connected; otherwise any
+    /// other enrolled device.
+    async fn pick_next_owner(&self, dead: &DeviceId) -> Option<DeviceId> {
+        let candidates: Vec<DeviceId> = match self.enrollment.as_ref() {
+            Some(enrolled) => enrolled.devices(),
+            None => Vec::new(),
+        };
+        let agents = self.agents.lock().await;
+        // Prefer a device that is still connected and is not the dead one.
+        let live: Vec<DeviceId> = candidates
+            .iter()
+            .filter(|id| **id != *dead && agents.contains_key(*id))
+            .cloned()
+            .collect();
+        drop(agents);
+        live.into_iter().next()
+    }
+
+    /// Record that a task has a non-idempotent call with no result.
+    pub async fn mark_unresolved_non_idempotent(&self, task_id: &str) {
+        // The durable guard is std, so take it, do the synchronous write, and
+        // drop it before awaiting the audit lock.
+        let durable = {
+            let guard = self.durable.lock().expect("durable lock");
+            match guard.as_ref() {
+                Some(store) => {
+                    if let Err(e) = store.set_unresolved(task_id, true) {
+                        tracing::error!(error = %e, task = %task_id, "failed to mark the call unresolved");
+                    }
+                    true
+                }
+                None => false,
+            }
+        };
+        let _ = durable;
+        self.audit(
+            "non_idempotent_call_unknown".to_string(),
+            "orchestrator".to_string(),
+            format!("task={task_id} requires approval before re-issue"),
+        )
+        .await;
+    }
+
+    /// Append an audit event to the in-memory log AND the durable store.
+    ///
+    /// Every audit write goes through here. The timestamp is taken once and
+    /// shared, so the two copies hash identically and the durable chain stays
+    /// verifiable against the in-memory one.
+    pub async fn audit(
+        &self,
+        action: impl Into<String>,
+        actor: impl Into<String>,
+        detail: impl Into<String>,
+    ) {
+        let ts = chrono::Utc::now().timestamp();
+        let action = action.into();
+        let actor = actor.into();
+        let detail = detail.into();
+        let mut audit = self.audit.lock().await;
+        audit.append_at(action.clone(), actor.clone(), detail.clone(), ts);
+        drop(audit);
+        let durable = {
+            let guard = self.durable.lock().expect("durable lock");
+            guard.as_ref().is_some()
+        };
+        if durable {
+            let guard = self.durable.lock().expect("durable lock");
+            if let Some(store) = guard.as_ref() {
+                if let Err(e) = store.append_audit(&action, &actor, &detail, ts) {
+                    tracing::error!(error = %e, "failed to persist the audit entry");
+                }
+            }
+        }
+    }
+
+    /// The durable audit log, when one is attached.
+    pub async fn durable_audit_events(&self) -> Option<Vec<crate::durable::DurableAuditEvent>> {
+        let guard = self.durable.lock().expect("durable lock");
+        guard
+            .as_ref()
+            .map(|store| store.audit_log().unwrap_or_default())
+    }
+
+    /// Whether durable state is enabled.
+    pub fn durable_enabled(&self) -> bool {
+        self.durable.lock().expect("durable lock").is_some()
+    }
+
+    /// Load durable state into the live maps: owner, epoch, event log.
+    ///
+    /// Called at startup after the store is attached. The epoch comes from the
+    /// durable record, never recomputed, so it cannot decrease across a
+    /// restart.
+    pub async fn load_durable_state(&self) -> usize {
+        // Read everything under the std guard, drop it, then do the async work.
+        let tasks = {
+            let guard = self.durable.lock().expect("durable lock");
+            match guard.as_ref() {
+                None => return 0,
+                Some(store) => match store.tasks() {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::error!(error = %e, "failed to read durable tasks");
+                        return 0;
+                    }
+                },
+            }
+        };
+        let mut loaded = 0;
+        for record in tasks {
+            let mut owners = self.owners.lock().await;
+            if let Err(e) = owners.register(record.task_id.clone(), DeviceId::new(&record.owner)) {
+                tracing::warn!(error = %e, task = %record.task_id, "failed to reload owner");
+                continue;
+            }
+            // The durable epoch is authoritative. `commit` refuses a decrease,
+            // which is exactly the property we need here.
+            let _ = owners.commit(&record.task_id, DeviceId::new(&record.owner), record.epoch);
+            drop(owners);
+
+            // Load the log under the std guard, then drop it before awaiting.
+            let log = {
+                let guard = self.durable.lock().expect("durable lock");
+                match guard.as_ref() {
+                    Some(store) => store.event_log(&record.task_id),
+                    None => continue,
+                }
+            };
+            match log {
+                Ok(log) => {
+                    let head = log.head();
+                    let mut event_log = self.event_log.lock().await;
+                    for event in log.events() {
+                        event_log.append(event.clone());
+                    }
+                    tracing::info!(task = %record.task_id, head, "reloaded the event log");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, task = %record.task_id, "failed to reload events")
+                }
+            }
+            loaded += 1;
+        }
+        loaded
+    }
+
+    /// Persist the commit point: epoch bump, owner change and `OwnerChanged`.
+    ///
+    /// The durable store performs all three in one transaction, so a crash
+    /// between them is impossible and the epoch cannot decrease across a
+    /// restart.
+    async fn persist_commit(
+        &self,
+        task_id: &TaskId,
+        from: &DeviceId,
+        to: &DeviceId,
+        outcome: &crate::handoff_driver::DriveOutcome,
+    ) {
+        // The durable store is behind a std mutex and `DurableStore` is not
+        // Clone, so take the guard only to read the flag, drop it, then do the
+        // async work. A std guard held across `.await` makes the caller's
+        // future non-Send, which breaks every axum handler.
+        let durable = self.durable.lock().expect("durable lock").is_some();
+        if !durable {
+            return;
+        }
+        // Re-take the guard for the synchronous writes only: rusqlite is
+        // blocking, so this must not be awaited on anyway.
+        let event = {
+            let log = self.event_log.lock().await;
+            log.next_event(
+                task_id.to_string(),
+                outcome.epoch,
+                to.clone(),
+                crate::eventlog::EventPayload::OwnerChanged {
+                    from: from.to_string(),
+                    to: to.to_string(),
+                    epoch: outcome.epoch,
+                },
+            )
+        };
+        let guard = self.durable.lock().expect("durable lock");
+        let Some(store) = guard.as_ref() else {
+            return;
+        };
+        if let Err(e) = store.commit_owner(task_id.as_str(), to.as_str(), outcome.epoch, &event) {
+            tracing::error!(error = %e, %task_id, "failed to persist the commit");
+        }
+        if let Err(e) = store.append_event(&event) {
+            tracing::error!(error = %e, %task_id, "failed to append OwnerChanged");
+        }
+        if let Err(e) = store.set_handoff_state(
+            &outcome.handoff_id,
+            outcome.state.as_str(),
+            outcome.committed,
+            outcome.reason.as_deref(),
+        ) {
+            tracing::error!(error = %e, %task_id, "failed to persist the handoff state");
+        }
+    }
+
     pub async fn owner(&self, task_id: &str) -> Option<crate::ownership::Ownership> {
         let owners = self.owners.lock().await;
         owners.get(task_id).cloned()
@@ -948,9 +1406,35 @@ impl Hub {
             handoffs.insert(handoff_id.clone(), handoff);
         }
 
+        // Persist the attempt so a restart knows it was in flight.
         {
-            let mut audit = self.audit.lock().await;
-            audit.append(line.action, from.to_string(), line.detail);
+            let guard = self.durable.lock().expect("durable lock");
+            if let Some(store) = guard.as_ref() {
+                // The task row must exist before any event references it, so a
+                // restart can load the owner and then the log.
+                if let Err(e) = store.ensure_task(task_id.as_str(), from.as_str()) {
+                    tracing::error!(error = %e, "failed to persist the task record");
+                }
+                let record = crate::durable::HandoffRecord {
+                    handoff_id: handoff_id.clone(),
+                    task_id: task_id.to_string(),
+                    from_device: from.to_string(),
+                    to_device: to.to_string(),
+                    state: "prepared".into(),
+                    epoch,
+                    checkpoint_seq,
+                    applied_seq: 0,
+                    committed: false,
+                    end_reason: None,
+                };
+                if let Err(e) = store.save_handoff(&record) {
+                    tracing::error!(error = %e, "failed to persist the handoff attempt");
+                }
+            }
+        }
+
+        {
+            self.audit(line.action, from.to_string(), line.detail).await;
         }
 
         info!(
@@ -1031,8 +1515,7 @@ impl Hub {
         }
 
         {
-            let mut audit = self.audit.lock().await;
-            audit.append(line.action, from.to_string(), line.detail);
+            self.audit(line.action, from.to_string(), line.detail).await;
         }
 
         info!(
@@ -1164,6 +1647,12 @@ impl Hub {
             owners
                 .commit(task_id.as_str(), to.clone(), outcome.epoch)
                 .map_err(|e| ProtoError::Policy(e.to_string()))?;
+            drop(owners);
+            // Persist the commit: epoch bump, owner change and `OwnerChanged`
+            // in one transaction. Doing it here, after the in-memory commit,
+            // keeps the durable path from being able to move ownership ahead of
+            // the state machine that actually decided it.
+            self.persist_commit(task_id, from, to, &outcome).await;
             // Ownership moved: clear the drain so the scenario loop resumes on
             // the new owner.
             let mut drained = self.drained.lock().await;
@@ -1179,9 +1668,8 @@ impl Hub {
         // the API could only show "prepared" and "finished", which is not the
         // confirmed-state sequence the spec asks for.
         {
-            let mut audit = self.audit.lock().await;
             for state in &outcome.path {
-                audit.append(
+                self.audit(
                     format!("handoff_{}", state.as_str()),
                     from.to_string(),
                     format!(
@@ -1189,7 +1677,8 @@ impl Hub {
                         outcome.epoch,
                         state.as_str()
                     ),
-                );
+                )
+                .await;
             }
         }
 
@@ -1212,8 +1701,7 @@ impl Hub {
                             );
                             match line {
                                 Ok(l) => {
-                                    let mut audit = self.audit.lock().await;
-                                    audit.append(l.action, from.to_string(), l.detail);
+                                    self.audit(l.action, from.to_string(), l.detail).await;
                                     true
                                 }
                                 Err(e) => {
@@ -1246,18 +1734,17 @@ impl Hub {
                 .and_then(|r| r.split(" inbound").next())
                 .and_then(|n| n.parse::<u64>().ok())
             {
-                let mut audit = self.audit.lock().await;
-                audit.append(
-                    "inbound_lagged".into(),
+                self.audit(
+                    "inbound_lagged".to_string(),
                     from.to_string(),
                     format!("handoff={handoff_id} lost={rest} message(s)"),
-                );
+                )
+                .await;
             }
         }
 
-        let mut audit = self.audit.lock().await;
-        audit.append(
-            "handoff_driver_finished".into(),
+        self.audit(
+            "handoff_driver_finished".to_string(),
             from.to_string(),
             format!(
                 "handoff={} state={} epoch={} commit_attempts={} reason={:?}",
@@ -1267,7 +1754,8 @@ impl Hub {
                 outcome.commit_attempts,
                 outcome.reason
             ),
-        );
+        )
+        .await;
 
         info!(
             handoff = %handoff_id,

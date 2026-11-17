@@ -215,19 +215,49 @@ async fn run_row(row: Row) {
         row.name
     );
 
-    let owner = common::http_get_json(port, &format!("/api/v1/tasks/{task_id}/owner"));
-    let owner_name = owner["owner"].as_str().unwrap_or_default();
     let want = if row.expect_source_owner { A } else { B };
+    // Ownership moves as part of the commit, which may still be settling when
+    // the HTTP response returns. Wait for it rather than reading it once: a
+    // single read races the hub under parallel test load.
+    let owner_name = {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let owner = common::http_get_json(port, &format!("/api/v1/tasks/{task_id}/owner"));
+            let name = owner["owner"].as_str().unwrap_or_default();
+            if name == want {
+                break name.to_string();
+            }
+            if std::time::Instant::now() >= deadline {
+                break name.to_string();
+            }
+            tokio::time::sleep(common::POLL_INTERVAL).await;
+        }
+    };
     assert_eq!(owner_name, want, "{}: unexpected owner", row.name);
 
-    let audit = common::http_get_json(port, "/api/v1/audit");
-    let lines = audit.as_array().expect("audit array");
-    let committed = lines
-        .iter()
-        .any(|l| l["action"] == json!("handoff_committed"));
-    let rolled_back = lines
-        .iter()
-        .any(|l| l["action"] == json!("handoff_rolled_back"));
+    // The commit/rollback lines are written by the hub around the same moment
+    // as the HTTP response, so give them a bounded window rather than reading
+    // once. Without this the row is flaky under parallel test load.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let (committed, rolled_back) = loop {
+        let audit = common::http_get_json(port, "/api/v1/audit");
+        let lines = audit.as_array().expect("audit array");
+        let committed = lines
+            .iter()
+            .any(|l| l["action"] == json!("handoff_committed"));
+        let rolled_back = lines
+            .iter()
+            .any(|l| l["action"] == json!("handoff_rolled_back"));
+        let settled = if row.expect_state == "rolled_back" {
+            rolled_back && !committed
+        } else {
+            committed
+        };
+        if settled || std::time::Instant::now() >= deadline {
+            break (committed, rolled_back);
+        }
+        tokio::time::sleep(common::POLL_INTERVAL).await;
+    };
     if row.expect_state == "rolled_back" {
         assert!(rolled_back, "{}: no rollback in the audit", row.name);
         assert!(!committed, "{}: a rolled-back handoff committed", row.name);

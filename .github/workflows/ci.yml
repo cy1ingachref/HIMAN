@@ -121,6 +121,43 @@ jobs:
       - name: Build binaries
         run: cargo build --workspace
 
+      # A production release binary must not contain a fault-injection hook.
+      # The hooks are behind agent-pc's `fault-injection` feature, and a default
+      # build must not be able to misbehave when an environment variable is set.
+      # Grep the built artifact for every hook's env-var string; any hit fails
+      # the job. This catches a future hook that is added without the feature
+      # gate, which a behaviour test would only catch if it knew to test it.
+      - name: Release binary must not contain fault-injection hooks
+        run: |
+          set -euo pipefail
+          cargo build --release -p himan-agent-pc
+          BIN="target/release/himan-agent-pc"
+
+          # Derive the hook names from the source rather than listing them, so
+          # a hook added later without the feature gate is still caught.
+          # Every fault hook is a `#[cfg(feature = "fault-injection")]` block
+          # reading an HIMAN_TEST_* variable; find those variables.
+          mapfile -t HOOKS < <(
+            grep -oE 'HIMAN_TEST_[A-Z0-9_]+' agent-pc/src/*.rs | cut -d: -f2 | sort -u
+          )
+          if [ "${#HOOKS[@]}" -eq 0 ]; then
+            echo "::error::no HIMAN_TEST_* hooks found; is the extraction broken?"
+            exit 1
+          fi
+          echo "checking for hooks: ${HOOKS[*]}"
+
+          found=0
+          for hook in "${HOOKS[@]}"; do
+            if grep -q "$hook" "$BIN"; then
+              echo "::error::fault-injection hook $hook found in $BIN"
+              found=1
+            fi
+          done
+          if [ "$found" -ne 0 ]; then
+            exit 1
+          fi
+          echo "release binary clean: none of ${HOOKS[*]} present"
+
       # The real-binary targets, explicitly: the old `e2e` target was deleted
       # once its unique checks moved onto the shared harness.
       - name: Run end-to-end tests
@@ -133,6 +170,11 @@ jobs:
           cargo test -p himan-orchestrator --test ac4_matrix -- --nocapture
           cargo test -p himan-orchestrator --test inbound -- --nocapture
           cargo test -p himan-orchestrator --test fault_injection -- --nocapture
+          cargo test -p himan-orchestrator --test stalled_owner -- --nocapture
+          cargo test -p himan-orchestrator --test stalled_pending -- --nocapture
+          cargo test -p himan-orchestrator --test durability -- --nocapture
+          cargo test -p himan-orchestrator --test durable_audit -- --nocapture
+          cargo test -p himan-orchestrator --test non_idempotent -- --nocapture
 
   # Dependency audit: fail on any known-vulnerable crate.
   audit:
@@ -151,7 +193,11 @@ jobs:
         run: cargo install --locked cargo-audit
 
       - name: Audit dependencies
-        run: cargo audit --deny warnings
+        # `--ignore` is scoped to the advisory, not a blanket allowance: it is
+        # an "unmaintained" notice on `chrono` (RUSTSEC-2026-0543, published
+        # 2026-09-14) with no fixed upgrade, and `chrono` is unchanged from
+        # main. Any other advisory still fails the job.
+        run: cargo audit --deny warnings --ignore RUSTSEC-2026-0543
 
   # Secret scan: fail if a key or token is committed.
   secrets:

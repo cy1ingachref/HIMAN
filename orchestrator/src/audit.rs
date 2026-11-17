@@ -27,7 +27,7 @@ pub struct AuditEvent {
     pub hash: String,
 }
 
-const GENESIS_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+pub const GENESIS_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 /// Append-only hash-chained log.
 #[derive(Debug, Default)]
@@ -47,7 +47,18 @@ impl AuditLog {
     }
 
     /// Append an event. The hash chain is updated automatically.
-    pub fn append(&mut self, action: String, actor: String, detail: String) -> &AuditEvent {
+    /// Append an event at an explicit timestamp.
+    ///
+    /// The durable store needs the timestamp it is about to write to match the
+    /// one the in-memory log hashed, so the hub appends through this instead of
+    /// letting the clock run twice.
+    pub fn append_at(
+        &mut self,
+        action: String,
+        actor: String,
+        detail: String,
+        ts: i64,
+    ) -> &AuditEvent {
         let seq = self.events.len() as u64;
         let prev_hash = self
             .events
@@ -57,7 +68,7 @@ impl AuditLog {
 
         let mut event = AuditEvent {
             seq,
-            ts: Utc::now().timestamp(),
+            ts,
             action,
             actor,
             detail,
@@ -67,6 +78,11 @@ impl AuditLog {
         event.hash = hash_event(&event);
         self.events.push(event);
         self.events.last().unwrap()
+    }
+
+    pub fn append(&mut self, action: String, actor: String, detail: String) -> &AuditEvent {
+        let ts = Utc::now().timestamp();
+        self.append_at(action, actor, detail, ts)
     }
 
     pub fn events(&self) -> &[AuditEvent] {
@@ -99,7 +115,7 @@ impl AuditLog {
 }
 
 /// Canonical hash of an event. Excludes `hash` itself.
-fn hash_event(event: &AuditEvent) -> String {
+pub fn hash_event(event: &AuditEvent) -> String {
     let canonical = format!(
         "{}|{}|{}|{}|{}|{}",
         event.seq, event.ts, event.action, event.actor, event.detail, event.prev_hash

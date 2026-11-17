@@ -5,6 +5,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -16,6 +17,8 @@ use himan_proto::{
 use tracing::{info, trace, warn};
 
 use crate::scenario_tool::scenario_registry;
+#[cfg(feature = "fault-injection")]
+use crate::scenario_tool::scenario_registry_with_effect;
 
 /// A boxed, `'static` future — the shape a drain hook returns.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -105,6 +108,9 @@ pub struct AgentClient {
     /// Set when the orchestrator asks this device to drain. A scenario run
     /// stops starting new steps; a plain agent is already idle.
     stopping: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Tool calls currently running. A drain waits for these so a
+    /// non-idempotent effect is not left half-applied across a switch.
+    in_flight: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Optional drain hook: a scenario run registers its stop handle here.
     stop_hook: Option<Arc<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>>,
 }
@@ -132,6 +138,7 @@ impl AgentClient {
             keepalive_sender,
             last_seq: 0,
             stopping: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            in_flight: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             stop_hook: None,
         }
     }
@@ -371,6 +378,15 @@ impl AgentClient {
                 return false;
             }
         };
+        // A test can ask for the non-idempotent effect tool, which is how a
+        // non-idempotent call in flight at the switch is exercised.
+        #[cfg(feature = "fault-injection")]
+        let tools = if std::env::var("HIMAN_TEST_EFFECT_TOOL").as_deref() == Ok("1") {
+            scenario_registry_with_effect(std::time::Duration::from_millis(100))
+        } else {
+            scenario_registry(std::time::Duration::from_millis(100))
+        };
+        #[cfg(not(feature = "fault-injection"))]
         let tools = scenario_registry(std::time::Duration::from_millis(100));
         let call = match &msg.payload {
             Payload::ToolCall(call) => call.clone(),
@@ -422,6 +438,14 @@ impl AgentClient {
                         "HIMAN_TEST_NEVER_READY=1: not sending HandoffReady"
                     );
                     return true;
+                }
+                // Durability test: stay in Warming long enough for the
+                // orchestrator to be restarted mid-handoff.
+                #[cfg(feature = "fault-injection")]
+                if let Ok(ms) = std::env::var("HIMAN_TEST_SLOW_READY_MS") {
+                    if let Ok(ms) = ms.parse::<u64>() {
+                        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                    }
                 }
                 if let Err(e) = self
                     .send(Payload::HandoffReady {
@@ -482,6 +506,17 @@ impl AgentClient {
                     return true;
                 }
                 self.request_stop().await;
+                // Wait for any in-flight call to finish before reporting the
+                // drain. A non-idempotent effect must not be left running while
+                // the target takes over and possibly replays the step.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                while self.in_flight.load(Ordering::SeqCst) > 0 {
+                    if std::time::Instant::now() >= deadline {
+                        warn!(handoff = %handoff_id, "timed out waiting for an in-flight call");
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
                 if let Err(e) = self
                     .send(Payload::HandoffDrained {
                         handoff_id: handoff_id.clone(),
@@ -599,23 +634,33 @@ impl AgentClient {
         // The whitelist is the security boundary: a call for a tool this
         // device does not expose is refused, not run.
         let result = match tools.resolve(&call.tool) {
-            Ok(tool) => match tool.run(&self.device_id, call.args).await {
-                Ok(output) => output,
-                Err(e) => {
-                    if self
-                        .send(Payload::ToolResult {
-                            task_id: call.task_id,
-                            state: TaskState::Failed,
-                            output: e.to_string(),
-                        })
-                        .await
-                        .is_err()
-                    {
-                        return false;
+            Ok(tool) => {
+                // Track the call so a drain can wait for it: a non-idempotent
+                // effect must finish before the switch, otherwise the target
+                // could replay it.
+                self.in_flight.fetch_add(1, Ordering::SeqCst);
+                let idempotency = tool.idempotency();
+                let outcome = tool.run(&self.device_id, call.args).await;
+                self.in_flight.fetch_sub(1, Ordering::SeqCst);
+                tracing::debug!(tool = %call.tool, ?idempotency, "tool call finished");
+                match outcome {
+                    Ok(output) => output,
+                    Err(e) => {
+                        if self
+                            .send(Payload::ToolResult {
+                                task_id: call.task_id.clone(),
+                                state: TaskState::Failed,
+                                output: e.to_string(),
+                            })
+                            .await
+                            .is_err()
+                        {
+                            return false;
+                        }
+                        return true;
                     }
-                    return true;
                 }
-            },
+            }
             Err(e) => {
                 let _ = self
                     .send(Payload::ToolResult {

@@ -201,7 +201,26 @@ async fn list_agents(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 async fn audit_log(State(state): State<AppState>) -> impl IntoResponse {
-    Json(state.hub.audit_events().await)
+    // Read from the durable log when one is attached, so the endpoint shows
+    // entries that survived a restart. Without durable state the in-memory log
+    // is the whole story.
+    match state.hub.durable_audit_events().await {
+        Some(events) => Json(
+            events
+                .into_iter()
+                .map(|e| crate::audit::AuditEvent {
+                    seq: e.seq,
+                    ts: e.ts,
+                    action: e.action,
+                    actor: e.actor,
+                    detail: e.detail,
+                    prev_hash: e.prev_hash,
+                    hash: e.hash,
+                })
+                .collect::<Vec<_>>(),
+        ),
+        None => Json(state.hub.audit_events().await),
+    }
 }
 
 async fn prompt(

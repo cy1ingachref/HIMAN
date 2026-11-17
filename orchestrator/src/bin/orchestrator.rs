@@ -52,6 +52,18 @@ async fn main() {
         }
     };
 
+    // Durable state. Unset means in-memory only (the tests and local runs);
+    // a set path is a SQLite file in WAL mode.
+    let durable_path = std::env::var("HIMAN_STATE_FILE").ok();
+    if let Some(path) = &durable_path {
+        if let Err(e) =
+            himan_orchestrator::durable::attach(hub.clone(), std::path::Path::new(path)).await
+        {
+            tracing::error!(error = %e, path = %path, "failed to open durable state");
+            std::process::exit(1);
+        }
+    }
+
     tracing::info!(port, "orchestrator starting");
     println!("orchestrator key: {}", hub.orchestrator_key_b64());
     println!("listening on 127.0.0.1:{port}");

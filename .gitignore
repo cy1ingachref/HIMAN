@@ -38,6 +38,12 @@ himan.db
 himan.db-shm
 himan.db-wal
 
+# SQLite durable state. The tests use temp dirs, so nothing should land in
+# the repo, but a stray file must never be committed.
+*.db
+*.db-wal
+*.db-shm
+
 # Device enrollment: contains the enrolled device ids (public keys only, but
 # treat as sensitive metadata). Never commit a real file.
 enrolled-devices.json

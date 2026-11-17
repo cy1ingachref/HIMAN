@@ -194,3 +194,60 @@ The target adapts quality to its reported capabilities (shape detail, effects). 
 - How the phone agent keeps the connection alive in the background for Warming and Shadowing.
 - Whether approvals bind to epoch.
 - Whether the user can pin a task to a device and block handoffs for it.
+
+## 13. Durability
+
+State that must survive a restart lives in SQLite (WAL), one file, opened
+when `HIMAN_STATE_FILE` is set. Unset means in-memory only.
+
+| State | Table | Notes |
+|---|---|---|
+| Owner + epoch | `tasks` | the epoch is authoritative and never decreases |
+| Event log | `events` | `seq` continues after a restart |
+| Handoff attempts | `handoffs` | `committed` decides rollback vs resume |
+| Audit log | `audit` | hash chain via `prev_hash` |
+| Stalled tasks | `stalled` | offered when a device registers |
+
+**The commit point is one transaction**: epoch bump, owner change and
+`OwnerChanged` are written together, so a crash cannot leave them disagreeing
+and the epoch cannot be replayed backwards.
+
+**Startup recovery**, before the server accepts connections:
+
+- an uncommitted handoff rolls back, and the rollback is written into the
+  durable audit log;
+- a committed-unacked handoff resumes at the ack step.
+
+**Audit chain verification** runs at startup. A broken chain refuses to start
+unless `HIMAN_ALLOW_AUDIT_RECOVERY=1`, and the reason is recorded in `meta` so
+a recovery run is never mistaken for a clean one.
+
+**Stalled owners.** A disconnect stalls every task that device owned: the epoch
+is bumped, the task is offered to a live enrolled device (the original source
+if it is connected, else any other), and a non-idempotent call with no result is
+marked `Unknown` so it cannot be re-issued without approval. A stall with no
+device online is persisted and offered when any enrolled device registers.
+
+**Fault injection.** Hooks that make a device misbehave
+(`HIMAN_TEST_NEVER_READY`, `HIMAN_TEST_DRAIN_SILENT`,
+`HIMAN_TEST_DUPLICATE_COMMIT`, `HIMAN_TEST_SLOW_READY_MS`,
+`HIMAN_TEST_SLOW_STEP_MS`, `HIMAN_TEST_EFFECT_TOOL`) are compiled only under
+agent-pc's `fault-injection` feature, off by default. The CI guard builds the
+release binary and greps it for every hook name; any hit fails the job.
+
+## 14. Durability test plan
+
+Covered by real-binary tests on the shared harness:
+
+- `orchestrator/tests/durability.rs` — restart mid-Shadowing rolls back, restart
+  after commit resumes at the ack, the epoch never decreases, the event `seq`
+  continues, a stale-epoch write is still rejected after a restart.
+- `orchestrator/tests/durable_audit.rs` — audit entries survive a restart; a
+  tampered row is refused at startup and recovered with the reason recorded.
+- `orchestrator/tests/stalled_owner.rs` — the owner dies after the commit: the
+  task is stalled, offered, and the unknown call is flagged.
+- `orchestrator/tests/stalled_pending.rs` — no device online: the stall is
+  persisted and offered when one connects.
+- `orchestrator/tests/non_idempotent.rs` — an effect in flight at the switch
+  runs exactly once; an effect longer than the timeout rolls back.
+
