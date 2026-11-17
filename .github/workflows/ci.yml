@@ -53,6 +53,35 @@ jobs:
       - name: Build
         run: cargo build --workspace
 
+      # The gate: the number of tests the binary reports must equal the
+      # number that actually ran, and none may be ignored. A suite that is
+      # silently skipped, filtered out, or marked `#[ignore]` fails here
+      # rather than passing as "green with fewer tests".
+      - name: Test count gate
+        run: |
+          set -euo pipefail
+          # `--list` prints one "<name>: test" line per discovered test and a
+          # final summary. Count the per-test lines only.
+          LISTED=$(cargo test --workspace -- --list 2>/dev/null \
+            | grep -c ': test$' || true)
+          # Run the whole workspace and sum the "test result: ok. N passed"
+          # lines. `--nocapture` is omitted so the output stays greppable.
+          RUN_OUTPUT=$(cargo test --workspace 2>&1 || true)
+          EXECUTED=$(printf '%s\n' "$RUN_OUTPUT" \
+            | grep -oE 'test result: ok\. [0-9]+ passed' \
+            | grep -oE '[0-9]+' | awk '{s+=$1} END {print s+0}')
+          IGNORED=$(printf '%s\n' "$RUN_OUTPUT" \
+            | grep -oE '[0-9]+ ignored' | grep -oE '[0-9]+' | awk '{s+=$1} END {print s+0}')
+          echo "listed=$LISTED executed=$EXECUTED ignored=$IGNORED"
+          if [ "$LISTED" -ne "$EXECUTED" ]; then
+            echo "::error::test count mismatch: $LISTED listed, $EXECUTED executed"
+            exit 1
+          fi
+          if [ "$IGNORED" -ne 0 ]; then
+            echo "::error::$IGNORED test(s) ignored; zero is required"
+            exit 1
+          fi
+
       - name: Test
         run: cargo test --workspace -- --nocapture
 
@@ -67,7 +96,9 @@ jobs:
   e2e:
     name: end-to-end (real binaries)
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    # Real-binary tests spawn processes and sockets; without a ceiling a wedged
+    # test would burn the whole job.
+    timeout-minutes: 20
 
     steps:
       - name: Checkout
@@ -86,12 +117,22 @@ jobs:
           key: ${{ runner.os }}-cargo-e2e-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-e2e-
 
-      # The e2e test spawns the real binaries, so they must be built first.
+      # The e2e tests spawn the real binaries, so they must be built first.
       - name: Build binaries
         run: cargo build --workspace
 
-      - name: Run end-to-end test
-        run: cargo test -p himan-orchestrator --test e2e -- --nocapture
+      # The real-binary targets, explicitly: the old `e2e` target was deleted
+      # once its unique checks moved onto the shared harness.
+      - name: Run end-to-end tests
+        run: |
+          set -euo pipefail
+          cargo test -p himan-orchestrator --test fast_roundtrip -- --nocapture
+          cargo test -p himan-orchestrator --test handoff_http -- --nocapture
+          cargo test -p himan-orchestrator --test ac1_happy_path -- --nocapture
+          cargo test -p himan-orchestrator --test ac2_ac3 -- --nocapture
+          cargo test -p himan-orchestrator --test ac4_matrix -- --nocapture
+          cargo test -p himan-orchestrator --test inbound -- --nocapture
+          cargo test -p himan-orchestrator --test fault_injection -- --nocapture
 
   # Dependency audit: fail on any known-vulnerable crate.
   audit:

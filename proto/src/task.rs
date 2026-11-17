@@ -45,6 +45,31 @@ impl FromStr for RiskTier {
     }
 }
 
+/// Whether re-issuing a tool call with the same idempotency key can cause a
+/// second side effect. Drives the handoff switch procedure (docs/HANDOFF.md
+/// section 2): a `NonIdempotent` call must finish on the current owner before
+/// the switch, while an `Idempotent` one may be re-issued on the new owner with
+/// the same `call_id`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+// `rename_all = "lowercase"` would render `NonIdempotent` as "nonidempotent";
+// the spec and `as_str()` both use "non_idempotent", so name it explicitly.
+#[serde(rename_all = "snake_case")]
+pub enum Idempotency {
+    /// Safe to re-issue with the same `call_id`, e.g. `device_status`.
+    Idempotent,
+    /// Must run at most once, e.g. deleting a file or sending a message.
+    NonIdempotent,
+}
+
+impl Idempotency {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Idempotency::Idempotent => "idempotent",
+            Idempotency::NonIdempotent => "non_idempotent",
+        }
+    }
+}
+
 /// A tool name, type-checked at the protocol boundary.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ToolName(pub String);
@@ -197,6 +222,20 @@ mod tests {
         assert!(!token.is_expired(999));
         assert!(token.is_expired(1000));
         assert!(token.is_expired(1001));
+    }
+
+    #[test]
+    fn idempotency_serializes_lowercase() {
+        assert_eq!(
+            serde_json::to_string(&Idempotency::Idempotent).unwrap(),
+            "\"idempotent\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Idempotency::NonIdempotent).unwrap(),
+            "\"non_idempotent\""
+        );
+        assert_eq!(Idempotency::Idempotent.as_str(), "idempotent");
+        assert_eq!(Idempotency::NonIdempotent.as_str(), "non_idempotent");
     }
 
     #[test]

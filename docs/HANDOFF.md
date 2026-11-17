@@ -79,17 +79,22 @@ The commit point is the single atomic write that increments `epoch` and appends 
 All messages travel in the existing signed envelope (seq, nonce, freshness window, sender signature). Names are Rust-style; the wire form is JSON.
 
 ```rust
-struct HandoffRequest   { task_id, to: DeviceId, reason }            // user/planner -> orchestrator
+struct HandoffRequest   { task_id, to: DeviceId, reason }            // user/planner -> orchestrator (HTTP body: `HandoffRequest` in server.rs)
 struct HandoffPrepare   { handoff_id, task_id, from, to, epoch,
-                          checkpoint_seq, checkpoint_ref, token }    // orchestrator -> target
+                          checkpoint_seq, token }    // orchestrator -> target
 struct HandoffReady     { handoff_id, applied_seq, capabilities }    // target -> orchestrator
-struct ShadowProgress   { handoff_id, applied_seq }                  // target -> orchestrator (periodic)
-struct SwitchPrepare    { handoff_id, new_epoch }                    // orchestrator -> source: stop starting new steps
-struct DrainDone        { handoff_id, last_seq }                     // source -> orchestrator
-struct SwitchCommit     { handoff_id, new_epoch, final_seq }         // orchestrator -> target
-struct SwitchAck        { handoff_id, new_epoch }                    // target -> orchestrator
-struct Rollback         { handoff_id, reason }                       // orchestrator -> both
+struct HandoffProgress  { handoff_id, applied_seq }                  // target -> orchestrator (periodic)
+struct HandoffDrain     { handoff_id, new_epoch }                    // orchestrator -> source: stop starting new steps
+struct HandoffDrained   { handoff_id, last_seq }                     // source -> orchestrator
+struct HandoffCommit    { handoff_id, new_epoch, final_seq }         // orchestrator -> target
+struct HandoffSwitched  { handoff_id, new_epoch }                    // target -> orchestrator
+struct HandoffRollback  { handoff_id, reason }                       // orchestrator -> both
 ```
+
+These are the `Payload` variants in `proto/src/envelope.rs` (prefixed
+`Handoff` to keep the enum readable). An earlier draft of this document used
+the shorter names `ShadowProgress`, `SwitchPrepare`, `DrainDone`,
+`SwitchCommit`, `SwitchAck`; the code and this document now agree.
 
 ### Handoff token
 

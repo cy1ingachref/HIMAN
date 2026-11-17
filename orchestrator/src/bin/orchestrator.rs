@@ -29,7 +29,21 @@ async fn main() {
         }
     };
 
-    let hub = Hub::with_key(HubConfig::default(), orchestrator_key);
+    // The per-device inbound queue size. A small queue is what makes a lag
+    // reachable, so it is configurable rather than hard-coded; the default is
+    // the production value.
+    let agent_queue: usize = std::env::var("HIMAN_AGENT_QUEUE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(64);
+
+    let hub = Hub::with_key(
+        HubConfig {
+            agent_queue,
+            ..HubConfig::default()
+        },
+        orchestrator_key,
+    );
     let hub = match himan_orchestrator::server::load_enrollment(hub) {
         Ok(h) => h,
         Err(e) => {
@@ -41,7 +55,10 @@ async fn main() {
     tracing::info!(port, "orchestrator starting");
     println!("orchestrator key: {}", hub.orchestrator_key_b64());
     println!("listening on 127.0.0.1:{port}");
-    println!("routes: /health /api/v1/agents /api/v1/audit /api/v1/prompt /ws");
+    println!(
+        "routes: /health /api/v1/agents /api/v1/audit /api/v1/prompt \
+         /api/v1/handoff /api/v1/tasks/:id/owner /ws"
+    );
 
     if let Err(e) = serve(hub, port).await {
         tracing::error!(error = %e, "server error");

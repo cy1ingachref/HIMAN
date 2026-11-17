@@ -63,14 +63,21 @@ fn run_and_capture(name: &str, args: &[(&str, &str)]) -> String {
         cmd.env("HIMAN_INSECURE_DEV", "1");
     }
 
-    cmd.stdout(Stdio::null()).stderr(Stdio::piped());
+    // stderr goes to a temp file, not a pipe: `wait_with_output` drains the
+    // pipe, but only after the process exits, and a chatty child can fill the
+    // pipe buffer and block before that. A file never backs up.
+    let dir = tempfile::tempdir().expect("tempdir for child stderr");
+    let err_file = dir.path().join("stderr.log");
+    cmd.stdout(Stdio::null()).stderr(Stdio::from(
+        std::fs::File::create(&err_file).expect("create stderr file"),
+    ));
 
     let mut child = cmd.spawn().expect("spawn");
     // Give the process time to attempt the connection and log the outcome.
     std::thread::sleep(Duration::from_millis(2500));
     let _ = child.kill();
-    let output = child.wait_with_output().expect("wait");
-    String::from_utf8_lossy(&output.stderr).to_string()
+    let _ = child.wait();
+    std::fs::read_to_string(&err_file).unwrap_or_default()
 }
 
 /// The agent must log its failure at ERROR level with RUST_LOG unset.

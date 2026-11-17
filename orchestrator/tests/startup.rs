@@ -48,22 +48,34 @@ fn run_with(envs: &[(&str, &str)], timeout_secs: u64) -> (Option<i32>, String) {
     for (k, v) in envs {
         cmd.env(k, v);
     }
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    // Both streams go to temp files, not pipes. The process is polled with
+    // `try_wait` while it runs, so a pipe nobody drains can fill and block the
+    // child before it exits — which is exactly the failure this suite must not
+    // be vulnerable to. Files never back up.
+    let dir = tempfile::tempdir().expect("scratch logs");
+    let out_file = dir.path().join("stdout.log");
+    let err_file = dir.path().join("stderr.log");
+    cmd.stdout(Stdio::from(
+        std::fs::File::create(&out_file).expect("create stdout file"),
+    ))
+    .stderr(Stdio::from(
+        std::fs::File::create(&err_file).expect("create stderr file"),
+    ));
 
     let mut child = cmd.spawn().expect("spawn orchestrator");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     loop {
         if let Some(status) = child.try_wait().expect("wait") {
-            let out = child.wait_with_output().expect("output");
-            let mut text = String::from_utf8_lossy(&out.stdout).to_string();
-            text.push_str(&String::from_utf8_lossy(&out.stderr));
+            let _ = child.wait();
+            let mut text = std::fs::read_to_string(&out_file).unwrap_or_default();
+            text.push_str(&std::fs::read_to_string(&err_file).unwrap_or_default());
             return (status.code(), text);
         }
         if std::time::Instant::now() > deadline {
             let _ = child.kill();
-            let out = child.wait_with_output().expect("output");
-            let mut text = String::from_utf8_lossy(&out.stdout).to_string();
-            text.push_str(&String::from_utf8_lossy(&out.stderr));
+            let _ = child.wait();
+            let mut text = std::fs::read_to_string(&out_file).unwrap_or_default();
+            text.push_str(&std::fs::read_to_string(&err_file).unwrap_or_default());
             return (None, text);
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
