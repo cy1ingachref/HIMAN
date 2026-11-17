@@ -283,12 +283,12 @@ impl Hub {
             last.insert(info.id.clone(), 0);
         }
 
-        let mut audit = self.audit.lock().await;
-        audit.append(
-            "agent_registered".into(),
+        self.audit(
+            "agent_registered".to_string(),
             info.id.to_string(),
             format!("class={}", info.class.as_str()),
-        );
+        )
+        .await;
 
         info!(device = %info.id, class = info.class.as_str(), "agent registered");
         Ok(info)
@@ -371,12 +371,12 @@ impl Hub {
                     }
                 };
                 if let Err(reason) = fenced {
-                    let mut audit = self.audit.lock().await;
-                    audit.append(
-                        "stale_epoch_write".into(),
+                    self.audit(
+                        "stale_epoch_write".to_string(),
                         msg.meta.from.to_string(),
                         reason.clone(),
-                    );
+                    )
+                    .await;
                     warn!("{reason}");
                     return Ok(None);
                 }
@@ -398,21 +398,21 @@ impl Hub {
                 store.set_output(task_id, output.clone());
                 drop(store);
 
-                let mut audit = self.audit.lock().await;
-                audit.append(
-                    "tool_result".into(),
+                self.audit(
+                    "tool_result".to_string(),
                     msg.meta.from.to_string(),
                     format!("task={task_id} state={}", state.as_str()),
-                );
+                )
+                .await;
                 Ok(None)
             }
             Payload::Status { state, detail } => {
-                let mut audit = self.audit.lock().await;
-                audit.append(
-                    "status".into(),
+                self.audit(
+                    "status".to_string(),
                     msg.meta.from.to_string(),
                     format!("{state}: {detail}"),
-                );
+                )
+                .await;
                 Ok(None)
             }
             Payload::Ping { nonce } => {
@@ -429,12 +429,12 @@ impl Hub {
                 Ok(None)
             }
             Payload::Bye { reason } => {
-                let mut audit = self.audit.lock().await;
-                audit.append(
-                    "agent_bye".into(),
+                self.audit(
+                    "agent_bye".to_string(),
                     msg.meta.from.to_string(),
                     reason.clone(),
-                );
+                )
+                .await;
                 let mut presence = self.presence.lock().await;
                 presence.unregister(&msg.meta.from);
                 let mut agents = self.agents.lock().await;
@@ -543,12 +543,12 @@ impl Hub {
         };
 
         {
-            let mut audit = self.audit.lock().await;
-            audit.append(
-                "tool_call_policy".into(),
+            self.audit(
+                "tool_call_policy".to_string(),
                 device_id.to_string(),
                 format!("task={task_id} tool={tool_name} decision={:?}", decision),
-            );
+            )
+            .await;
         }
 
         match decision {
@@ -801,13 +801,12 @@ impl Hub {
             let mut presence = self.presence.lock().await;
             presence.unregister(id);
             drop(presence);
-            let mut audit = self.audit.lock().await;
-            audit.append(
-                "agent_unregistered".into(),
+            self.audit(
+                "agent_unregistered".to_string(),
                 id.to_string(),
-                "disconnected".into(),
-            );
-            drop(audit);
+                "disconnected".to_string(),
+            )
+            .await;
             info!(device = %id, "agent unregistered");
             // A disconnect is how an owner dies without a clean Bye: any task
             // it owned is now stalled.
@@ -923,13 +922,13 @@ impl Hub {
         let to = record.to_device.clone();
         rt.spawn(async move {
             let mut audit = audit.lock().await;
-            audit.append(
-                "handoff_rolled_back".into(),
-                "orchestrator".into(),
+            audit.append_at(
+                "handoff_rolled_back".to_string(),
+                "orchestrator".to_string(),
                 format!("task={task_id} from={from} to={to} reason=orchestrator restarted before the commit"),
+                chrono::Utc::now().timestamp(),
             );
-            drop(audit);
-            tracing::info!(handoff = %handoff_id, "audited the startup rollback");
+                        tracing::info!(handoff = %handoff_id, "audited the startup rollback");
         });
     }
 
@@ -957,12 +956,12 @@ impl Hub {
             let new_epoch = epoch + 1;
             let reason = format!("owner {device} disconnected");
             {
-                let mut audit = self.audit.lock().await;
-                audit.append(
-                    "task_stalled".into(),
+                self.audit(
+                    "task_stalled".to_string(),
                     device.to_string(),
                     format!("task={task_id} epoch={new_epoch} reason={reason}"),
-                );
+                )
+                .await;
             }
             // Choose the next owner: the original source if connected, else any
             // other enrolled device.
@@ -977,21 +976,21 @@ impl Hub {
                         let mut owners = self.owners.lock().await;
                         let _ = owners.commit(&task_id, candidate.clone(), new_epoch);
                     }
-                    let mut audit = self.audit.lock().await;
-                    audit.append(
-                        "task_offered".into(),
-                        "orchestrator".into(),
+                    self.audit(
+                        "task_offered".to_string(),
+                        "orchestrator".to_string(),
                         format!("task={task_id} to={candidate} epoch={new_epoch}"),
-                    );
+                    )
+                    .await;
                     tracing::info!(%task_id, to = %candidate, "stalled task offered");
                 }
                 None => {
-                    let mut audit = self.audit.lock().await;
-                    audit.append(
-                        "task_unresolved".into(),
-                        "orchestrator".into(),
+                    self.audit(
+                        "task_unresolved".to_string(),
+                        "orchestrator".to_string(),
                         format!("task={task_id} no candidate owner epoch={new_epoch}"),
-                    );
+                    )
+                    .await;
                 }
             }
             // A non-idempotent call with no result cannot be replayed blindly.
@@ -1034,12 +1033,52 @@ impl Hub {
             }
         };
         let _ = durable;
-        let mut audit = self.audit.lock().await;
-        audit.append(
-            "non_idempotent_call_unknown".into(),
-            "orchestrator".into(),
+        self.audit(
+            "non_idempotent_call_unknown".to_string(),
+            "orchestrator".to_string(),
             format!("task={task_id} requires approval before re-issue"),
-        );
+        )
+        .await;
+    }
+
+    /// Append an audit event to the in-memory log AND the durable store.
+    ///
+    /// Every audit write goes through here. The timestamp is taken once and
+    /// shared, so the two copies hash identically and the durable chain stays
+    /// verifiable against the in-memory one.
+    pub async fn audit(
+        &self,
+        action: impl Into<String>,
+        actor: impl Into<String>,
+        detail: impl Into<String>,
+    ) {
+        let ts = chrono::Utc::now().timestamp();
+        let action = action.into();
+        let actor = actor.into();
+        let detail = detail.into();
+        let mut audit = self.audit.lock().await;
+        audit.append_at(action.clone(), actor.clone(), detail.clone(), ts);
+        drop(audit);
+        let durable = {
+            let guard = self.durable.lock().expect("durable lock");
+            guard.as_ref().is_some()
+        };
+        if durable {
+            let guard = self.durable.lock().expect("durable lock");
+            if let Some(store) = guard.as_ref() {
+                if let Err(e) = store.append_audit(&action, &actor, &detail, ts) {
+                    tracing::error!(error = %e, "failed to persist the audit entry");
+                }
+            }
+        }
+    }
+
+    /// The durable audit log, when one is attached.
+    pub async fn durable_audit_events(&self) -> Option<Vec<crate::durable::DurableAuditEvent>> {
+        let guard = self.durable.lock().expect("durable lock");
+        guard
+            .as_ref()
+            .map(|store| store.audit_log().unwrap_or_default())
     }
 
     /// Whether durable state is enabled.
@@ -1284,8 +1323,7 @@ impl Hub {
         }
 
         {
-            let mut audit = self.audit.lock().await;
-            audit.append(line.action, from.to_string(), line.detail);
+            self.audit(line.action, from.to_string(), line.detail).await;
         }
 
         info!(
@@ -1366,8 +1404,7 @@ impl Hub {
         }
 
         {
-            let mut audit = self.audit.lock().await;
-            audit.append(line.action, from.to_string(), line.detail);
+            self.audit(line.action, from.to_string(), line.detail).await;
         }
 
         info!(
@@ -1520,9 +1557,8 @@ impl Hub {
         // the API could only show "prepared" and "finished", which is not the
         // confirmed-state sequence the spec asks for.
         {
-            let mut audit = self.audit.lock().await;
             for state in &outcome.path {
-                audit.append(
+                self.audit(
                     format!("handoff_{}", state.as_str()),
                     from.to_string(),
                     format!(
@@ -1530,7 +1566,8 @@ impl Hub {
                         outcome.epoch,
                         state.as_str()
                     ),
-                );
+                )
+                .await;
             }
         }
 
@@ -1553,8 +1590,7 @@ impl Hub {
                             );
                             match line {
                                 Ok(l) => {
-                                    let mut audit = self.audit.lock().await;
-                                    audit.append(l.action, from.to_string(), l.detail);
+                                    self.audit(l.action, from.to_string(), l.detail).await;
                                     true
                                 }
                                 Err(e) => {
@@ -1587,18 +1623,17 @@ impl Hub {
                 .and_then(|r| r.split(" inbound").next())
                 .and_then(|n| n.parse::<u64>().ok())
             {
-                let mut audit = self.audit.lock().await;
-                audit.append(
-                    "inbound_lagged".into(),
+                self.audit(
+                    "inbound_lagged".to_string(),
                     from.to_string(),
                     format!("handoff={handoff_id} lost={rest} message(s)"),
-                );
+                )
+                .await;
             }
         }
 
-        let mut audit = self.audit.lock().await;
-        audit.append(
-            "handoff_driver_finished".into(),
+        self.audit(
+            "handoff_driver_finished".to_string(),
             from.to_string(),
             format!(
                 "handoff={} state={} epoch={} commit_attempts={} reason={:?}",
@@ -1608,7 +1643,8 @@ impl Hub {
                 outcome.commit_attempts,
                 outcome.reason
             ),
-        );
+        )
+        .await;
 
         info!(
             handoff = %handoff_id,

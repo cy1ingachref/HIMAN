@@ -23,6 +23,18 @@ use tracing::info;
 
 use crate::eventlog::{EventLog, EventPayload, TaskEvent};
 
+/// One durable audit entry, as stored in SQLite.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DurableAuditEvent {
+    pub seq: u64,
+    pub ts: i64,
+    pub action: String,
+    pub actor: String,
+    pub detail: String,
+    pub prev_hash: String,
+    pub hash: String,
+}
+
 /// One task's durable identity and fencing state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskRecord {
@@ -105,7 +117,170 @@ impl DurableStore {
                     applied_seq INTEGER NOT NULL,
                     committed   INTEGER NOT NULL DEFAULT 0,
                     end_reason  TEXT
+                );
+                -- Append-only audit log. `prev_hash` is the hash of the
+                -- previous row, which is what makes the chain verifiable.
+                CREATE TABLE IF NOT EXISTS audit (
+                    seq       INTEGER PRIMARY KEY,
+                    ts        INTEGER NOT NULL,
+                    action    TEXT NOT NULL,
+                    actor     TEXT NOT NULL,
+                    detail    TEXT NOT NULL,
+                    prev_hash TEXT NOT NULL,
+                    hash      TEXT NOT NULL
+                );
+                -- Whether a startup detected a broken chain. Recorded so a
+                -- recovery run is not mistaken for a clean one.
+                CREATE TABLE IF NOT EXISTS meta (
+                    key   TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
                 );",
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Load the durable audit log in chain order.
+    pub fn audit_log(&self) -> Result<Vec<DurableAuditEvent>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT seq, ts, action, actor, detail, prev_hash, hash
+                 FROM audit ORDER BY seq",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(DurableAuditEvent {
+                    seq: row.get::<_, i64>(0)? as u64,
+                    ts: row.get::<_, i64>(1)?,
+                    action: row.get(2)?,
+                    actor: row.get(3)?,
+                    detail: row.get(4)?,
+                    prev_hash: row.get(5)?,
+                    hash: row.get(6)?,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
+    }
+
+    /// Append one audit entry, chaining it to the current tail.
+    ///
+    /// The `prev_hash` is read from the same connection, so a concurrent
+    /// writer cannot interleave: SQLite serialises writes and the read + insert
+    /// are ordered by the caller (the hub holds the audit lock).
+    pub fn append_audit(
+        &self,
+        action: &str,
+        actor: &str,
+        detail: &str,
+        ts: i64,
+    ) -> Result<(), String> {
+        let prev_hash = self
+            .conn
+            .query_row(
+                "SELECT hash FROM audit ORDER BY seq DESC LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?
+            .unwrap_or_else(|| crate::audit::GENESIS_HASH.to_owned());
+        let seq = self.audit_len()?;
+        let mut event = crate::audit::AuditEvent {
+            seq,
+            ts,
+            action: action.to_string(),
+            actor: actor.to_string(),
+            detail: detail.to_string(),
+            prev_hash,
+            hash: String::new(),
+        };
+        event.hash = crate::audit::hash_event(&event);
+        self.conn
+            .execute(
+                "INSERT INTO audit (seq, ts, action, actor, detail, prev_hash, hash)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    seq as i64,
+                    event.ts,
+                    event.action,
+                    event.actor,
+                    event.detail,
+                    event.prev_hash,
+                    event.hash
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Number of durable audit entries.
+    pub fn audit_len(&self) -> Result<u64, String> {
+        let n: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM audit", [], |row| row.get(0))
+            .map_err(|e| e.to_string())?;
+        Ok(n as u64)
+    }
+
+    /// Verify the durable audit chain.
+    ///
+    /// Returns `Ok(())` when every entry's hash matches its content and every
+    /// `prev_hash` matches the previous entry. Any mismatch means the log was
+    /// tampered with (or truncated mid-write), and the caller must refuse to
+    /// start unless an explicit recovery flag is set.
+    pub fn verify_audit(&self) -> Result<(), String> {
+        let events = self.audit_log()?;
+        let mut prev_hash = crate::audit::GENESIS_HASH.to_owned();
+        for event in events {
+            let mut expected = crate::audit::AuditEvent {
+                seq: event.seq,
+                ts: event.ts,
+                action: event.action.clone(),
+                actor: event.actor.clone(),
+                detail: event.detail.clone(),
+                prev_hash: event.prev_hash.clone(),
+                hash: String::new(),
+            };
+            let computed = crate::audit::hash_event(&expected);
+            expected.hash = computed.clone();
+            if event.prev_hash != prev_hash {
+                return Err(format!(
+                    "audit chain broken at seq {}: prev_hash {} != {}",
+                    event.seq, event.prev_hash, prev_hash
+                ));
+            }
+            if event.hash != computed {
+                return Err(format!(
+                    "audit entry {} does not match its hash: {} != {}",
+                    event.seq, event.hash, computed
+                ));
+            }
+            prev_hash = event.hash;
+        }
+        Ok(())
+    }
+
+    /// Read or write a `meta` value.
+    pub fn meta_get(&self, key: &str) -> Result<Option<String>, String> {
+        self.conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn meta_set(&self, key: &str, value: &str) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
+                params![key, value],
             )
             .map_err(|e| e.to_string())?;
         Ok(())
@@ -435,6 +610,25 @@ impl DurableStore {
 /// resume at the ack step.
 pub async fn attach(hub: Arc<crate::hub::Hub>, path: &Path) -> Result<(), String> {
     let store = DurableStore::open(path)?;
+    // Verify the audit chain BEFORE anything is written. A broken chain means
+    // the log was tampered with; starting anyway would let the tampering be
+    // covered up by new entries.
+    let recovery = std::env::var("HIMAN_ALLOW_AUDIT_RECOVERY").as_deref() == Ok("1");
+    if let Err(reason) = store.verify_audit() {
+        if recovery {
+            tracing::error!(
+                error = %reason,
+                "AUDIT CHAIN BROKEN; starting anyway because HIMAN_ALLOW_AUDIT_RECOVERY=1"
+            );
+            store.meta_set("audit_chain_recovery", reason.as_str())?;
+        } else {
+            return Err(format!(
+                "audit chain verification failed: {reason}. \
+                 Refusing to start. Set HIMAN_ALLOW_AUDIT_RECOVERY=1 to \
+                 acknowledge and continue."
+            ));
+        }
+    }
     let (rolled_back, resume) = store.recover()?;
 
     for record in &rolled_back {
