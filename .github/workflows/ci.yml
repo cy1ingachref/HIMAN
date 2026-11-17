@@ -170,6 +170,11 @@ jobs:
           cargo test -p himan-orchestrator --test ac4_matrix -- --nocapture
           cargo test -p himan-orchestrator --test inbound -- --nocapture
           cargo test -p himan-orchestrator --test fault_injection -- --nocapture
+          cargo test -p himan-orchestrator --test stalled_owner -- --nocapture
+          cargo test -p himan-orchestrator --test stalled_pending -- --nocapture
+          cargo test -p himan-orchestrator --test durability -- --nocapture
+          cargo test -p himan-orchestrator --test durable_audit -- --nocapture
+          cargo test -p himan-orchestrator --test non_idempotent -- --nocapture
 
   # Dependency audit: fail on any known-vulnerable crate.
   audit:

@@ -4,7 +4,7 @@ Secure Multi-Device AI Agent Orchestration — a zero-trust architecture for
 autonomous cross-device task execution, with an embodied 3D character.
 
 Repository: https://github.com/cy1ingachref/HIMAN
-Phase: 3 — Phone and handoff (in progress, 220 tests)
+Phase: 3 — Phone and handoff (in progress, 275 tests)
 
 ## What this is
 
@@ -27,7 +27,8 @@ No iOS. No Flutter.
 ## Layout
 
     proto/          shared message types, signing primitives
-    orchestrator/   planner, policy engine, presence manager, state store
+    orchestrator/   planner, policy engine, presence manager, state store,
+                    durable SQLite state, handoff driver
     agent-core/     tool trait, transport, LLM backend trait + stub
     agent-pc/       Windows PC agent
     app/desktop/    Tauri 2 shell + Three.js character
@@ -47,8 +48,22 @@ Test layers:
 | Unit | `#[cfg(test)]` modules | types and helpers |
 | Integration | `orchestrator/tests/integration.rs` | in-process round trip |
 | Red team | `orchestrator/tests/redteam.rs` | each named attack is refused |
-| End to end | `orchestrator/tests/e2e.rs` | the real binaries work together |
+| End to end | `orchestrator/tests/*.rs` | the real binaries work together |
+| Handoff acceptance | `orchestrator/tests/{ac1_happy_path,ac2_ac3,ac4_matrix}.rs` | AC-1/AC-2/AC-3, the failure matrix |
+| Durability | `orchestrator/tests/{durability,durable_audit,stalled_owner,stalled_pending,non_idempotent}.rs` | restarts, the audit chain, dead owners |
 | Logging | `orchestrator/tests/logging.rs` | logs appear without `RUST_LOG` |
+
+Fault-injection hooks are compiled only under agent-pc's `fault-injection`
+feature (off by default) and CI fails if any hook name appears in the release
+binary.
+
+## Durability
+
+Set `HIMAN_STATE_FILE=/path/to/state.db` to persist owner, epoch, event log,
+handoff state and the audit log in SQLite (WAL). Unset means in-memory only.
+On startup the audit chain is verified; a broken chain refuses to start unless
+`HIMAN_ALLOW_AUDIT_RECOVERY=1` is set, which is recorded. See
+`docs/HANDOFF.md` sections 13 and 14.
 
 ## Running it
 

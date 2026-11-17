@@ -50,6 +50,15 @@ Status of each phase. Mark a phase done only when its exit check passes.
       `GET /api/v1/tasks/{id}/owner`)
 - [x] Agent answers `HandoffPrepare` / `HandoffCommit` and enforces the
       token's own claims (target, task, expiry)
+- [x] Handoff driver that owns both sockets and walks
+      Requested -> Prepared -> Warming -> Shadowing -> Switching -> Committed
+      -> Active (`orchestrator/src/handoff_driver.rs`)
+- [x] AC-1/AC-2/AC-3 on the real binaries
+      (`orchestrator/tests/{ac1_happy_path,ac2_ac3}.rs`)
+- [x] AC-4 failure matrix: stale-epoch write, duplicate and dropped
+      `SwitchCommit`, source dies in Shadowing, target dies before commit,
+      non-idempotent effect in flight (`orchestrator/tests/ac4_matrix.rs`,
+      `orchestrator/tests/non_idempotent.rs`)
 - [ ] Agent-side target: warm state, shadow the log, report `applied_seq`
 - [ ] Exit check: task started on PC finishes on phone
 - [ ] Secure mesh (Tailscale/WireGuard/Headscale)
@@ -66,6 +75,30 @@ Requested -> Prepared -> Warming -> Shadowing -> Switching -> Committed ->
 Active, plus the agent loop's shadow mode (apply log events side-effect free
 and report `applied_seq`). Until that lands, the e2e exit check
 "task started on PC finishes on phone" is not claimable.
+
+### Phase 3 durability (`feat/phase3-durability`)
+
+- [x] SQLite durable state (WAL): per-task owner/epoch, the event log, the
+      handoff state and the audit log
+      (`orchestrator/src/durable.rs`)
+- [x] The commit point is one transaction: epoch bump, owner change and
+      `OwnerChanged` together; it refuses a backwards or no-op epoch
+- [x] Startup recovery: an uncommitted handoff rolls back (and is audited), a
+      committed unacked one resumes at the ack step
+- [x] The audit log is a hash chain (`prev_hash`); a broken chain refuses to
+      start unless `HIMAN_ALLOW_AUDIT_RECOVERY=1`, which is recorded
+- [x] A dead owner's tasks are stalled, epoch-bumped, offered to a live
+      enrolled device, and marked unresolved when a non-idempotent call has no
+      result (`orchestrator/tests/stalled_owner.rs`)
+- [x] A stall with no device online is persisted and offered when one
+      connects (`orchestrator/tests/stalled_pending.rs`)
+- [x] Restart tests on the real binaries
+      (`orchestrator/tests/durability.rs`, `durable_audit.rs`)
+- [x] Fault-injection hooks are behind the `fault-injection` feature and a CI
+      guard fails the job if any reaches the release binary
+- [ ] Handoff state itself survives a restart *uncommitted* (rolls back, by
+      design) and committed-unacked resumes — covered, but a target-side
+      re-offer after the new owner dies is not implemented
 
 ## Phase 4: Character
 
