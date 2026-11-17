@@ -436,6 +436,7 @@ impl DurableStore {
 pub async fn attach(hub: Arc<crate::hub::Hub>, path: &Path) -> Result<(), String> {
     let store = DurableStore::open(path)?;
     let (rolled_back, resume) = store.recover()?;
+
     for record in &rolled_back {
         tracing::warn!(
             handoff = %record.handoff_id,
@@ -444,6 +445,12 @@ pub async fn attach(hub: Arc<crate::hub::Hub>, path: &Path) -> Result<(), String
         );
     }
     hub.install_durable(store, rolled_back.len(), resume.is_some());
+    // Audit the rollbacks now, after the store is attached: the audit log is
+    // in-memory and starts empty on every start, so a rollback discovered during
+    // recovery has to be written into it here or it would be invisible.
+    for record in &rolled_back {
+        hub.audit_handoff_rolled_back(record);
+    }
     // Load owner/epoch/event log back into the live maps. The epoch is taken
     // from the durable record, never recomputed.
     let loaded = hub.load_durable_state().await;

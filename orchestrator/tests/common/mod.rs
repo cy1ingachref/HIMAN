@@ -580,6 +580,23 @@ impl E2ETest {
         bin
     }
 
+    /// The last `n` lines of the orchestrator's stdout and stderr, for failure
+    /// output. A test that needs to diagnose a restart prints this.
+    pub fn orchestrator_log(&self, n: usize) -> String {
+        let mut text = self.orch.tail(n);
+        let old = self.orch.err.with_extension("old.log");
+        if let Ok(prev) = std::fs::read_to_string(&old) {
+            let lines: Vec<&str> = prev.lines().collect();
+            let start = lines.len().saturating_sub(n);
+            text.push_str("\n--- previous orchestrator ---\n");
+            for line in &lines[start..] {
+                text.push_str(line);
+                text.push('\n');
+            }
+        }
+        text
+    }
+
     /// The orchestrator's HTTP port.
     pub fn port(&self) -> u16 {
         self.port

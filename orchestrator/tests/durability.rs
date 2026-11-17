@@ -12,6 +12,21 @@ use std::time::Duration;
 const A: &str = "dev-a";
 const B: &str = "dev-b";
 
+/// Wait until the task exists and has at least one event.
+async fn wait_for_task(port: u16, task_id: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let events = common::http_get_json(port, &format!("/api/v1/tasks/{task_id}/events"));
+        if events["events"].as_u64().unwrap_or(0) >= 1 {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("task {task_id} never got an event: {events}");
+        }
+        tokio::time::sleep(common::POLL_INTERVAL).await;
+    }
+}
+
 /// A harness with a durable state file, both agents registered.
 async fn durable() -> (common::E2ETest, tempfile::TempDir, String) {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -75,7 +90,7 @@ async fn durable_with_slow_target() -> (common::E2ETest, tempfile::TempDir, Stri
             &key_b,
             &orch_key,
             Vec::new(),
-            vec![("HIMAN_TEST_SLOW_READY_MS".to_string(), "8000".to_string())],
+            vec![("HIMAN_TEST_SLOW_READY_MS".to_string(), "30000".to_string())],
         )
         .await
         .expect("dev-b registers");
@@ -95,6 +110,9 @@ async fn restart_mid_shadowing_rolls_back_and_the_source_keeps_ownership() {
     );
     assert_eq!(status, 200, "dispatch refused: {body}");
     let task_id = body["task_id"].as_str().expect("task id").to_string();
+    // Wait until the task is real: the scenario loop starts asynchronously, and
+    // a handoff requested before the first step is not a mid-run handoff.
+    wait_for_task(port, &task_id).await;
 
     // Start the handoff request and restart while it is in flight. The target
     // delays its Ready, so the procedure is in Warming when the orchestrator
@@ -105,20 +123,44 @@ async fn restart_mid_shadowing_rolls_back_and_the_source_keeps_ownership() {
     // leaves an uncommitted handoff, which recovery rolls back.
     let url = format!("http://127.0.0.1:{port}/api/v1/handoff");
     let task_for_request = task_id.clone();
+    let started = tokio::sync::oneshot::channel::<()>();
+    let started_tx = started.0;
     let request = tokio::spawn(async move {
+        // Signal just before the call, so the restart races the request rather
+        // than running before it reached the old orchestrator.
+        let _ = started_tx.send(());
         ureq::post(&url)
             .set("Authorization", &format!("Bearer {}", common::API_TOKEN))
             .send_json(json!({"task_id": task_for_request, "from": A, "to": B}))
             .map(|r| r.status())
     });
+    let _ = started.1.await;
     tokio::time::sleep(Duration::from_millis(500)).await;
+    // Restart as soon as the request has reached the old orchestrator, without
+    // waiting for its response: the handoff is still in flight at that point.
+    // Waiting for the response first would mean the whole procedure finished
+    // (the handler drives it synchronously), and the restart would land after
+    // the commit rather than during it.
+    tokio::time::sleep(Duration::from_millis(200)).await;
     harness.restart_orchestrator_nowait().await;
-    harness.wait_for_agents().await;
     let _ = request.await;
+    harness.wait_for_agents().await;
+    eprintln!(
+        "=== orch log ===
+{}",
+        harness.orchestrator_log(60)
+    );
 
     // After the restart the source is still the owner and the epoch did not
     // move: the attempt never reached the commit point.
     let owner = common::http_get_json(port, &format!("/api/v1/tasks/{task_id}/owner"));
+    if owner["owner"] != json!(A) {
+        eprintln!(
+            "=== orchestrator log ===
+{}",
+            harness.orchestrator_log(60)
+        );
+    }
     assert_eq!(owner["owner"], json!(A), "the restart moved ownership");
     assert_eq!(owner["epoch"], json!(0), "the restart bumped the epoch");
 

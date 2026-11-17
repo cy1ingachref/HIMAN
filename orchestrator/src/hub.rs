@@ -78,7 +78,7 @@ pub struct Hub {
     policy: Mutex<PolicyEngine>,
     presence: Mutex<PresenceManager>,
     store: Mutex<StateStore>,
-    audit: Mutex<AuditLog>,
+    audit: Arc<Mutex<AuditLog>>,
     orchestrator_key: SigningKey,
     config: HubConfig,
     enrollment: Option<EnrollmentFile>,
@@ -161,7 +161,7 @@ impl Hub {
             policy: Mutex::new(policy),
             presence: Mutex::new(PresenceManager::new(PolicyEngine::default())),
             store: Mutex::new(StateStore::new()),
-            audit: Mutex::new(AuditLog::new()),
+            audit: Arc::new(Mutex::new(AuditLog::new())),
             orchestrator_key,
             config,
             enrollment: None,
@@ -892,6 +892,31 @@ impl Hub {
             rolled_back,
             resume_pending, "durable state attached and recovery complete"
         );
+    }
+
+    /// Write a `handoff_rolled_back` line into the audit for a handoff that
+    /// recovery found uncommitted.
+    ///
+    /// Called at startup, after the store is attached. The audit log is
+    /// in-memory, so without this the rollback would leave no trace the API can
+    /// report.
+    pub fn audit_handoff_rolled_back(&self, record: &crate::durable::HandoffRecord) {
+        let rt = tokio::runtime::Handle::current();
+        let audit = self.audit.clone();
+        let handoff_id = record.handoff_id.clone();
+        let task_id = record.task_id.clone();
+        let from = record.from_device.clone();
+        let to = record.to_device.clone();
+        rt.spawn(async move {
+            let mut audit = audit.lock().await;
+            audit.append(
+                "handoff_rolled_back".into(),
+                "orchestrator".into(),
+                format!("task={task_id} from={from} to={to} reason=orchestrator restarted before the commit"),
+            );
+            drop(audit);
+            tracing::info!(handoff = %handoff_id, "audited the startup rollback");
+        });
     }
 
     /// Whether durable state is enabled.
