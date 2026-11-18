@@ -50,6 +50,12 @@ impl PresenceManager {
         }
     }
 
+    /// Test support: the policy engine, so the enrollment boundary can be
+    /// asserted directly rather than through the connection check.
+    pub fn policy_snapshot_for_test(&self) -> &PolicyEngine {
+        &self.policy
+    }
+
     pub fn unregister(&mut self, id: &DeviceId) {
         self.devices.remove(id);
         if self.active_device.as_ref() == Some(id) {

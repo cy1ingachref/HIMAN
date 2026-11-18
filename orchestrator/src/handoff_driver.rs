@@ -133,6 +133,10 @@ pub struct DriveOutcome {
     pub committed: bool,
     /// Devices the task was offered to after a failure, if any.
     pub offered_to: Vec<DeviceId>,
+    /// Wall-clock start of the attempt, for the total-time metric.
+    pub started_at_ms: i64,
+    /// How far behind the source the target was at the switch, in log events.
+    pub replay_lag: Option<u64>,
 }
 
 /// A driver bound to one handoff attempt.
@@ -143,6 +147,10 @@ pub struct HandoffDriver {
     timeouts: HandoffTimeouts,
     retries: RetryPolicy,
     path: Vec<HandoffState>,
+    /// Wall-clock start, kept so the outcome can report total time.
+    started_at_ms: i64,
+    /// How far behind the source the target was when the switch happened.
+    replay_lag: Option<u64>,
 }
 
 impl HandoffDriver {
@@ -160,6 +168,8 @@ impl HandoffDriver {
             timeouts,
             retries,
             path: vec![HandoffState::Prepared],
+            started_at_ms: chrono::Utc::now().timestamp_millis(),
+            replay_lag: None,
         }
     }
 
@@ -327,6 +337,11 @@ impl HandoffDriver {
                     // what makes the commit idempotent by (handoff_id, epoch).
                     if self.handoff.state == HandoffState::Switching {
                         self.apply(HandoffEvent::Committed { epoch: new_epoch }, clock);
+                        // Replay lag: how much of the source's log the target
+                        // had not applied when the switch happened. Recorded
+                        // for the AC-6 metric.
+                        self.replay_lag =
+                            Some(self.handoff.checkpoint_seq.saturating_sub(applied_seq));
                     }
                     self.apply(HandoffEvent::SwitchAcked, clock);
                     info!(handoff = %self.handoff.handoff_id, attempts, "handoff complete");
@@ -455,6 +470,8 @@ impl HandoffDriver {
             commit_attempts: attempts,
             committed: self.handoff.committed,
             offered_to: Vec::new(),
+            started_at_ms: self.started_at_ms,
+            replay_lag: self.replay_lag,
         }
     }
 }

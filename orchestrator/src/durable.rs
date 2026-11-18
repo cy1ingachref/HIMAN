@@ -39,6 +39,8 @@ pub struct StalledRecord {
 pub struct DurableAuditEvent {
     pub seq: u64,
     pub ts: i64,
+    /// Millisecond timestamp, for gap metrics the second resolution loses.
+    pub ts_ms: i64,
     pub action: String,
     pub actor: String,
     pub detail: String,
@@ -134,6 +136,7 @@ impl DurableStore {
                 CREATE TABLE IF NOT EXISTS audit (
                     seq       INTEGER PRIMARY KEY,
                     ts        INTEGER NOT NULL,
+                    ts_ms     INTEGER NOT NULL DEFAULT 0,
                     action    TEXT NOT NULL,
                     actor     TEXT NOT NULL,
                     detail    TEXT NOT NULL,
@@ -222,7 +225,7 @@ impl DurableStore {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT seq, ts, action, actor, detail, prev_hash, hash
+                "SELECT seq, ts, ts_ms, action, actor, detail, prev_hash, hash
                  FROM audit ORDER BY seq",
             )
             .map_err(|e| e.to_string())?;
@@ -231,11 +234,12 @@ impl DurableStore {
                 Ok(DurableAuditEvent {
                     seq: row.get::<_, i64>(0)? as u64,
                     ts: row.get::<_, i64>(1)?,
-                    action: row.get(2)?,
-                    actor: row.get(3)?,
-                    detail: row.get(4)?,
-                    prev_hash: row.get(5)?,
-                    hash: row.get(6)?,
+                    ts_ms: row.get::<_, i64>(2).unwrap_or(0),
+                    action: row.get(3)?,
+                    actor: row.get(4)?,
+                    detail: row.get(5)?,
+                    prev_hash: row.get(6)?,
+                    hash: row.get(7)?,
                 })
             })
             .map_err(|e| e.to_string())?;
@@ -254,6 +258,7 @@ impl DurableStore {
         actor: &str,
         detail: &str,
         ts: i64,
+        ts_ms: i64,
     ) -> Result<(), String> {
         let prev_hash = self
             .conn
@@ -269,6 +274,7 @@ impl DurableStore {
         let mut event = crate::audit::AuditEvent {
             seq,
             ts,
+            ts_ms,
             action: action.to_string(),
             actor: actor.to_string(),
             detail: detail.to_string(),
@@ -278,11 +284,12 @@ impl DurableStore {
         event.hash = crate::audit::hash_event(&event);
         self.conn
             .execute(
-                "INSERT INTO audit (seq, ts, action, actor, detail, prev_hash, hash)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO audit (seq, ts, ts_ms, action, actor, detail, prev_hash, hash)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     seq as i64,
                     event.ts,
+                    event.ts_ms,
                     event.action,
                     event.actor,
                     event.detail,
@@ -303,6 +310,28 @@ impl DurableStore {
         Ok(n as u64)
     }
 
+    /// Test support: rewrite one entry's `ts` in place, leaving its hash.
+    pub fn rewrite_audit_timestamp_for_test(&self, seq: u64, ts: i64) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE audit SET ts = ?2 WHERE seq = ?1",
+                params![seq as i64, ts],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Test support: rewrite one entry's `ts_ms` in place.
+    pub fn rewrite_audit_ts_ms_for_test(&self, seq: u64, ts_ms: i64) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE audit SET ts_ms = ?2 WHERE seq = ?1",
+                params![seq as i64, ts_ms],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     /// Verify the durable audit chain.
     ///
     /// Returns `Ok(())` when every entry's hash matches its content and every
@@ -316,6 +345,8 @@ impl DurableStore {
             let mut expected = crate::audit::AuditEvent {
                 seq: event.seq,
                 ts: event.ts,
+                // `ts_ms` is not hashed, so it is not part of the chain check.
+                ts_ms: 0,
                 action: event.action.clone(),
                 actor: event.actor.clone(),
                 detail: event.detail.clone(),

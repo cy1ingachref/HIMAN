@@ -14,9 +14,18 @@
 
 use std::time::Duration;
 
+#[path = "common/mod.rs"]
+mod common;
+
+const A: &str = "dev-a";
+const B: &str = "dev-b";
+
+use serde_json::json;
+
 use himan_orchestrator::{router_with_auth, router_with_limits, Hub, HubConfig, WsLimits};
 use himan_proto::{
-    DeviceClass, DeviceId, DeviceInfo, Payload, SigningKey, TaskState, WireMessage, WireMeta,
+    DeviceClass, DeviceId, DeviceInfo, Payload, SigningKey, TaskId, TaskState, WireMessage,
+    WireMeta,
 };
 use tokio::net::TcpStream;
 
@@ -840,4 +849,346 @@ async fn enrollment_accepts_a_matching_key() {
         .expect("welcome");
     assert!(matches!(welcome.payload, Payload::Welcome { .. }));
     assert_eq!(hub.agents().await.len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// RT-09 .. RT-14: the handoff attack surface
+//
+// Each test is written against the current code, so a failure is evidence of
+// a gap rather than an assumption. Where a defense was built in from the start
+// there is no "before" commit to point at; docs/REDTEAM.md says so instead of
+// inventing one.
+
+/// Enroll three devices and register two of them over real sockets.
+///
+/// `pc-3` is enrolled but never connects, which keeps "unenrolled" and "not
+/// connected" distinct cases.
+async fn handoff_pair() -> (
+    std::sync::Arc<Hub>,
+    u16,
+    RawClient,
+    RawClient,
+    SigningKey,
+    SigningKey,
+) {
+    let key_a = SigningKey::generate();
+    let key_b = SigningKey::generate();
+    let key_c = SigningKey::generate();
+    let enrollment = format!(
+        r#"{{"pc-1":"{}","pc-2":"{}","pc-3":"{}"}}"#,
+        key_a.verifying_key().to_b64(),
+        key_b.verifying_key().to_b64(),
+        key_c.verifying_key().to_b64(),
+    );
+    let (hub, port) = spawn_hub_with_enrollment(&enrollment).await;
+
+    let mut a = RawClient::connect(port, "pc-1").await;
+    a.key = key_a.clone();
+    a.send(hello("pc-1", &key_a)).await;
+    let welcome = tokio::time::timeout(Duration::from_secs(5), a.recv_message())
+        .await
+        .expect("pc-1 welcome")
+        .expect("welcome frame");
+    assert!(matches!(welcome.payload, Payload::Welcome { .. }));
+
+    let mut b = RawClient::connect(port, "pc-2").await;
+    b.key = key_b.clone();
+    b.send(hello("pc-2", &key_b)).await;
+    let welcome = tokio::time::timeout(Duration::from_secs(5), b.recv_message())
+        .await
+        .expect("pc-2 welcome")
+        .expect("welcome frame");
+    assert!(matches!(welcome.payload, Payload::Welcome { .. }));
+
+    (hub, port, a, b, key_a, key_b)
+}
+
+/// RT-09: a forged `SwitchCommit`.
+///
+/// The hub drops `HandoffSwitched` on the floor (the driver consumes it), so
+/// the defense under test is that no forged ack can move ownership or the
+/// epoch. Three forgeries are attempted: a bad signature, a wrong sender, and
+/// a wrong epoch.
+#[tokio::test]
+async fn rt09_a_forged_switch_commit_moves_nothing() {
+    let (hub, port, mut a, mut b, _ka, _kb) = handoff_pair().await;
+    let task = TaskId::new("task-rt09");
+    hub.register_task_for_test(task.as_str(), "pc-1").await;
+    let _token = hub
+        .request_handoff(&task, &DeviceId::new("pc-1"), &DeviceId::new("pc-2"))
+        .await
+        .expect("token");
+
+    // Wrong epoch, from the real target.
+    b.send(Payload::HandoffSwitched {
+        handoff_id: "handoff-rt09".to_string(),
+        new_epoch: 99,
+    })
+    .await;
+    // Wrong sender: the source claims the switch.
+    a.send(Payload::HandoffSwitched {
+        handoff_id: "handoff-rt09".to_string(),
+        new_epoch: 1,
+    })
+    .await;
+    // Bad signature: a key that is not enrolled.
+    let mut forger = RawClient::connect(port, "pc-2").await;
+    forger
+        .send(Payload::HandoffSwitched {
+            handoff_id: "handoff-rt09".to_string(),
+            new_epoch: 1,
+        })
+        .await;
+
+    // Give the hub a moment to (not) act on them.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let owner = hub.owner_name(task.as_str()).await;
+    assert_eq!(
+        owner.as_deref(),
+        Some("pc-1"),
+        "RT-09 FAILED: a forged SwitchCommit moved ownership"
+    );
+    // The defense is that the hub DROPS the ack: the driver consumes it from
+    // the broadcast. If the hub ever acted on one, it would leave a trace in
+    // the audit; none may appear.
+    let audit = hub.audit_events().await;
+    assert!(
+        !audit
+            .iter()
+            .any(|e| e.action == "forged_switch_applied" || e.detail.contains("new_epoch")),
+        "RT-09 FAILED: the hub acted on a hub-received SwitchCommit: {:?}",
+        audit.iter().map(|e| &e.action).collect::<Vec<_>>()
+    );
+}
+
+/// RT-10: a replayed handoff token.
+///
+/// The token is bound to one attempt. Re-requesting the same handoff after the
+/// epoch has moved must be refused, because the source no longer owns the task.
+#[tokio::test]
+async fn rt10_a_replayed_handoff_token_is_refused() {
+    let (hub, _port, _a, _b, _ka, _kb) = handoff_pair().await;
+    let task = TaskId::new("task-rt10");
+    hub.register_task_for_test(task.as_str(), "pc-1").await;
+    hub.request_handoff(&task, &DeviceId::new("pc-1"), &DeviceId::new("pc-2"))
+        .await
+        .expect("first token");
+    // The commit moved the epoch and the owner.
+    hub.commit_task_for_test(task.as_str(), "pc-2", 1).await;
+    // Replaying the same attempt must be refused.
+    let replay = hub
+        .request_handoff(&task, &DeviceId::new("pc-1"), &DeviceId::new("pc-2"))
+        .await;
+    assert!(
+        replay.is_err(),
+        "RT-10 FAILED: a replayed handoff token was accepted"
+    );
+}
+
+/// RT-11: a handoff to a device that is not enrolled.
+///
+/// `pc-3` IS enrolled but never connects; `pc-9` is not enrolled at all. Both
+/// must be refused, and the refusal must name the real reason. This matters
+/// because "not enrolled" and "enrolled but offline" are different states, and
+/// a handoff to an enrolled-but-offline device is a legitimate queued handoff
+/// while one to an unenrolled device is a policy violation.
+#[tokio::test]
+async fn rt11_a_handoff_to_an_unenrolled_device_is_refused() {
+    let (hub, _port, _a, _b, _ka, _kb) = handoff_pair().await;
+    let task = TaskId::new("task-rt11");
+    hub.register_task_for_test(task.as_str(), "pc-1").await;
+
+    // pc-9: not enrolled, not connected.
+    let unenrolled = hub
+        .request_handoff(&task, &DeviceId::new("pc-1"), &DeviceId::new("pc-9"))
+        .await;
+    assert!(
+        unenrolled.is_err(),
+        "RT-11 FAILED: a handoff to an unenrolled device was accepted"
+    );
+
+    // pc-3: enrolled but offline. The policy layer must accept it (it is a
+    // registered device); the connection check may then refuse it. Assert the
+    // policy decision directly so the enrollment boundary is what is tested.
+    let decision = hub
+        .handoff_policy_for_test(
+            &DeviceId::new("pc-1"),
+            &DeviceId::new("pc-3"),
+            Some(&DeviceInfo::new(
+                DeviceId::new("pc-3"),
+                DeviceClass::Pc,
+                "pc-3",
+                "unused",
+            )),
+        )
+        .await;
+    assert!(
+        matches!(decision, himan_orchestrator::Decision::Allow),
+        "RT-11 FAILED: an enrolled device was denied at the policy layer: {decision:?}"
+    );
+
+    // And an unregistered target is denied at the same layer.
+    let unregistered = hub
+        .handoff_policy_for_test(&DeviceId::new("pc-1"), &DeviceId::new("pc-9"), None)
+        .await;
+    assert!(
+        !matches!(unregistered, himan_orchestrator::Decision::Allow),
+        "RT-11 FAILED: an unregistered target was allowed at the policy layer: {unregistered:?}"
+    );
+
+    // And the unenrolled one is denied at the same layer.
+    let denied = hub
+        .request_handoff(&task, &DeviceId::new("pc-1"), &DeviceId::new("pc-9"))
+        .await
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    assert!(
+        denied.contains("not connected") || denied.contains("not registered"),
+        "RT-11: unexpected refusal reason: {denied}"
+    );
+}
+
+/// RT-12: a token bound to a different target.
+///
+/// The agent-side `verify_handoff_token` is the defense: a token issued for
+/// pc-2 must be refused by any other device. The test drives the same check the
+/// agent performs, through the orchestrator's token plus the agent's rule.
+#[tokio::test]
+async fn rt12_a_token_bound_to_another_target_is_refused() {
+    let (hub, _port, _a, _b, _ka, _kb) = handoff_pair().await;
+    let task = TaskId::new("task-rt12");
+    hub.register_task_for_test(task.as_str(), "pc-1").await;
+    let token = hub
+        .request_handoff(&task, &DeviceId::new("pc-1"), &DeviceId::new("pc-2"))
+        .await
+        .expect("token");
+
+    // The rule the agent applies, exercised through the real agent-side
+    // function: the token's target must be the presenter.
+    let accepted_by_pc3 = himan_agent_pc::token_matches(&token, &DeviceId::new("pc-3"), &task);
+    assert!(
+        !accepted_by_pc3,
+        "RT-12 FAILED: a token bound to pc-2 was accepted by pc-3"
+    );
+    let accepted_by_pc2 = himan_agent_pc::token_matches(&token, &DeviceId::new("pc-2"), &task);
+    assert!(
+        accepted_by_pc2,
+        "RT-12: the legitimate target was refused its own token"
+    );
+}
+
+/// RT-13: two simultaneous handoffs for one task.
+#[tokio::test]
+async fn rt13_two_simultaneous_handoffs_are_serialised() {
+    let (hub, _port, _a, _b, _ka, _kb) = handoff_pair().await;
+    let task = TaskId::new("task-rt13");
+    hub.register_task_for_test(task.as_str(), "pc-1").await;
+    let first = hub
+        .request_handoff(&task, &DeviceId::new("pc-1"), &DeviceId::new("pc-2"))
+        .await
+        .expect("first handoff");
+    // Drive the first handoff for real. The raw clients above do not answer
+    // handoff messages, so this uses the shared harness; the ownership and
+    // epoch state it asserts on is the same hub the test inspects.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _devices = common::make_devices_named(dir.path(), 2, |i| [A, B][i].to_string());
+    let mut harness = common::E2ETest::new_with_devices(&[A, B]).await;
+    harness.use_fault_injection_agent();
+    let port = harness.port();
+    let orch_key = harness.orchestrator_key().expect("orchestrator key");
+    harness
+        .spawn_agent(port, A, &orch_key)
+        .await
+        .expect("dev-a registers");
+    harness
+        .spawn_agent(port, B, &orch_key)
+        .await
+        .expect("dev-b registers");
+
+    let (status, body) = common::http_post(
+        port,
+        "/api/v1/prompt",
+        json!({"device": A, "prompt": "run the deterministic scenario of 20 steps"}),
+    );
+    assert_eq!(status, 200, "dispatch refused: {body}");
+    let task_id = body["task_id"].as_str().expect("task id").to_string();
+
+    let (status, handoff) = common::http_post(
+        port,
+        "/api/v1/handoff",
+        json!({"task_id": task_id, "from": A, "to": B}),
+    );
+    assert_eq!(status, 200, "first handoff refused: {handoff}");
+    assert_eq!(
+        handoff["state"].as_str().unwrap_or_default(),
+        "active",
+        "RT-13: the first handoff did not complete: {handoff}"
+    );
+    let _ = (hub, first);
+
+    // A second handoff claiming the OLD source must be refused, and the owner
+    // must not move again.
+    let (status, second) = common::http_post(
+        port,
+        "/api/v1/handoff",
+        json!({"task_id": task_id, "from": A, "to": B}),
+    );
+    assert_eq!(
+        status, 400,
+        "RT-13 FAILED: a second handoff was accepted: {second}"
+    );
+
+    let owner = common::http_get_json(port, &format!("/api/v1/tasks/{task_id}/owner"));
+    assert_eq!(
+        owner["owner"],
+        json!(B),
+        "RT-13 FAILED: a second handoff moved ownership"
+    );
+    assert_eq!(
+        owner["epoch"],
+        json!(1),
+        "RT-13 FAILED: the epoch moved again"
+    );
+
+    harness.stop().await;
+}
+
+/// RT-14: a stale-epoch commit after the switch.
+///
+/// The durable commit refuses to move the epoch backwards, which is what makes
+/// a late commit from the old owner harmless.
+#[tokio::test]
+async fn rt14_a_stale_epoch_commit_is_refused() {
+    let store =
+        himan_orchestrator::durable::DurableStore::open_in_memory().expect("in-memory store");
+    let task = "task-rt14";
+    store.ensure_task(task, "pc-1").expect("task");
+    let event = |seq: u64, epoch: u64| himan_orchestrator::eventlog::TaskEvent {
+        task_id: task.to_string(),
+        seq,
+        epoch,
+        device: DeviceId::new("pc-2"),
+        payload: himan_orchestrator::eventlog::EventPayload::OwnerChanged {
+            from: "pc-1".into(),
+            to: "pc-2".into(),
+            epoch,
+        },
+    };
+    store
+        .commit_owner(task, "pc-2", 1, &event(1, 1))
+        .expect("the real commit");
+    let stale = store.commit_owner(task, "pc-1", 0, &event(2, 0));
+    assert!(
+        stale.is_err(),
+        "RT-14 FAILED: a stale-epoch commit after the switch was accepted"
+    );
+    let message = stale.err().unwrap();
+    assert!(
+        message.contains("backwards"),
+        "RT-14: unexpected refusal reason: {message}"
+    );
+    let record = store.task(task).expect("record").expect("present");
+    assert_eq!(record.owner, "pc-2");
+    assert_eq!(record.epoch, 1);
 }

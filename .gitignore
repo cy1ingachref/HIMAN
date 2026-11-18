@@ -52,3 +52,6 @@ enrolled-devices.json
 # Agent and orchestrator key material. Never commit.
 *.seed
 *.key
+
+# Metrics output from the AC-6 example.
+results/

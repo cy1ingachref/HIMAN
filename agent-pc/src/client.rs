@@ -115,6 +115,26 @@ pub struct AgentClient {
     stop_hook: Option<Arc<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>>,
 }
 
+/// The token's own claims: the target must be the presenter, the task must
+/// match, and the token must not be expired.
+///
+/// The *signature* is verified by the orchestrator's signed envelope; this
+/// rule is what stops a token minted for one target being replayed at another.
+/// It is a free function so the red-team test exercises exactly the code the
+/// agent runs, not a copy of it.
+pub fn token_matches(token: &himan_proto::HandoffToken, to: &DeviceId, task_id: &TaskId) -> bool {
+    if token.to_device != *to {
+        return false;
+    }
+    if token.task_id != *task_id {
+        return false;
+    }
+    if token.is_expired(chrono::Utc::now().timestamp()) {
+        return false;
+    }
+    true
+}
+
 impl AgentClient {
     pub fn new(device_id: DeviceId, key: SigningKey, conn: Connection) -> Self {
         let (keepalive_interval, configured) = crate::keepalive::configured_interval();
@@ -706,24 +726,12 @@ impl AgentClient {
         to: &DeviceId,
         task_id: &TaskId,
     ) -> bool {
-        if token.to_device != *to {
+        if !token_matches(token, to, task_id) {
             warn!(
                 expected = %self.device_id,
                 got = %to,
-                "handoff token is for a different target"
+                "handoff token is for a different target or task, or expired"
             );
-            return false;
-        }
-        if token.task_id != *task_id {
-            warn!(
-                expected = %task_id,
-                got = %token.task_id,
-                "handoff token is for a different task"
-            );
-            return false;
-        }
-        if token.is_expired(chrono::Utc::now().timestamp()) {
-            warn!("handoff token is expired");
             return false;
         }
         true

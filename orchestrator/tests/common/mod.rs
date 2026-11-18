@@ -264,6 +264,46 @@ impl Child {
         let _ = self.child.wait();
     }
 
+    /// The exit code once the process has exited, or `None` if it is still
+    /// running.
+    pub fn try_wait(&mut self) -> Option<i32> {
+        match self.child.try_wait() {
+            Ok(Some(status)) => status.code(),
+            _ => None,
+        }
+    }
+
+    /// Wait for the process to exit, and assert it exited non-zero with a
+    /// message matching `expect` somewhere in its log.
+    ///
+    /// This is how a startup guard is tested: the orchestrator refuses to
+    /// start when the durable audit chain is broken, so the interesting
+    /// assertion is on the exit and the reason, not on a socket.
+    pub fn expect_startup_failure(&mut self, expect: &str, timeout: Duration) -> String {
+        let deadline = std::time::Instant::now() + timeout;
+        let code = loop {
+            if let Some(code) = self.try_wait() {
+                break code;
+            }
+            if std::time::Instant::now() >= deadline {
+                let tail = self.tail(LOG_TAIL_LINES);
+                panic!("the process did not exit within {timeout:?}\n{tail}");
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        let _ = self.child.wait();
+        let log = self.tail(LOG_TAIL_LINES);
+        assert_ne!(
+            code, 0,
+            "the process exited successfully but a failure was required\n{log}"
+        );
+        assert!(
+            log.contains(expect),
+            "the process failed without the expected message {expect:?}\n{log}"
+        );
+        log
+    }
+
     /// The last `n` lines of the child's stdout and stderr, for failure output.
     pub fn tail(&self, n: usize) -> String {
         let mut text = String::new();
@@ -589,6 +629,37 @@ impl E2ETest {
                 panic!("{message}\n{tail}");
             }
         }
+    }
+
+    /// Spawn the orchestrator again WITHOUT waiting for it to come up.
+    ///
+    /// For tests that expect the process to refuse to start: the assertion is
+    /// on the exit code and the log, which `expect_startup_failure` reads.
+    pub fn start_orchestrator_with(&mut self, extra: &[(String, String)]) -> Child {
+        self.orch.kill();
+        let key_file = self.key_file.clone().expect("restartable harness");
+        let enrollment_file = self.enrollment_file.clone().expect("restartable harness");
+        let mut envs: Vec<(String, String)> = vec![
+            ("HIMAN_PORT".to_string(), self.port.to_string()),
+            (
+                "HIMAN_ORCH_KEY_FILE".to_string(),
+                key_file.display().to_string(),
+            ),
+            (
+                "HIMAN_ENROLLED_FILE".to_string(),
+                enrollment_file.display().to_string(),
+            ),
+            ("HIMAN_API_TOKEN".to_string(), API_TOKEN.to_string()),
+        ];
+        if let Some(path) = &self.state_file {
+            envs.push(("HIMAN_STATE_FILE".to_string(), path.display().to_string()));
+        }
+        envs.extend(extra.iter().cloned());
+        Child::spawn(
+            &binary("himan-orchestrator").expect("build himan-orchestrator first"),
+            Vec::<String>::new(),
+            envs,
+        )
     }
 
     /// Stop the orchestrator and start it again on the same data directory, key

@@ -96,9 +96,52 @@ and report `applied_seq`). Until that lands, the e2e exit check
       (`orchestrator/tests/durability.rs`, `durable_audit.rs`)
 - [x] Fault-injection hooks are behind the `fault-injection` feature and a CI
       guard fails the job if any reaches the release binary
+- [x] AC-5 handoff red team, RT-09 to RT-14
+      (`orchestrator/tests/redteam.rs`, `docs/REDTEAM.md`)
+- [x] AC-6 metrics as audit events, CSV + p50/p95, nightly job
+      (`orchestrator/examples/handoff_metrics.rs`)
 - [ ] Handoff state itself survives a restart *uncommitted* (rolls back, by
       design) and committed-unacked resumes — covered, but a target-side
       re-offer after the new owner dies is not implemented
+
+### Phase 3 exit check
+
+| AC | Meaning | Status |
+|---|---|---|
+| AC-1 | mid-run handoff, one owner, every step once | PASS |
+| AC-2 | no owner-less interval in the audit timeline | PASS |
+| AC-3 | a target that never readies rolls back at the timeout | PASS |
+| AC-4 | the failure matrix | PASS (8 of 8 rows) |
+| AC-5 | handoff red team RT-09..RT-14 | PASS |
+| AC-6 | metrics recorded and reported | PASS |
+
+AC-1 to AC-6 all pass. The exit check "task started on PC finishes on phone" is
+claimable **for the PC-to-PC stand-in** used by the tests; the phone shell itself
+is still Phase 3's unfinished Android work.
+
+Caveat on AC-4 row 8: "orchestrator restart mid-handoff" is covered for the two
+durable outcomes (uncommitted rolls back, committed resumes) and for a lost
+target-side ack, but not for a target that is mid-ack while the orchestrator dies
+— that is a scheduling window the harness cannot hit deterministically.
+
+### AC-4 row-by-row
+
+| # | Row | Test that covers it | Status |
+|---|---|---|---|
+| 1 | stale-epoch write from the old owner | `hub::tests::a_stale_owner_write_is_rejected_and_audited` (unit) + the fencing in `rt14_a_stale_epoch_commit_is_refused` | PASS |
+| 2 | duplicate `SwitchCommit` | `ac4_matrix::ac4_duplicate_switch_commit_is_idempotent` | PASS |
+| 3 | drop `SwitchCommit` (retry, then recovery) | `ac4_matrix::ac4_dropped_switch_commit_is_retried_and_completes` | PASS |
+| 4 | non-idempotent call in flight at the switch | `non_idempotent::the_flip_waits_for_the_in_flight_effect_and_it_runs_exactly_once` + `an_effect_that_exceeds_the_timeout_rolls_the_handoff_back` | PASS |
+| 5 | kill the source in Shadowing | `ac4_matrix::ac4_source_dies_in_shadowing_rolls_back` | PASS |
+| 6 | kill the target before commit | `ac4_matrix::ac4_target_dies_before_commit_rolls_back` | PASS |
+| 7 | kill the target after commit | `ac4_target_after_commit::a_target_that_dies_after_the_commit_loses_the_task` | PASS |
+| 8 | orchestrator restart mid-handoff | `durability::restart_mid_shadowing_rolls_back_and_the_source_keeps_ownership` (uncommitted rolls back), `restart_after_commit_resumes_at_the_ack_and_ends_active` (committed resumes), `a_lost_target_ack_does_not_roll_back_a_committed_handoff` (a lost ack is not a rollback) | PASS |
+
+Rows 1-8 all pass. Each of the two previously missing rows was written first
+and shown failing for the right reason with its defense removed (stall on
+disconnect; committing the handoff record).
+
+
 
 ## Phase 4: Character
 

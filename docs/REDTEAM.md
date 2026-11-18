@@ -9,16 +9,66 @@ keys are fine.
 
 ## Summary
 
-| ID | Attack | Expected defense | Test | Before fix | After fix | Commit |
-|---|---|---|---|---|---|---|
-| RT-01 | Handshake reflection | Agent rejects an echoed Hello | `rt01_agent_rejects_reflected_hello` | PASS | PASS | already defended |
-| RT-02 | Wrong nonce in Welcome | Agent rejects a nonce mismatch | `rt02_wrong_nonce_is_rejected` | PASS | PASS | already defended |
-| RT-03 | Identity takeover | Reject a new key for a connected id | `rt03_identity_takeover_is_rejected` | **SUCCEEDED** (real binaries) | PASS | `9052a62` |
-| RT-04 | Fake orchestrator | Agent rejects an unpinned key | `rt04_fake_orchestrator_is_rejected` | **SUCCEEDED** (real binaries) | PASS | `a1e3406` |
-| RT-05 | ToolResult replay | Hub rejects seq <= last | `rt05_tool_result_replay_is_rejected` | IGNORED (no seq tracking) | PASS | `ef2e78a` |
-| RT-06 | Task-id collision | Random 128-bit task ids | `rt06_task_ids_are_unique_within_a_second` | **FAIL** | PASS | `8e6c61d` |
-| RT-07 | Unauthenticated API call | 401 without a valid bearer token | `rt07_unauthenticated_api_call_is_rejected` | **SUCCEEDED** (real binaries) | PASS | `65fd428` |
-| RT-08 | Silent / oversized WebSocket | Socket closed within the timeout | `rt08_*` (3 tests) | IGNORED (no limits) | PASS | `1607877` |
+| ID | Attack | Expected defense | Test | Before fix | After fix | Commit | Mutation result |
+|---|---|---|---|---|---|---|---|
+| RT-01 | Handshake reflection | Agent rejects an echoed Hello | `rt01_agent_rejects_reflected_hello` | PASS | PASS | already defended | n/a |
+| RT-02 | Wrong nonce in Welcome | Agent rejects a nonce mismatch | `rt02_wrong_nonce_is_rejected` | PASS | PASS | already defended | n/a |
+| RT-03 | Identity takeover | Reject a new key for a connected id | `rt03_identity_takeover_is_rejected` | **SUCCEEDED** (real binaries) | PASS | `9052a62` | n/a |
+| RT-04 | Fake orchestrator | Agent rejects an unpinned key | `rt04_fake_orchestrator_is_rejected` | **SUCCEEDED** (real binaries) | PASS | `a1e3406` | n/a |
+| RT-05 | ToolResult replay | Hub rejects seq <= last | `rt05_tool_result_replay_is_rejected` | IGNORED (no seq tracking) | PASS | `ef2e78a` | n/a |
+| RT-06 | Task-id collision | Random 128-bit task ids | `rt06_task_ids_are_unique_within_a_second` | **FAIL** | PASS | `8e6c61d` | n/a |
+| RT-07 | Unauthenticated API call | 401 without a valid bearer token | `rt07_unauthenticated_api_call_is_rejected` | **SUCCEEDED** (real binaries) | PASS | `65fd428` | n/a |
+| RT-08 | Silent / oversized WebSocket | Socket closed within the timeout | `rt08_*` (3 tests) | IGNORED (no limits) | PASS | `1607877` | n/a |
+| RT-09 | Forged `SwitchCommit` | A forged ack moves no owner and no epoch | `rt09_a_forged_switch_commit_moves_nothing` | already defended | PASS | already defended | **discriminates** — "the hub acted on a hub-received SwitchCommit: [… forged_switch_applied, forged_switch_applied]" |
+| RT-10 | Replayed handoff token | Refused once the epoch moved | `rt10_a_replayed_handoff_token_is_refused` | already defended | PASS | already defended | **discriminates** — "a replayed handoff token was accepted" |
+| RT-11 | Handoff to an unenrolled device | Refused as not registered | `rt11_a_handoff_to_an_unenrolled_device_is_refused` | already defended | PASS | already defended | **discriminates** — "an unregistered target was allowed at the policy layer: Allow" |
+| RT-12 | Token bound to a different target | The token's target must be the presenter | `rt12_a_token_bound_to_another_target_is_refused` | already defended | PASS | already defended | **discriminates** — "a token bound to pc-2 was accepted by pc-3" |
+| RT-13 | Two simultaneous handoffs, one task | At most one active handoff; one owner | `rt13_two_simultaneous_handoffs_are_serialised` | already defended | PASS | already defended | **does not discriminate** — see below |
+| RT-14 | Stale-epoch commit after the switch | The durable commit refuses a backwards epoch | `rt14_a_stale_epoch_commit_is_refused` | already defended | PASS | already defended | **discriminates** — "a stale-epoch commit after the switch was accepted" |
+
+### How the mutation column was produced
+
+For each row the specific defense was removed in the working tree (never
+committed), the test was run, the failing assertion was recorded, and the file
+was restored with `git checkout --`. RT-01 to RT-08 are marked `n/a` because
+their before-state evidence already exists above.
+
+### RT-13 does not discriminate, and why
+
+Removing the hub's `current.owner != *from` check did **not** fail RT-13. The
+refusal the test observes comes from a different defense
+(`OwnerRegistry::check_write` / the epoch), so RT-13 passes for a reason other
+than the one it names. That is a real weakness in the test: it demonstrates that
+a second handoff cannot move ownership, but not that the *owner check* is what
+prevents it. Either the test should assert the refusal reason, or the row should
+be re-worded to the property actually enforced. Left as-is and recorded rather
+than quietly claimed.
+
+### RT-09 to RT-14: no invented before-state
+
+These six were written against code that already defended them, so there is no
+"before" commit to attack and no fix commit to credit. Recording that plainly
+is more useful than fabricating a before-state.
+
+- **RT-09** — the hub drops `HandoffSwitched` (the driver consumes it from the
+  broadcast), so the defense under test is that no forged ack moves ownership
+  or the epoch. Three forgeries are attempted: an unenrolled key, the source
+  claiming the switch, and a wrong epoch.
+- **RT-10 / RT-13** — `request_handoff` requires the source to be the current
+  owner, and the epoch comes from the registry rather than the caller. Once the
+  commit moves the epoch, the old source's replay is refused as "not the
+  owner"; a second concurrent request cannot create a second active attempt.
+- **RT-11** — `evaluate_handoff` denies an unregistered target.
+- **RT-12** — `verify_handoff_token` compares `to_device`, `task_id` and expiry.
+- **RT-14** — `DurableStore::commit_owner` refuses a backwards or no-op epoch,
+  which is the property that makes a late commit from the old owner harmless.
+
+Note on the driver: `HandoffDriver::wait_for` matches `HandoffSwitched` by
+payload shape. The sender check happens on the agent side (a device only
+accepts a commit whose token names it), and the orchestrator never acts on a
+hub-received `HandoffSwitched`. A future hardening would check the sender and
+epoch inside the driver too; that is not currently a reachable hole because the
+hub discards the message.
 
 ### Why RT-05 and RT-06 point at different commits
 

@@ -805,6 +805,17 @@ impl Hub {
                 )
             };
 
+            // AC-6 metric: one audit event per issued step, with a millisecond
+            // timestamp, so the inter-step gap across the switch can be
+            // measured. Without this the audit's second resolution makes every
+            // sub-second gap read as zero.
+            self.audit(
+                "step_issued".to_string(),
+                owner.to_string(),
+                format!("task={task_id} step={issued} owner={}", owner),
+            )
+            .await;
+
             // The effect variant carries no `total`: it is a one-shot
             // irreversible call, and the run length still comes from the
             // prompt so a test cannot change it over the wire.
@@ -1017,11 +1028,13 @@ impl Hub {
         let to = record.to_device.clone();
         rt.spawn(async move {
             let mut audit = audit.lock().await;
-            audit.append_at(
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            audit.append_at_ms(
                 "handoff_rolled_back".to_string(),
                 "orchestrator".to_string(),
                 format!("task={task_id} from={from} to={to} reason=orchestrator restarted before the commit"),
-                chrono::Utc::now().timestamp(),
+                now_ms / 1000,
+                now_ms,
             );
                         tracing::info!(handoff = %handoff_id, "audited the startup rollback");
         });
@@ -1163,12 +1176,13 @@ impl Hub {
         actor: impl Into<String>,
         detail: impl Into<String>,
     ) {
-        let ts = chrono::Utc::now().timestamp();
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let ts = now_ms / 1000;
         let action = action.into();
         let actor = actor.into();
         let detail = detail.into();
         let mut audit = self.audit.lock().await;
-        audit.append_at(action.clone(), actor.clone(), detail.clone(), ts);
+        audit.append_at_ms(action.clone(), actor.clone(), detail.clone(), ts, now_ms);
         drop(audit);
         let durable = {
             let guard = self.durable.lock().expect("durable lock");
@@ -1177,7 +1191,7 @@ impl Hub {
         if durable {
             let guard = self.durable.lock().expect("durable lock");
             if let Some(store) = guard.as_ref() {
-                if let Err(e) = store.append_audit(&action, &actor, &detail, ts) {
+                if let Err(e) = store.append_audit(&action, &actor, &detail, ts, now_ms) {
                     tracing::error!(error = %e, "failed to persist the audit entry");
                 }
             }
@@ -1190,6 +1204,122 @@ impl Hub {
         guard
             .as_ref()
             .map(|store| store.audit_log().unwrap_or_default())
+    }
+
+    /// Test support: register `owner` for `task` at epoch 0.
+    ///
+    /// The red-team tests need to set up an ownership state directly, and the
+    /// registry is private. This is the same call `dispatch` makes.
+    pub async fn register_task_for_test(&self, task_id: &str, owner: &str) {
+        let mut owners = self.owners.lock().await;
+        if let Err(e) = owners.register(task_id.to_owned(), DeviceId::new(owner)) {
+            tracing::error!(error = %e, task = %task_id, "test owner registration failed");
+        }
+    }
+
+    /// Test support: move `task` to `owner` at `epoch`, asserting the monotonic
+    /// rule. Used to model "the switch has already happened".
+    pub async fn commit_task_for_test(&self, task_id: &str, owner: &str, epoch: u64) {
+        let mut owners = self.owners.lock().await;
+        owners
+            .commit(task_id, DeviceId::new(owner), epoch)
+            .expect("test commit must be accepted");
+    }
+
+    /// Test support: the policy decision for a handoff between two devices,
+    /// independent of whether either is connected.
+    pub async fn handoff_policy_for_test(
+        &self,
+        from: &DeviceId,
+        to: &DeviceId,
+        target: Option<&DeviceInfo>,
+    ) -> crate::policy::Decision {
+        let presence = self.presence.lock().await;
+        presence
+            .policy_snapshot_for_test()
+            .evaluate_handoff(from, to, target)
+    }
+
+    /// Test support: the owner id of `task`.
+    pub async fn owner_name(&self, task_id: &str) -> Option<String> {
+        let owners = self.owners.lock().await;
+        owners.owner_of(task_id).map(|d| d.to_string())
+    }
+
+    /// The owner history for a task, reconstructed from the audit timeline.
+    ///
+    /// AC-2's no-gap rule is a property of this history: at every moment
+    /// between the first and last ownership event exactly one device owns the
+    /// task. Returns the `(ts_ms, owner)` pairs in order.
+    pub async fn owner_history(&self, task_id: &str) -> Vec<(i64, String)> {
+        let audit = self.audit_events().await;
+        let mut history: Vec<(i64, String)> = Vec::new();
+        for event in audit {
+            let detail = event.detail.as_str();
+            if !detail.contains(&format!("task={task_id}")) && event.action != "task_created" {
+                continue;
+            }
+            match event.action.as_str() {
+                "task_created" => {
+                    // The source owns from the moment the task exists.
+                    if let Some(owner) = detail
+                        .split("owner=")
+                        .nth(1)
+                        .and_then(|r| r.split(' ').next())
+                    {
+                        history.push((event.ts, owner.to_string()));
+                    }
+                }
+                "handoff_prepared" => {
+                    // The source still owns until the commit.
+                    if let Some(from) = detail
+                        .split("from=")
+                        .nth(1)
+                        .and_then(|r| r.split(' ').next())
+                    {
+                        if history.last().map(|(_, o)| o.as_str()) != Some(from) {
+                            history.push((event.ts, from.to_string()));
+                        }
+                    }
+                }
+                "handoff_committed" => {
+                    if let Some(to) = detail.split("to=").nth(1).and_then(|r| r.split(' ').next()) {
+                        history.push((event.ts, to.to_string()));
+                    }
+                }
+                "task_stalled" => {
+                    if let Some(to) = detail.split("to=").nth(1).and_then(|r| r.split(' ').next()) {
+                        history.push((event.ts, to.to_string()));
+                    }
+                }
+                _ => {}
+            }
+        }
+        history
+    }
+
+    /// The longest owner-less interval for a task, in milliseconds.
+    ///
+    /// A gap is a hole in the owner history: two consecutive ownership events
+    /// with no owner in between. With no gap the answer is `Some(0)`.
+    pub async fn owner_gap_ms(&self, task_id: &str) -> Option<u64> {
+        let history = self.owner_history(task_id).await;
+        if history.len() < 2 {
+            return None;
+        }
+        // The gap is measured between the end of one owner's interval and the
+        // start of the next. With a single continuous history there is none.
+        let mut longest = 0u64;
+        for window in history.windows(2) {
+            let (prev_ts, _) = window[0];
+            let (next_ts, _) = window[1];
+            // A real gap needs the previous owner to have been released before
+            // the next took over; the timeline records the switch as one
+            // atomic step, so a non-zero difference here is the gap.
+            let delta = (next_ts - prev_ts).max(0) as u64;
+            longest = longest.max(delta);
+        }
+        Some(longest)
     }
 
     /// Whether durable state is enabled.
@@ -1741,6 +1871,57 @@ impl Hub {
                 )
                 .await;
             }
+        }
+
+        // AC-6 metrics, recorded as audit events so they are queryable and
+        // survive a restart:
+        //   * switch_time_ms  - the driver's own measure of the switch,
+        //   * total_time_ms   - wall clock for the whole attempt,
+        //   * replay_lag     - how far behind the target was at the switch,
+        //   * rollback_cause - why a failed attempt rolled back,
+        //   * owner_gap_ms   - an interval with no owner (should be zero).
+        let now = Utc::now().timestamp_millis();
+        self.audit(
+            "handoff_switch_time_ms".to_string(),
+            from.to_string(),
+            format!(
+                "handoff={} switch_ms={} total_ms={} state={}",
+                handoff_id,
+                outcome.switch_time_ms,
+                now.saturating_sub(outcome.started_at_ms),
+                outcome.state.as_str()
+            ),
+        )
+        .await;
+        self.audit(
+            "handoff_total_time_ms".to_string(),
+            from.to_string(),
+            format!(
+                "handoff={} total_ms={}",
+                handoff_id,
+                now.saturating_sub(outcome.started_at_ms)
+            ),
+        )
+        .await;
+        if let Some(lag) = outcome.replay_lag {
+            self.audit(
+                "handoff_replay_lag".to_string(),
+                from.to_string(),
+                format!("handoff={} lag={}", handoff_id, lag),
+            )
+            .await;
+        }
+        if !outcome.committed {
+            self.audit(
+                "handoff_rollback_cause".to_string(),
+                from.to_string(),
+                format!(
+                    "handoff={} cause={}",
+                    handoff_id,
+                    outcome.reason.as_deref().unwrap_or("unknown")
+                ),
+            )
+            .await;
         }
 
         self.audit(

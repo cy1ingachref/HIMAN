@@ -74,7 +74,7 @@ async fn audit_entries_survive_a_restart() {
             &key_b,
             &harness.orchestrator_key().expect("key"),
             Vec::new(),
-            vec![("HIMAN_TEST_SLOW_READY_MS".to_string(), "30000".to_string())],
+            vec![("HIMAN_TEST_SLOW_READY_MS".to_string(), "15000".to_string())],
         )
         .await
         .expect("dev-b re-registers");
@@ -128,20 +128,10 @@ async fn a_tampered_audit_row_is_detected_at_startup() {
     let state = _dir.path().join("state.db");
     tamper_audit_row(&state);
 
-    // A restart without the recovery flag must refuse to start.
-    let refused = !harness.try_restart_orchestrator_env(&[]).await;
-    assert!(
-        refused,
-        "the orchestrator started despite a tampered audit row"
-    );
-    let reason = harness
-        .last_restart_refused()
-        .unwrap_or_default()
-        .to_string();
-    assert!(
-        reason.contains("audit chain verification failed"),
-        "unexpected refusal reason: {reason}"
-    );
+    // A restart without the recovery flag must refuse to start. The process
+    // exits on its own, so the assertion is on the exit and the reason.
+    let mut failed = harness.start_orchestrator_with(&[]);
+    failed.expect_startup_failure("audit chain verification failed", Duration::from_secs(5));
 
     // With the explicit flag it starts, and records why.
     let started = harness
@@ -177,4 +167,51 @@ fn tamper_audit_row(path: &std::path::Path) {
         .execute("UPDATE audit SET detail = 'tampered' WHERE seq = 1", [])
         .expect("update");
     assert!(n > 0, "no audit row was tampered with");
+}
+
+/// Altering a stored TIMESTAMP must be detected, not just the detail.
+///
+/// `ts` is part of the canonical form that `hash_event` covers, so changing it
+/// invalidates the entry's own hash. `ts_ms` is deliberately NOT hashed (it is
+/// metric-only), which is why this test also records that limitation: changing
+/// `ts_ms` is NOT detected, and that is a documented decision rather than an
+/// oversight.
+#[test]
+fn altering_a_stored_timestamp_is_detected() {
+    let store =
+        himan_orchestrator::durable::DurableStore::open_in_memory().expect("in-memory store");
+    store
+        .append_audit("one", "dev-a", "detail", 1_000, 1_000_000)
+        .expect("append");
+    store
+        .append_audit("two", "dev-b", "detail", 2_000, 2_000_000)
+        .expect("append");
+    assert!(store.verify_audit().is_ok(), "a clean chain must verify");
+
+    // Rewrite the timestamp of the second entry on disk, leaving its hash.
+    store
+        .rewrite_audit_timestamp_for_test(1, 9_999)
+        .expect("rewrite ts");
+    let err = store
+        .verify_audit()
+        .expect_err("a changed timestamp must fail verification");
+    assert!(
+        err.contains("does not match its hash"),
+        "unexpected verification error: {err}"
+    );
+
+    // And `ts_ms` is not hashed, so changing it is NOT detected. Recorded as
+    // the documented limitation.
+    let store =
+        himan_orchestrator::durable::DurableStore::open_in_memory().expect("in-memory store");
+    store
+        .append_audit("one", "dev-a", "detail", 1_000, 1_000_000)
+        .expect("append");
+    store
+        .rewrite_audit_ts_ms_for_test(0, 5_000_000)
+        .expect("rewrite ts_ms");
+    assert!(
+        store.verify_audit().is_ok(),
+        "ts_ms is metric-only and must not break the chain"
+    );
 }
