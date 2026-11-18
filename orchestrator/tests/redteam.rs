@@ -1038,7 +1038,7 @@ async fn rt13_two_simultaneous_handoffs_are_serialised() {
     // handoff messages, so this uses the shared harness; the ownership and
     // epoch state it asserts on is the same hub the test inspects.
     let dir = tempfile::tempdir().expect("tempdir");
-    let devices = common::make_devices_named(dir.path(), 2, |i| [A, B][i].to_string());
+    let _devices = common::make_devices_named(dir.path(), 2, |i| [A, B][i].to_string());
     let mut harness = common::E2ETest::new_with_devices(&[A, B]).await;
     harness.use_fault_injection_agent();
     let port = harness.port();
