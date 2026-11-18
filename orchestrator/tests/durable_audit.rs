@@ -168,3 +168,50 @@ fn tamper_audit_row(path: &std::path::Path) {
         .expect("update");
     assert!(n > 0, "no audit row was tampered with");
 }
+
+/// Altering a stored TIMESTAMP must be detected, not just the detail.
+///
+/// `ts` is part of the canonical form that `hash_event` covers, so changing it
+/// invalidates the entry's own hash. `ts_ms` is deliberately NOT hashed (it is
+/// metric-only), which is why this test also records that limitation: changing
+/// `ts_ms` is NOT detected, and that is a documented decision rather than an
+/// oversight.
+#[test]
+fn altering_a_stored_timestamp_is_detected() {
+    let store =
+        himan_orchestrator::durable::DurableStore::open_in_memory().expect("in-memory store");
+    store
+        .append_audit("one", "dev-a", "detail", 1_000, 1_000_000)
+        .expect("append");
+    store
+        .append_audit("two", "dev-b", "detail", 2_000, 2_000_000)
+        .expect("append");
+    assert!(store.verify_audit().is_ok(), "a clean chain must verify");
+
+    // Rewrite the timestamp of the second entry on disk, leaving its hash.
+    store
+        .rewrite_audit_timestamp_for_test(1, 9_999)
+        .expect("rewrite ts");
+    let err = store
+        .verify_audit()
+        .expect_err("a changed timestamp must fail verification");
+    assert!(
+        err.contains("does not match its hash"),
+        "unexpected verification error: {err}"
+    );
+
+    // And `ts_ms` is not hashed, so changing it is NOT detected. Recorded as
+    // the documented limitation.
+    let store =
+        himan_orchestrator::durable::DurableStore::open_in_memory().expect("in-memory store");
+    store
+        .append_audit("one", "dev-a", "detail", 1_000, 1_000_000)
+        .expect("append");
+    store
+        .rewrite_audit_ts_ms_for_test(0, 5_000_000)
+        .expect("rewrite ts_ms");
+    assert!(
+        store.verify_audit().is_ok(),
+        "ts_ms is metric-only and must not break the chain"
+    );
+}

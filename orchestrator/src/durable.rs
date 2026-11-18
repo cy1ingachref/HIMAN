@@ -310,6 +310,28 @@ impl DurableStore {
         Ok(n as u64)
     }
 
+    /// Test support: rewrite one entry's `ts` in place, leaving its hash.
+    pub fn rewrite_audit_timestamp_for_test(&self, seq: u64, ts: i64) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE audit SET ts = ?2 WHERE seq = ?1",
+                params![seq as i64, ts],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Test support: rewrite one entry's `ts_ms` in place.
+    pub fn rewrite_audit_ts_ms_for_test(&self, seq: u64, ts_ms: i64) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE audit SET ts_ms = ?2 WHERE seq = ?1",
+                params![seq as i64, ts_ms],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     /// Verify the durable audit chain.
     ///
     /// Returns `Ok(())` when every entry's hash matches its content and every
