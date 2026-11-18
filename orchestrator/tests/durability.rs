@@ -388,3 +388,72 @@ async fn a_stale_epoch_write_after_a_restart_is_still_rejected() {
 
     harness.stop().await;
 }
+
+/// AC-4 row 8, second half: a target-side ack lost across a restart.
+///
+/// The commit is durable, so the target owns the task after the restart even
+/// though the ack was never recorded. What must NOT happen is the handoff being
+/// rolled back (the commit already happened) or the epoch moving backwards.
+#[tokio::test]
+async fn a_lost_target_ack_does_not_roll_back_a_committed_handoff() {
+    let (mut harness, _dir, _state) = durable().await;
+    let port = harness.port();
+
+    let (status, body) = common::http_post(
+        port,
+        "/api/v1/prompt",
+        json!({"device": A, "prompt": "run the deterministic scenario of 20 steps"}),
+    );
+    assert_eq!(status, 200, "dispatch refused: {body}");
+    let task_id = body["task_id"].as_str().expect("task id").to_string();
+
+    // Commit the handoff, then restart before any ack could be recorded: the
+    // driver's in-memory ack is gone, the durable commit survives.
+    let (status, handoff) = common::http_post(
+        port,
+        "/api/v1/handoff",
+        json!({"task_id": task_id, "from": A, "to": B}),
+    );
+    assert_eq!(status, 200, "handoff refused: {handoff}");
+    assert_eq!(handoff["state"].as_str().unwrap_or_default(), "active");
+    assert_eq!(handoff["epoch"], json!(1));
+
+    harness.restart_orchestrator().await;
+
+    // The commit is durable, so the target still owns the task at epoch 1.
+    let owner = common::http_get_json(port, &format!("/api/v1/tasks/{task_id}/owner"));
+    assert_eq!(
+        owner["owner"],
+        json!(B),
+        "a lost ack rolled the committed handoff back"
+    );
+    assert_eq!(owner["epoch"], json!(1), "the epoch moved backwards");
+
+    // The durable handoff record must say committed, never rolled back.
+    let state_file = std::path::Path::new(&_state);
+    let store =
+        himan_orchestrator::durable::DurableStore::open(state_file).expect("reopen the store");
+    let handoffs = store.handoffs().expect("read handoffs");
+    let record = handoffs
+        .iter()
+        .find(|h| h.task_id == task_id)
+        .expect("the handoff record survived");
+    assert!(
+        record.committed,
+        "a committed handoff was recorded as uncommitted"
+    );
+    assert_ne!(
+        record.state, "rolled_back",
+        "a committed handoff was rolled back after a restart"
+    );
+
+    // And the audit must not claim a rollback either.
+    let audit = common::http_get_json(port, "/api/v1/audit");
+    let lines = audit.as_array().expect("audit array");
+    assert!(
+        !lines.iter().any(|l| l["action"] == "handoff_rolled_back"),
+        "a committed handoff was audited as rolled back"
+    );
+
+    harness.stop().await;
+}
