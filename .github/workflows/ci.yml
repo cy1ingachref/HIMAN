@@ -219,6 +219,9 @@ jobs:
             orchestrator/results/handoff-metrics.csv
             orchestrator/results/handoff-metrics.md
           if-no-files-found: error
+          # CI artifacts expire; keep the raw data long enough to compare runs.
+          # The committed copy in docs/data/ is the permanent record.
+          retention-days: 90
 
   # Dependency audit: fail on any known-vulnerable crate.
   audit:
