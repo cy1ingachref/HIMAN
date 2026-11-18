@@ -64,7 +64,8 @@ Set `HIMAN_STATE_FILE=/path/to/state.db` to persist owner, epoch, event log,
 handoff state and the audit log in SQLite (WAL). Unset means in-memory only.
 On startup the audit chain is verified; a broken chain refuses to start unless
 `HIMAN_ALLOW_AUDIT_RECOVERY=1` is set, which is recorded. See
-`docs/HANDOFF.md` sections 13 and 14.
+`docs/HANDOFF.md` sections 13-15. Handoff metrics are in
+`docs/METRICS.md`; the red-team log is in `docs/REDTEAM.md`.
 
 ## Handoff metrics
 
@@ -74,8 +75,9 @@ On startup the audit chain is verified; a broken chain refuses to start unless
 `orchestrator/results/handoff-metrics.csv` and a markdown summary with p50/p95
 for switch time, total time, replay lag, owner gap and inter-step gap. It is an
 example rather than a test so the per-commit gate stays fast; a nightly CI job
-runs it and uploads the CSV. Latest measured: switch p50 350 ms / p95 362 ms,
-owner gap 0, 0 rollbacks of 30.
+runs it and uploads the CSV. The committed results, including the Linux CI run,
+are in `docs/METRICS.md`: switch p50 375 ms / p95 376 ms, owner gap 0,
+replay lag 0, 0 rollbacks of 30.
 
 ## Running it
 
