@@ -881,6 +881,31 @@ impl E2ETest {
     /// issued. That keeps a single writer: the step count and the exactly-once
     /// guarantee live in the orchestrator's event log, not in a process-local
     /// counter.
+    /// Spawn a real agent with extra environment, no extra CLI args.
+    pub async fn spawn_agent_env(
+        &mut self,
+        orch_port: u16,
+        device_id: &str,
+        orch_key: &str,
+        extra_envs: &[(String, String)],
+    ) -> Result<Value, String> {
+        let key_file = self
+            .device_keys
+            .iter()
+            .find(|d| d.device == device_id)
+            .map(|d| d.key_file.clone())
+            .ok_or_else(|| format!("no key generated for device {device_id}"))?;
+        self.spawn_agent_full(
+            orch_port,
+            device_id,
+            &key_file,
+            orch_key,
+            Vec::new(),
+            extra_envs.to_vec(),
+        )
+        .await
+    }
+
     pub async fn spawn_agent_scenario(
         &mut self,
         orch_port: u16,

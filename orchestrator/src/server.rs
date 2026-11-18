@@ -253,6 +253,19 @@ async fn prompt(
 /// This is the entry point the UI or planner uses. It does not move ownership
 /// by itself; it records the attempt and returns the signed token that the
 /// target must receive. The commit happens later, through `advance_handoff`.
+/// The HTTP status for a handoff driver error.
+///
+/// The one-active-handoff guard is a conflict: the request is well-formed and
+/// can be retried once the in-flight attempt ends. Every other refusal is a bad
+/// request. Extracted so the mapping is testable without a live handoff.
+pub fn handoff_error_status(error: &ProtoError) -> StatusCode {
+    if error.to_string().contains("already has an active handoff") {
+        StatusCode::CONFLICT
+    } else {
+        StatusCode::BAD_REQUEST
+    }
+}
+
 async fn handoff(
     State(state): State<AppState>,
     Json(req): Json<HandoffRequest>,
@@ -286,7 +299,7 @@ async fn handoff(
         Err(e) => {
             warn!("handoff driver error: {e}");
             (
-                StatusCode::BAD_REQUEST,
+                handoff_error_status(&e),
                 Json(ErrorResponse {
                     error: e.to_string(),
                 }),

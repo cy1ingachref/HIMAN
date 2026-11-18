@@ -1240,6 +1240,27 @@ impl Hub {
             .evaluate_handoff(from, to, target)
     }
 
+    /// Test support: move a handoff attempt to a terminal state directly.
+    pub async fn set_handoff_state_for_test(
+        &self,
+        handoff_id: &str,
+        state: &str,
+        committed: bool,
+        reason: Option<&str>,
+    ) {
+        let mut handoffs = self.handoffs.lock().await;
+        if let Some(record) = handoffs.get_mut(handoff_id) {
+            record.state = match state {
+                "rolled_back" => crate::handoff::HandoffState::RolledBack,
+                "active" => crate::handoff::HandoffState::Active,
+                "failed" => crate::handoff::HandoffState::Failed,
+                _ => crate::handoff::HandoffState::Prepared,
+            };
+            record.committed = committed;
+            record.end_reason = reason.map(|r| r.to_string());
+        }
+    }
+
     /// Test support: the owner id of `task`.
     pub async fn owner_name(&self, task_id: &str) -> Option<String> {
         let owners = self.owners.lock().await;
@@ -1476,6 +1497,33 @@ impl Hub {
             if !agents.contains_key(from) {
                 return Err(ProtoError::Policy(format!(
                     "source device {from} is not connected"
+                )));
+            }
+        }
+
+        // One active handoff per task. Without this, two requests could both
+        // mint tokens for the same task and both drive it, which is the
+        // double-owner window RT-13 is about. The check is under the same lock
+        // as the insert below, so it cannot race.
+        {
+            let existing = {
+                let handoffs = self.handoffs.lock().await;
+                handoffs
+                    .values()
+                    .find(|h| h.task_id.as_str() == task_id.as_str() && h.state.is_active())
+                    .map(|h| (h.handoff_id.clone(), h.state.as_str().to_string()))
+            };
+            if let Some((active_id, active_state)) = existing {
+                self.audit(
+                    "handoff_rejected".to_string(),
+                    from.to_string(),
+                    format!(
+                        "task={task_id} reason=one_active_handoff active={active_id} state={active_state}"
+                    ),
+                )
+                .await;
+                return Err(ProtoError::Policy(format!(
+                    "task {task_id} already has an active handoff {active_id}"
                 )));
             }
         }
@@ -1975,6 +2023,132 @@ impl Hub {
 mod tests {
     use super::*;
     use himan_proto::DeviceClass;
+
+    /// One active handoff per task, rejected at request time.
+    ///
+    /// This is the RT-13 guard: before it, two requests for the same task both
+    /// minted tokens and both could be driven, which is the double-owner
+    /// window the row is about.
+    #[tokio::test]
+    async fn a_second_handoff_for_a_task_in_flight_is_rejected() {
+        let (hub, _sk) = hub_with("pc-1").await;
+        // A second connected and enrolled device, so neither the "not
+        // connected" nor the "not registered" check can be what refuses.
+        let sk2 = SigningKey::generate();
+        let dev2 = DeviceInfo::new(
+            DeviceId::new("pc-2"),
+            DeviceClass::Pc,
+            "pc-2".to_owned(),
+            sk2.verifying_key().to_b64(),
+        );
+        hub.keys
+            .lock()
+            .await
+            .insert(dev2.id.clone(), sk2.verifying_key());
+        hub.presence.lock().await.register(dev2.clone());
+        let (tx2, rx2) = mpsc::channel(8);
+        std::mem::forget(rx2);
+        let (inbound_tx2, _inbound_rx2) = tokio::sync::broadcast::channel(8);
+        hub.agents.lock().await.insert(
+            dev2.id.clone(),
+            AgentSession {
+                device: dev2.clone(),
+                tx: tx2,
+                inbound_tx: inbound_tx2,
+            },
+        );
+
+        let task = TaskId::new("task-one-active");
+        hub.register_task_for_test(task.as_str(), "pc-1").await;
+
+        // The first request mints a token; the attempt stays Prepared because
+        // nothing drives it, which is exactly the "in flight" window.
+        hub.request_handoff(&task, &DeviceId::new("pc-1"), &DeviceId::new("pc-2"))
+            .await
+            .expect("the first handoff is accepted");
+
+        // The second must be refused at request time, and the refusal must be
+        // auditable.
+        let second = hub
+            .request_handoff(&task, &DeviceId::new("pc-1"), &DeviceId::new("pc-2"))
+            .await;
+        let message = second.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(
+            message.contains("already has an active handoff"),
+            "the second handoff was not refused by the one-active guard: {message}"
+        );
+
+        // And the refusal left an audit event naming the reason.
+        let audit = hub.audit_events().await;
+        let rejected = audit.iter().find(|e| e.action == "handoff_rejected");
+        assert!(
+            rejected.is_some(),
+            "the rejection was not audited: {:?}",
+            audit.iter().map(|e| &e.action).collect::<Vec<_>>()
+        );
+        let detail = rejected.expect("checked").detail.as_str();
+        assert!(
+            detail.contains("reason=one_active_handoff"),
+            "the audit event does not name the guard: {detail}"
+        );
+    }
+
+    /// Once the first attempt is terminal, a new handoff is allowed again: the
+    /// guard must not wedge the task permanently.
+    #[tokio::test]
+    async fn a_handoff_is_accepted_again_after_the_first_ends() {
+        let (hub, _sk) = hub_with("pc-1").await;
+        let sk2 = SigningKey::generate();
+        let dev2 = DeviceInfo::new(
+            DeviceId::new("pc-2"),
+            DeviceClass::Pc,
+            "pc-2".to_owned(),
+            sk2.verifying_key().to_b64(),
+        );
+        hub.keys
+            .lock()
+            .await
+            .insert(dev2.id.clone(), sk2.verifying_key());
+        hub.presence.lock().await.register(dev2.clone());
+        let (tx2, rx2) = mpsc::channel(8);
+        std::mem::forget(rx2);
+        let (inbound_tx2, _inbound_rx2) = tokio::sync::broadcast::channel(8);
+        hub.agents.lock().await.insert(
+            dev2.id.clone(),
+            AgentSession {
+                device: dev2.clone(),
+                tx: tx2,
+                inbound_tx: inbound_tx2,
+            },
+        );
+
+        let task = TaskId::new("task-after-terminal");
+        hub.register_task_for_test(task.as_str(), "pc-1").await;
+        hub.request_handoff(&task, &DeviceId::new("pc-1"), &DeviceId::new("pc-2"))
+            .await
+            .expect("first handoff");
+
+        // Mark the first attempt terminal, as the driver would on rollback.
+        let snapshot = hub.handoffs_snapshot().await;
+        let first_id = snapshot
+            .iter()
+            .find(|h| h.task_id.as_str() == task.as_str())
+            .expect("the attempt exists")
+            .handoff_id
+            .clone();
+        hub.set_handoff_state_for_test(&first_id, "rolled_back", false, None)
+            .await;
+
+        // A new attempt for the same task is now allowed.
+        let again = hub
+            .request_handoff(&task, &DeviceId::new("pc-1"), &DeviceId::new("pc-2"))
+            .await;
+        assert!(
+            again.is_ok(),
+            "a terminal attempt still blocked a new handoff: {:?}",
+            again.err().map(|e| e.to_string())
+        );
+    }
 
     /// Register a device directly, bypassing Hello, so tests can focus on
     /// dispatch behavior. Returns the hub plus the signing key that matches
