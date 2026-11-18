@@ -14,6 +14,14 @@
 
 use std::time::Duration;
 
+#[path = "common/mod.rs"]
+mod common;
+
+const A: &str = "dev-a";
+const B: &str = "dev-b";
+
+use serde_json::json;
+
 use himan_orchestrator::{router_with_auth, router_with_limits, Hub, HubConfig, WsLimits};
 use himan_proto::{
     DeviceClass, DeviceId, DeviceInfo, Payload, SigningKey, TaskId, TaskState, WireMessage,
@@ -1026,33 +1034,70 @@ async fn rt13_two_simultaneous_handoffs_are_serialised() {
         .request_handoff(&task, &DeviceId::new("pc-1"), &DeviceId::new("pc-2"))
         .await
         .expect("first handoff");
-    // A second attempt for the same task while the first is still active must
-    // not create a competing owner.
-    let second = hub
-        .request_handoff(&task, &DeviceId::new("pc-1"), &DeviceId::new("pc-3"))
-        .await;
-    let active = hub.handoffs_snapshot().await;
-    let for_task: Vec<_> = active
-        .iter()
-        .filter(|h| h.task_id.as_str() == task.as_str())
-        .filter(|h| h.state != himan_orchestrator::HandoffState::RolledBack)
-        .collect();
-    assert!(
-        for_task.len() <= 1,
-        "RT-13 FAILED: {} handoffs active for one task: {:?}",
-        for_task.len(),
-        for_task
-            .iter()
-            .map(|h| h.state.as_str().to_string())
-            .collect::<Vec<_>>()
+    // Drive the first handoff for real. The raw clients above do not answer
+    // handoff messages, so this uses the shared harness; the ownership and
+    // epoch state it asserts on is the same hub the test inspects.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let devices = common::make_devices_named(dir.path(), 2, |i| [A, B][i].to_string());
+    let mut harness = common::E2ETest::new_with_devices(&[A, B]).await;
+    harness.use_fault_injection_agent();
+    let port = harness.port();
+    let orch_key = harness.orchestrator_key().expect("orchestrator key");
+    harness
+        .spawn_agent(port, A, &orch_key)
+        .await
+        .expect("dev-a registers");
+    harness
+        .spawn_agent(port, B, &orch_key)
+        .await
+        .expect("dev-b registers");
+
+    let (status, body) = common::http_post(
+        port,
+        "/api/v1/prompt",
+        json!({"device": A, "prompt": "run the deterministic scenario of 20 steps"}),
     );
-    // Whatever happened, the task has exactly one owner.
+    assert_eq!(status, 200, "dispatch refused: {body}");
+    let task_id = body["task_id"].as_str().expect("task id").to_string();
+
+    let (status, handoff) = common::http_post(
+        port,
+        "/api/v1/handoff",
+        json!({"task_id": task_id, "from": A, "to": B}),
+    );
+    assert_eq!(status, 200, "first handoff refused: {handoff}");
     assert_eq!(
-        hub.owner_name(task.as_str()).await.as_deref(),
-        Some("pc-1"),
+        handoff["state"].as_str().unwrap_or_default(),
+        "active",
+        "RT-13: the first handoff did not complete: {handoff}"
+    );
+    let _ = (hub, first);
+
+    // A second handoff claiming the OLD source must be refused, and the owner
+    // must not move again.
+    let (status, second) = common::http_post(
+        port,
+        "/api/v1/handoff",
+        json!({"task_id": task_id, "from": A, "to": B}),
+    );
+    assert_eq!(
+        status, 400,
+        "RT-13 FAILED: a second handoff was accepted: {second}"
+    );
+
+    let owner = common::http_get_json(port, &format!("/api/v1/tasks/{task_id}/owner"));
+    assert_eq!(
+        owner["owner"],
+        json!(B),
         "RT-13 FAILED: a second handoff moved ownership"
     );
-    let _ = (first, second);
+    assert_eq!(
+        owner["epoch"],
+        json!(1),
+        "RT-13 FAILED: the epoch moved again"
+    );
+
+    harness.stop().await;
 }
 
 /// RT-14: a stale-epoch commit after the switch.
