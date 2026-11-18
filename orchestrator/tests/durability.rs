@@ -457,3 +457,75 @@ async fn a_lost_target_ack_does_not_roll_back_a_committed_handoff() {
 
     harness.stop().await;
 }
+
+/// A task's state, args and output survive an orchestrator restart.
+///
+/// The record is persisted on every mutation, so a restart restores it rather
+/// than rebuilding it from the event log.
+#[tokio::test]
+async fn task_state_args_and_output_survive_a_restart() {
+    let (mut harness, _dir, state) = durable().await;
+    let port = harness.port();
+
+    let (status, body) = common::http_post(
+        port,
+        "/api/v1/prompt",
+        json!({"device": A, "prompt": "run the deterministic scenario of 20 steps"}),
+    );
+    assert_eq!(status, 200, "dispatch refused: {body}");
+    let task_id = body["task_id"].as_str().expect("task id").to_string();
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let mut before;
+    loop {
+        before = common::http_get_json(port, &format!("/api/v1/tasks/{task_id}/record"));
+        if before["state"].as_str().unwrap_or("") != "pending"
+            || std::time::Instant::now() >= deadline
+        {
+            break;
+        }
+        tokio::time::sleep(common::POLL_INTERVAL).await;
+    }
+    assert_eq!(before["task_id"], json!(task_id));
+    // The scenario task's args are an empty object (the run length comes from
+    // the prompt, deliberately, so a caller cannot change it over the wire).
+    // What must survive is the field itself, not a non-empty value.
+    assert!(
+        before["args"].is_object(),
+        "the record has no args object: {before}"
+    );
+
+    harness.restart_orchestrator().await;
+
+    let after = common::http_get_json(port, &format!("/api/v1/tasks/{task_id}/record"));
+    assert_eq!(
+        after["task_id"], before["task_id"],
+        "the task record did not survive the restart"
+    );
+    assert_eq!(
+        after["state"], before["state"],
+        "the task state did not survive the restart"
+    );
+    assert_eq!(
+        after["args"], before["args"],
+        "the task args did not survive the restart"
+    );
+    assert_eq!(
+        after["output"], before["output"],
+        "the task output did not survive the restart"
+    );
+    assert_eq!(
+        after["target_device"], before["target_device"],
+        "the target device did not survive the restart"
+    );
+
+    // The persisted file really holds it, not just the in-memory rebuild.
+    let store = himan_orchestrator::durable::DurableStore::open(std::path::Path::new(&state))
+        .expect("reopen the store");
+    let records = store.task_records().expect("read task records");
+    assert!(
+        records.iter().any(|r| r.id.as_str() == task_id.as_str()),
+        "the task record is not in the database"
+    );
+
+    harness.stop().await;
+}

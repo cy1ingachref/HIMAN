@@ -459,6 +459,7 @@ impl Hub {
                 store.set_state(task_id, *state);
                 store.set_output(task_id, output.clone());
                 drop(store);
+                self.persist_task_record(task_id).await;
 
                 self.audit(
                     "tool_result".to_string(),
@@ -595,7 +596,7 @@ impl Hub {
         let call = ToolCall {
             task_id: task_id.clone(),
             tool: himan_proto::ToolName::new(tool_name),
-            args,
+            args: args.clone(),
             risk_tier: risk,
             target_device: device_id.clone(),
             nonce: random_nonce(),
@@ -621,6 +622,8 @@ impl Hub {
                 let mut store = self.store.lock().await;
                 store.set_state(&task_id, TaskState::Failed);
                 store.set_output(&task_id, reason.clone());
+                drop(store);
+                self.persist_task_record(&task_id).await;
                 return Ok(DispatchResult {
                     task_id: task_id.to_string(),
                     state: "failed".into(),
@@ -633,6 +636,8 @@ impl Hub {
                 // Report honestly rather than pretending the call ran.
                 let mut store = self.store.lock().await;
                 store.set_state(&task_id, TaskState::AwaitingApproval);
+                drop(store);
+                self.persist_task_record(&task_id).await;
                 return Ok(DispatchResult {
                     task_id: task_id.to_string(),
                     state: "awaiting_approval".into(),
@@ -654,6 +659,7 @@ impl Hub {
             );
             store.set_state(&task_id, TaskState::Running);
         }
+        self.persist_task_record(&task_id).await;
 
         // Record the task durably, so a restart can load its owner and log even
         // if no handoff ever happens.
@@ -699,6 +705,19 @@ impl Hub {
                     },
                 );
             }
+            // Record the task, as the plain tool-call path does, so the task's
+            // state, args and output exist for the API and survive a restart.
+            {
+                let mut store = self.store.lock().await;
+                store.create(
+                    task_id.clone(),
+                    himan_proto::ToolName::new(tool_name),
+                    device_id.clone(),
+                    args.clone(),
+                );
+                store.set_state(&task_id, TaskState::Running);
+            }
+            self.persist_task_record(&task_id).await;
             // Drive the steps in the background; the HTTP caller gets the task
             // id immediately and observes progress through the audit and the
             // event log.
@@ -1261,7 +1280,32 @@ impl Hub {
         }
     }
 
+    /// Mirror a task record to the durable store, if one is attached.
+    ///
+    /// Best-effort: a failure to persist a record is logged, not fatal, so a
+    /// disk problem cannot stop a handoff. The record is written on every state
+    /// change, so the durable copy is always the current answer rather than a
+    /// replay.
+    async fn persist_task_record(&self, task_id: &TaskId) {
+        let record = {
+            let store = self.store.lock().await;
+            store.get(task_id).cloned()
+        };
+        if let Some(record) = record {
+            let durable = self.durable.lock().expect("durable lock");
+            if let Some(store) = durable.as_ref() {
+                if let Err(e) = store.save_task_record(&record) {
+                    tracing::error!(error = %e, task = %task_id, "failed to persist the task record");
+                }
+            }
+        }
+    }
+
     /// Test support: the owner id of `task`.
+    pub async fn task_record(&self, task_id: &str) -> Option<crate::state::TaskRecord> {
+        let store = self.store.lock().await;
+        store.get(&TaskId::new(task_id)).cloned()
+    }
     pub async fn owner_name(&self, task_id: &str) -> Option<String> {
         let owners = self.owners.lock().await;
         owners.owner_of(task_id).map(|d| d.to_string())
@@ -1403,6 +1447,34 @@ impl Hub {
             }
             loaded += 1;
         }
+
+        // Rebuild the task records (state, args, output). These are not derived
+        // from the event log: the log records what happened, the record is the
+        // current answer, and the two are updated at different moments.
+        let records = {
+            let guard = self.durable.lock().expect("durable lock");
+            match guard.as_ref() {
+                None => return loaded,
+                Some(store) => match store.task_records() {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::error!(error = %e, "failed to read task records");
+                        return loaded;
+                    }
+                },
+            }
+        };
+        let mut restored = 0;
+        for record in records {
+            let mut store = self.store.lock().await;
+            if store.get(&record.id).is_some() {
+                // A live record is newer than the persisted copy.
+                continue;
+            }
+            store.restore(record);
+            restored += 1;
+        }
+        tracing::info!(task_records = restored, "restored task records");
         loaded
     }
 

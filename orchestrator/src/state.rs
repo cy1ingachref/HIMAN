@@ -77,6 +77,18 @@ impl StateStore {
         Some(previous)
     }
 
+    /// Insert a record restored from durable storage, keeping its recorded
+    /// timestamps rather than stamping "now".
+    pub fn restore(&mut self, record: TaskRecord) -> &TaskRecord {
+        if !self.tasks.contains_key(&record.id) {
+            self.order.push(record.id.clone());
+        }
+        self.tasks.insert(record.id.clone(), record);
+        self.tasks
+            .get(&self.order.last().cloned().unwrap())
+            .unwrap()
+    }
+
     pub fn set_output(&mut self, id: &TaskId, output: String) {
         if let Some(record) = self.tasks.get_mut(id) {
             record.output = Some(output);

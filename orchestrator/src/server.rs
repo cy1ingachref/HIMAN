@@ -111,6 +111,7 @@ pub fn router(hub: Arc<Hub>, _config: HubConfig) -> Router {
         .route("/api/v1/prompt", post(prompt))
         .route("/api/v1/handoff", post(handoff))
         .route("/api/v1/tasks/{task_id}/owner", get(task_owner))
+        .route("/api/v1/tasks/{task_id}/record", get(task_record))
         .route("/api/v1/tasks/{task_id}/events", get(task_events))
         .route("/ws", get(ws_handler))
         .with_state(state)
@@ -140,6 +141,7 @@ pub fn router_with_auth(
         .route("/prompt", post(prompt))
         .route("/handoff", post(handoff))
         .route("/tasks/{task_id}/owner", get(task_owner))
+        .route("/tasks/{task_id}/record", get(task_record))
         .route("/tasks/{task_id}/events", get(task_events))
         .route_layer(axum::middleware::from_fn_with_state(
             token,
@@ -171,6 +173,7 @@ pub fn router_with_limits(hub: Arc<Hub>, limits: WsLimits) -> Router {
         .route("/api/v1/prompt", post(prompt))
         .route("/api/v1/handoff", post(handoff))
         .route("/api/v1/tasks/{task_id}/owner", get(task_owner))
+        .route("/api/v1/tasks/{task_id}/record", get(task_record))
         .route("/api/v1/tasks/{task_id}/events", get(task_events))
         .route("/ws", get(ws_handler))
         .with_state(state)
@@ -337,7 +340,37 @@ async fn task_events(
     .into_response()
 }
 
-/// Report the owner and epoch recorded for a task (fencing state).
+/// Report a task's own record: state, args and output.
+///
+/// This is the orchestrator's current answer for the task, which is distinct
+/// from the event log (what happened). It is what a restart must restore.
+async fn task_record(
+    State(state): State<AppState>,
+    axum::extract::Path(task_id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let record = state.hub.task_record(&task_id).await;
+    match record {
+        Some(r) => Json(serde_json::json!({
+            "task_id": r.id.as_str(),
+            "tool": r.tool.as_str(),
+            "target_device": r.target_device.as_str(),
+            "state": r.state.as_str(),
+            "args": r.args,
+            "output": r.output,
+            "created_at": r.created_at,
+            "updated_at": r.updated_at,
+        }))
+        .into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("task {task_id} has no recorded state"),
+            }),
+        )
+            .into_response(),
+    }
+}
+
 async fn task_owner(
     State(state): State<AppState>,
     axum::extract::Path(task_id): axum::extract::Path<String>,
