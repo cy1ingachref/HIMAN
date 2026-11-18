@@ -942,11 +942,22 @@ async fn rt09_a_forged_switch_commit_moves_nothing() {
 
     // Give the hub a moment to (not) act on them.
     tokio::time::sleep(Duration::from_millis(300)).await;
-
+    let owner = hub.owner_name(task.as_str()).await;
     assert_eq!(
-        hub.owner_name(task.as_str()).await.as_deref(),
+        owner.as_deref(),
         Some("pc-1"),
         "RT-09 FAILED: a forged SwitchCommit moved ownership"
+    );
+    // The defense is that the hub DROPS the ack: the driver consumes it from
+    // the broadcast. If the hub ever acted on one, it would leave a trace in
+    // the audit; none may appear.
+    let audit = hub.audit_events().await;
+    assert!(
+        !audit
+            .iter()
+            .any(|e| e.action == "forged_switch_applied" || e.detail.contains("new_epoch")),
+        "RT-09 FAILED: the hub acted on a hub-received SwitchCommit: {:?}",
+        audit.iter().map(|e| &e.action).collect::<Vec<_>>()
     );
 }
 
@@ -974,23 +985,67 @@ async fn rt10_a_replayed_handoff_token_is_refused() {
     );
 }
 
-/// RT-11: a handoff to an unenrolled device.
+/// RT-11: a handoff to a device that is not enrolled.
+///
+/// `pc-3` IS enrolled but never connects; `pc-9` is not enrolled at all. Both
+/// must be refused, and the refusal must name the real reason. This matters
+/// because "not enrolled" and "enrolled but offline" are different states, and
+/// a handoff to an enrolled-but-offline device is a legitimate queued handoff
+/// while one to an unenrolled device is a policy violation.
 #[tokio::test]
 async fn rt11_a_handoff_to_an_unenrolled_device_is_refused() {
     let (hub, _port, _a, _b, _ka, _kb) = handoff_pair().await;
     let task = TaskId::new("task-rt11");
     hub.register_task_for_test(task.as_str(), "pc-1").await;
-    let result = hub
+
+    // pc-9: not enrolled, not connected.
+    let unenrolled = hub
         .request_handoff(&task, &DeviceId::new("pc-1"), &DeviceId::new("pc-9"))
         .await;
     assert!(
-        result.is_err(),
+        unenrolled.is_err(),
         "RT-11 FAILED: a handoff to an unenrolled device was accepted"
     );
-    let message = result.err().map(|e| e.to_string()).unwrap_or_default();
+
+    // pc-3: enrolled but offline. The policy layer must accept it (it is a
+    // registered device); the connection check may then refuse it. Assert the
+    // policy decision directly so the enrollment boundary is what is tested.
+    let decision = hub
+        .handoff_policy_for_test(
+            &DeviceId::new("pc-1"),
+            &DeviceId::new("pc-3"),
+            Some(&DeviceInfo::new(
+                DeviceId::new("pc-3"),
+                DeviceClass::Pc,
+                "pc-3",
+                "unused",
+            )),
+        )
+        .await;
     assert!(
-        message.contains("not registered") || message.contains("not connected"),
-        "RT-11: unexpected refusal reason: {message}"
+        matches!(decision, himan_orchestrator::Decision::Allow),
+        "RT-11 FAILED: an enrolled device was denied at the policy layer: {decision:?}"
+    );
+
+    // And an unregistered target is denied at the same layer.
+    let unregistered = hub
+        .handoff_policy_for_test(&DeviceId::new("pc-1"), &DeviceId::new("pc-9"), None)
+        .await;
+    assert!(
+        !matches!(unregistered, himan_orchestrator::Decision::Allow),
+        "RT-11 FAILED: an unregistered target was allowed at the policy layer: {unregistered:?}"
+    );
+
+    // And the unenrolled one is denied at the same layer.
+    let denied = hub
+        .request_handoff(&task, &DeviceId::new("pc-1"), &DeviceId::new("pc-9"))
+        .await
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    assert!(
+        denied.contains("not connected") || denied.contains("not registered"),
+        "RT-11: unexpected refusal reason: {denied}"
     );
 }
 
@@ -1009,15 +1064,14 @@ async fn rt12_a_token_bound_to_another_target_is_refused() {
         .await
         .expect("token");
 
-    // The rule the agent applies: the token's target must be the presenter.
-    let accepted_by_pc3 = token.to_device == DeviceId::new("pc-3");
+    // The rule the agent applies, exercised through the real agent-side
+    // function: the token's target must be the presenter.
+    let accepted_by_pc3 = himan_agent_pc::token_matches(&token, &DeviceId::new("pc-3"), &task);
     assert!(
         !accepted_by_pc3,
         "RT-12 FAILED: a token bound to pc-2 was accepted by pc-3"
     );
-    let accepted_by_pc2 = token.to_device == DeviceId::new("pc-2")
-        && token.task_id == task
-        && !token.is_expired(chrono::Utc::now().timestamp());
+    let accepted_by_pc2 = himan_agent_pc::token_matches(&token, &DeviceId::new("pc-2"), &task);
     assert!(
         accepted_by_pc2,
         "RT-12: the legitimate target was refused its own token"

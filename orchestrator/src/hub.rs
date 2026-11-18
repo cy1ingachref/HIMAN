@@ -1226,6 +1226,20 @@ impl Hub {
             .expect("test commit must be accepted");
     }
 
+    /// Test support: the policy decision for a handoff between two devices,
+    /// independent of whether either is connected.
+    pub async fn handoff_policy_for_test(
+        &self,
+        from: &DeviceId,
+        to: &DeviceId,
+        target: Option<&DeviceInfo>,
+    ) -> crate::policy::Decision {
+        let presence = self.presence.lock().await;
+        presence
+            .policy_snapshot_for_test()
+            .evaluate_handoff(from, to, target)
+    }
+
     /// Test support: the owner id of `task`.
     pub async fn owner_name(&self, task_id: &str) -> Option<String> {
         let owners = self.owners.lock().await;
