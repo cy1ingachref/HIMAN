@@ -627,21 +627,30 @@ fn build_welcome(hub: &Hub, device: &DeviceId, nonce: &str) -> Result<WireMessag
 ///
 /// When `HIMAN_API_TOKEN` is set, the HTTP API requires a bearer token.
 /// The token is never printed; only whether auth is enabled.
-pub async fn serve(hub: Arc<Hub>, port: u16) -> Result<(), std::io::Error> {
-    let token = crate::api_auth::ApiToken::from_env();
-    let app = match token {
+/// The router the binary serves, chosen exactly as `serve` chooses it.
+///
+/// Extracted so a test can build THE production router rather than a copy:
+/// the route table and the auth layer under test are the same code the
+/// binary runs.
+pub fn production_router(hub: Arc<Hub>, token: Option<crate::api_auth::ApiToken>) -> Router {
+    match token {
         Some(t) => {
             tracing::info!("API authentication enabled");
-            router_with_auth(hub.clone(), HubConfig::default(), t)
+            router_with_auth(hub, HubConfig::default(), t)
         }
         None => {
             tracing::warn!(
                 "HIMAN_API_TOKEN is not set: the HTTP API is open. \
                  Set it before exposing the port."
             );
-            router(hub.clone(), HubConfig::default())
+            router(hub, HubConfig::default())
         }
-    };
+    }
+}
+
+pub async fn serve(hub: Arc<Hub>, port: u16) -> Result<(), std::io::Error> {
+    let token = crate::api_auth::ApiToken::from_env();
+    let app = production_router(hub, token);
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
     info!(port, "orchestrator listening on 127.0.0.1");
     axum::serve(listener, app).await
