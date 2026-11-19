@@ -16,12 +16,13 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use himan_proto::DeviceId;
+use himan_proto::{DeviceId, TaskId, TaskState, ToolName};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use crate::eventlog::{EventLog, EventPayload, TaskEvent};
+use crate::state::TaskRecord as StateRecord;
 
 /// A task whose owner died with no device available to take it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,6 +110,20 @@ impl DurableStore {
                     owner       TEXT NOT NULL,
                     epoch       INTEGER NOT NULL,
                     has_unresolved_non_idempotent INTEGER NOT NULL DEFAULT 0
+                );
+                -- The orchestrator's own task records, so a task's state, args
+                -- and output survive a restart. Kept beside the event log, not
+                -- derived from it: the log records what happened, this records
+                -- the current answer. See docs/DECISIONS.md.
+                CREATE TABLE IF NOT EXISTS task_records (
+                    task_id      TEXT PRIMARY KEY,
+                    tool         TEXT NOT NULL,
+                    target_device TEXT NOT NULL,
+                    state        TEXT NOT NULL,
+                    args         TEXT NOT NULL,
+                    output       TEXT,
+                    created_at   INTEGER NOT NULL,
+                    updated_at   INTEGER NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS events (
                     task_id TEXT NOT NULL,
@@ -218,6 +233,78 @@ impl DurableStore {
             )
             .map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    /// Persist one task record.
+    ///
+    /// Called on every state change so a restart finds the current state, args
+    /// and output rather than replaying the log.
+    pub fn save_task_record(&self, record: &StateRecord) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT INTO task_records
+                     (task_id, tool, target_device, state, args, output, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(task_id) DO UPDATE SET
+                     tool = excluded.tool,
+                     target_device = excluded.target_device,
+                     state = excluded.state,
+                     args = excluded.args,
+                     output = excluded.output,
+                     updated_at = excluded.updated_at",
+                params![
+                    record.id.as_str(),
+                    record.tool.as_str(),
+                    record.target_device.as_str(),
+                    record.state.as_str(),
+                    record.args.to_string(),
+                    record.output,
+                    record.created_at,
+                    record.updated_at,
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Every persisted task record, for startup.
+    pub fn task_records(&self) -> Result<Vec<StateRecord>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT task_id, tool, target_device, state, args, output, created_at, updated_at
+                 FROM task_records ORDER BY created_at",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| {
+                let args: String = row.get(4)?;
+                let args = serde_json::from_str(&args).unwrap_or(serde_json::Value::Null);
+                Ok(StateRecord {
+                    id: TaskId::new(row.get::<_, String>(0)?),
+                    tool: ToolName::new(row.get::<_, String>(1)?),
+                    target_device: DeviceId::new(row.get::<_, String>(2)?),
+                    state: match row.get::<_, String>(3)?.as_str() {
+                        "pending" => TaskState::Pending,
+                        "running" => TaskState::Running,
+                        "awaiting_approval" => TaskState::AwaitingApproval,
+                        "succeeded" => TaskState::Succeeded,
+                        "failed" => TaskState::Failed,
+                        "cancelled" => TaskState::Cancelled,
+                        other => {
+                            tracing::warn!(state = %other, "unknown persisted task state");
+                            TaskState::Pending
+                        }
+                    },
+                    args,
+                    output: row.get(5)?,
+                    created_at: row.get(6)?,
+                    updated_at: row.get(7)?,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
     }
 
     /// Load the durable audit log in chain order.

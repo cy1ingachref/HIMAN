@@ -99,7 +99,7 @@ async fn durable_with_slow_target() -> (common::E2ETest, tempfile::TempDir, Stri
 
 #[tokio::test]
 async fn restart_mid_shadowing_rolls_back_and_the_source_keeps_ownership() {
-    let (mut harness, _dir, _state) = durable_with_slow_target().await;
+    let (mut harness, _dir, state) = durable_with_slow_target().await;
     let port = harness.port();
 
     // 40 steps so the run is still going when the orchestrator comes back.
@@ -135,13 +135,25 @@ async fn restart_mid_shadowing_rolls_back_and_the_source_keeps_ownership() {
             .map(|r| r.status())
     });
     let _ = started.1.await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    // Restart as soon as the request has reached the old orchestrator, without
-    // waiting for its response: the handoff is still in flight at that point.
-    // Waiting for the response first would mean the whole procedure finished
-    // (the handler drives it synchronously), and the restart would land after
-    // the commit rather than during it.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Wait until the attempt is really persisted, then restart immediately.
+    // The audit is only flushed when the driver finishes, so it cannot show
+    // "in flight"; the durable handoff row is written at request time and can.
+    // A fixed sleep is not enough: if the handoff times out before the restart,
+    // the rollback comes from the timeout rather than from recovery, which is a
+    // different code path and would let this test pass for the wrong reason.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let recorded =
+            himan_orchestrator::durable::DurableStore::open(std::path::Path::new(&state))
+                .ok()
+                .and_then(|s| s.handoffs().ok())
+                .map(|hs| hs.iter().any(|h| h.task_id == task_id))
+                .unwrap_or(false);
+        if recorded || std::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     harness.restart_orchestrator_nowait().await;
     let _ = request.await;
     harness.wait_for_agents().await;
@@ -165,6 +177,15 @@ async fn restart_mid_shadowing_rolls_back_and_the_source_keeps_ownership() {
     assert_eq!(owner["epoch"], json!(0), "the restart bumped the epoch");
 
     // The in-flight handoff was rolled back and the rollback is audited.
+    //
+    // NOTE: this asserts only that a rollback happened, not that it came from
+    // restart recovery. With the target's 30 s slow-ready and a 10 s handoff
+    // timeout, the timeout usually wins the race, so the observed cause is
+    // "target never sent HandoffReady" rather than "orchestrator restarted
+    // before the commit". Tightening this to require the recovery reason makes
+    // the test fail — the restart does not reliably land inside the window.
+    // That is a pre-existing weakness (main has the same timing), recorded here
+    // rather than hidden behind a passing assertion.
     let audit = common::http_get_json(port, "/api/v1/audit");
     let lines = audit.as_array().expect("audit array");
     assert!(
@@ -453,6 +474,78 @@ async fn a_lost_target_ack_does_not_roll_back_a_committed_handoff() {
     assert!(
         !lines.iter().any(|l| l["action"] == "handoff_rolled_back"),
         "a committed handoff was audited as rolled back"
+    );
+
+    harness.stop().await;
+}
+
+/// A task's state, args and output survive an orchestrator restart.
+///
+/// The record is persisted on every mutation, so a restart restores it rather
+/// than rebuilding it from the event log.
+#[tokio::test]
+async fn task_state_args_and_output_survive_a_restart() {
+    let (mut harness, _dir, state) = durable().await;
+    let port = harness.port();
+
+    let (status, body) = common::http_post(
+        port,
+        "/api/v1/prompt",
+        json!({"device": A, "prompt": "run the deterministic scenario of 20 steps"}),
+    );
+    assert_eq!(status, 200, "dispatch refused: {body}");
+    let task_id = body["task_id"].as_str().expect("task id").to_string();
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let mut before;
+    loop {
+        before = common::http_get_json(port, &format!("/api/v1/tasks/{task_id}/record"));
+        if before["state"].as_str().unwrap_or("") != "pending"
+            || std::time::Instant::now() >= deadline
+        {
+            break;
+        }
+        tokio::time::sleep(common::POLL_INTERVAL).await;
+    }
+    assert_eq!(before["task_id"], json!(task_id));
+    // The scenario task's args are an empty object (the run length comes from
+    // the prompt, deliberately, so a caller cannot change it over the wire).
+    // What must survive is the field itself, not a non-empty value.
+    assert!(
+        before["args"].is_object(),
+        "the record has no args object: {before}"
+    );
+
+    harness.restart_orchestrator().await;
+
+    let after = common::http_get_json(port, &format!("/api/v1/tasks/{task_id}/record"));
+    assert_eq!(
+        after["task_id"], before["task_id"],
+        "the task record did not survive the restart"
+    );
+    assert_eq!(
+        after["state"], before["state"],
+        "the task state did not survive the restart"
+    );
+    assert_eq!(
+        after["args"], before["args"],
+        "the task args did not survive the restart"
+    );
+    assert_eq!(
+        after["output"], before["output"],
+        "the task output did not survive the restart"
+    );
+    assert_eq!(
+        after["target_device"], before["target_device"],
+        "the target device did not survive the restart"
+    );
+
+    // The persisted file really holds it, not just the in-memory rebuild.
+    let store = himan_orchestrator::durable::DurableStore::open(std::path::Path::new(&state))
+        .expect("reopen the store");
+    let records = store.task_records().expect("read task records");
+    assert!(
+        records.iter().any(|r| r.id.as_str() == task_id.as_str()),
+        "the task record is not in the database"
     );
 
     harness.stop().await;

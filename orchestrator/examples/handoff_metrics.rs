@@ -27,26 +27,44 @@ const A: &str = "dev-a";
 const B: &str = "dev-b";
 const RUNS: usize = 30;
 
+/// One-way latencies the proxy adds, in ms. 0 is the loopback baseline, but it
+/// still goes through the proxy so the comparison is apples to apples.
+const LATENCIES: [u64; 4] = [0, 25, 100, 250];
+
+/// Scenario lengths. Each step is one event, so these are the event-log sizes
+/// the handoff has to shadow-replay: 100, 1000 and 10000 events.
+const LOG_SIZES: [u64; 3] = [100, 1000, 10000];
+
 #[tokio::main]
 async fn main() {
     let out_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("results");
     std::fs::create_dir_all(&out_dir).expect("create results dir");
 
     let mut rows: Vec<RunRow> = Vec::new();
-    for run in 0..RUNS {
-        let started = Instant::now();
-        let row = one_run(run).await;
-        println!(
-            "run {:>2}/{} switch={}ms total={}ms gap={}ms step_gap={}ms ({:.1}s)",
-            run + 1,
-            RUNS,
-            row.switch_ms,
-            row.total_ms,
-            row.owner_gap_ms,
-            row.longest_step_gap_ms,
-            started.elapsed().as_secs_f32()
-        );
-        rows.push(row);
+    for &steps in &LOG_SIZES {
+        for &latency in &LATENCIES {
+            let impairment = if latency == 0 {
+                common::proxy::Impairment::none()
+            } else {
+                common::proxy::Impairment::latency(latency)
+            };
+            println!("=== steps={steps} latency={latency}ms ===");
+            for run in 0..RUNS {
+                let started = Instant::now();
+                let row = one_run(run, impairment, steps).await;
+                println!(
+                    "  run {:>2}/{} switch={}ms rollback={} gap={}ms step_gap={}ms ({:.1}s)",
+                    run + 1,
+                    RUNS,
+                    row.switch_ms,
+                    row.rolled_back,
+                    row.owner_gap_ms,
+                    row.longest_step_gap_ms,
+                    started.elapsed().as_secs_f32()
+                );
+                rows.push(row);
+            }
+        }
     }
 
     write_csv(&out_dir.join("handoff-metrics.csv"), &rows);
@@ -58,6 +76,10 @@ async fn main() {
 #[derive(Clone)]
 struct RunRow {
     run: usize,
+    /// One-way latency the proxy added, in ms.
+    latency_ms: u64,
+    /// Scenario length: the event log grows with it.
+    steps: u64,
     switch_ms: u128,
     total_ms: u128,
     replay_lag: u64,
@@ -68,7 +90,7 @@ struct RunRow {
     normal_step_gap_ms: u64,
 }
 
-async fn one_run(run: usize) -> RunRow {
+async fn one_run(run: usize, impairment: common::proxy::Impairment, steps: u64) -> RunRow {
     let dir = tempfile::tempdir().expect("tempdir");
     // The devices are created in a temp dir so their key files are real
     // and disposable.
@@ -77,12 +99,21 @@ async fn one_run(run: usize) -> RunRow {
     harness.use_fault_injection_agent();
     let port = harness.port();
     let orch_key = harness.orchestrator_key().expect("orchestrator key");
+
+    // The agents connect through the proxy, so every WebSocket frame carries
+    // the impairment. The orchestrator's own HTTP API stays on `port`: the
+    // measurement is about the agent links, not the test's control channel.
+    let proxy = common::proxy::Proxy::start(port, impairment)
+        .await
+        .expect("start the impairment proxy");
+    let agent_port = proxy.port;
+
     harness
-        .spawn_agent(port, A, &orch_key)
+        .spawn_agent(agent_port, A, &orch_key)
         .await
         .expect("dev-a registers");
     harness
-        .spawn_agent(port, B, &orch_key)
+        .spawn_agent(agent_port, B, &orch_key)
         .await
         .expect("dev-b registers");
 
@@ -90,7 +121,7 @@ async fn one_run(run: usize) -> RunRow {
     let (status, body) = common::http_post(
         port,
         "/api/v1/prompt",
-        json!({"device": A, "prompt": "run the deterministic scenario of 20 steps"}),
+        json!({"device": A, "prompt": format!("run the deterministic scenario of {steps} steps")}),
     );
     assert_eq!(status, 200, "run {run}: dispatch refused: {body}");
     let task_id = body["task_id"].as_str().expect("task id").to_string();
@@ -132,11 +163,14 @@ async fn one_run(run: usize) -> RunRow {
     let owner_gap_ms = owner_gap_ms(&audit, &task_id);
     let (longest_step_gap_ms, normal_step_gap_ms) = step_gaps(&audit);
 
+    proxy.stop();
     harness.stop().await;
     drop(dir);
 
     RunRow {
         run,
+        latency_ms: impairment.latency_ms,
+        steps,
         switch_ms: switch_ms.unwrap_or(wall_ms),
         total_ms: total_ms.unwrap_or(wall_ms),
         replay_lag: replay_lag.unwrap_or(0),
@@ -273,11 +307,13 @@ fn percentile(values: &mut [u128], p: u8) -> u128 {
 
 fn write_csv(path: &std::path::Path, rows: &[RunRow]) {
     let mut text = String::from(
-        "run,switch_ms,total_ms,replay_lag,rolled_back,rollback_cause,owner_gap_ms,longest_step_gap_ms,normal_step_gap_ms\n",
+        "steps,latency_ms,run,switch_ms,total_ms,replay_lag,rolled_back,rollback_cause,owner_gap_ms,longest_step_gap_ms,normal_step_gap_ms\n",
     );
     for r in rows {
         text.push_str(&format!(
-            "{},{},{},{},{},\"{}\",{},{},{}\n",
+            "{},{},{},{},{},{},{},\"{}\",{},{},{}\n",
+            r.steps,
+            r.latency_ms,
             r.run,
             r.switch_ms,
             r.total_ms,
@@ -292,50 +328,79 @@ fn write_csv(path: &std::path::Path, rows: &[RunRow]) {
     std::fs::write(path, text).expect("write csv");
 }
 
-fn write_summary(path: &std::path::Path, rows: &[RunRow]) {
+/// One cell of the sweep: p50, p95 and max for a metric, plus the rollback rate.
+fn cell(rows: &[RunRow]) -> String {
     let mut switch: Vec<u128> = rows.iter().map(|r| r.switch_ms).collect();
-    let mut total: Vec<u128> = rows.iter().map(|r| r.total_ms).collect();
-    let mut lag: Vec<u128> = rows.iter().map(|r| r.replay_lag as u128).collect();
-    let mut gap: Vec<u128> = rows.iter().map(|r| r.owner_gap_ms as u128).collect();
     let mut longest: Vec<u128> = rows.iter().map(|r| r.longest_step_gap_ms as u128).collect();
-    let mut normal: Vec<u128> = rows.iter().map(|r| r.normal_step_gap_ms as u128).collect();
     let rollbacks = rows.iter().filter(|r| r.rolled_back).count();
-
-    let text = format!(
-        "# Handoff metrics\n\n\
-         {} runs of the AC-1 scenario against the real binaries.\n\n\
-         | Metric | p50 | p95 | Max |\n\
-         |---|---:|---:|---:|\n\
-         | switch time (ms) | {} | {} | {} |\n\
-         | total handoff time (ms) | {} | {} | {} |\n\
-         | replay lag (events) | {} | {} | {} |\n\
-         | owner gap (ms) | {} | {} | {} |\n\
-         | longest inter-step gap (ms) | {} | {} | {} |\n\
-         | normal inter-step gap (ms) | {} | {} | {} |\n\n\
-         Rollbacks: {rollbacks} of {}.\n\n\
-         An owner gap above zero means a window with no owner (AC-2). The\n\
-         longest inter-step gap should be the switch itself: the target's first\n\
-         step follows the source's last after the commit.\n",
-        rows.len(),
+    let rate = if rows.is_empty() {
+        0.0
+    } else {
+        100.0 * rollbacks as f64 / rows.len() as f64
+    };
+    format!(
+        "| {} / {} / {} | {} / {} / {} | {:.1}% ({}/{}) |",
         percentile(&mut switch, 50),
         percentile(&mut switch, 95),
         switch.iter().copied().max().unwrap_or(0),
-        percentile(&mut total, 50),
-        percentile(&mut total, 95),
-        total.iter().copied().max().unwrap_or(0),
-        percentile(&mut lag, 50),
-        percentile(&mut lag, 95),
-        lag.iter().copied().max().unwrap_or(0),
-        percentile(&mut gap, 50),
-        percentile(&mut gap, 95),
-        gap.iter().copied().max().unwrap_or(0),
         percentile(&mut longest, 50),
         percentile(&mut longest, 95),
         longest.iter().copied().max().unwrap_or(0),
-        percentile(&mut normal, 50),
-        percentile(&mut normal, 95),
-        normal.iter().copied().max().unwrap_or(0),
+        rate,
+        rollbacks,
         rows.len(),
+    )
+}
+
+fn write_summary(path: &std::path::Path, rows: &[RunRow]) {
+    let mut text = String::from(
+        "# Handoff metrics\n\n\
+         30 handoffs per cell, against the real binaries. The agents connect\
+         through a TCP proxy that adds the stated one-way latency (with jitter\
+         of a quarter of it); `steps` is the scenario length, so it is also the\
+         event-log size the target shadow-replays.\n\n\
+         Each cell is `p50 / p95 / max`.\n\n",
     );
+
+    for &steps in &LOG_SIZES {
+        text.push_str(&format!("\n## {steps} events\n\n"));
+        text.push_str(
+            "| Latency | Switch time (ms) | Longest inter-step gap (ms) | Rollback rate |\n\
+             |---|---|---|---|\n",
+        );
+        for &latency in &LATENCIES {
+            let subset: Vec<RunRow> = rows
+                .iter()
+                .filter(|r| r.steps == steps && r.latency_ms == latency)
+                .cloned()
+                .collect();
+            text.push_str(&format!("| {latency} ms {}\n", cell(&subset)));
+        }
+    }
+
+    // The correctness columns, pooled: these must not move with latency.
+    let mut gap: Vec<u128> = rows.iter().map(|r| r.owner_gap_ms as u128).collect();
+    let mut lag: Vec<u128> = rows.iter().map(|r| r.replay_lag as u128).collect();
+    let rollbacks = rows.iter().filter(|r| r.rolled_back).count();
+    text.push_str(&format!(
+        "\n## Correctness, pooled over {} runs\n\n\
+         | Metric | p50 | p95 | Max |\n\
+         |---|---:|---:|---:|\n\
+         | owner gap (ms) | {} | {} | {} |\n\
+         | replay lag (events) | {} | {} | {} |\n\n\
+         Rollbacks: {rollbacks} of {}.\n\n\
+         An owner gap above zero means a window with no owner (AC-2), which is a\
+         correctness bug rather than a performance number. A rollback under\
+         latency is a legitimate outcome: the handoff must either complete or\
+         roll back, never leave two owners.\n",
+        rows.len(),
+        percentile(&mut gap, 50),
+        percentile(&mut gap, 95),
+        gap.iter().copied().max().unwrap_or(0),
+        percentile(&mut lag, 50),
+        percentile(&mut lag, 95),
+        lag.iter().copied().max().unwrap_or(0),
+        rows.len(),
+    ));
     std::fs::write(path, text).expect("write summary");
 }

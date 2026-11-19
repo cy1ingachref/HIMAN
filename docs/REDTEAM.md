@@ -23,7 +23,7 @@ keys are fine.
 | RT-10 | Replayed handoff token | Refused once the epoch moved | `rt10_a_replayed_handoff_token_is_refused` | already defended | PASS | already defended | **discriminates** — "a replayed handoff token was accepted" |
 | RT-11 | Handoff to an unenrolled device | Refused as not registered | `rt11_a_handoff_to_an_unenrolled_device_is_refused` | already defended | PASS | already defended | **discriminates** — "an unregistered target was allowed at the policy layer: Allow" |
 | RT-12 | Token bound to a different target | The token's target must be the presenter | `rt12_a_token_bound_to_another_target_is_refused` | already defended | PASS | already defended | **discriminates** — "a token bound to pc-2 was accepted by pc-3" |
-| RT-13 | Two simultaneous handoffs, one task | At most one active handoff; one owner | `rt13_two_simultaneous_handoffs_are_serialised` | already defended | PASS | already defended | **does not discriminate** — see below |
+| RT-13 | Two simultaneous handoffs, one task | At most one active handoff, rejected with 409 | `rt13_two_simultaneous_handoffs_are_serialised` + `hub::tests::a_second_handoff_for_a_task_in_flight_is_rejected` + `one_active_handoff_http` | already defended | PASS | `a6f2601`, guard added in this branch | **discriminates** — "the second handoff was not refused by the one-active guard: " |
 | RT-14 | Stale-epoch commit after the switch | The durable commit refuses a backwards epoch | `rt14_a_stale_epoch_commit_is_refused` | already defended | PASS | already defended | **discriminates** — "a stale-epoch commit after the switch was accepted" |
 
 ### How the mutation column was produced
@@ -33,16 +33,28 @@ committed), the test was run, the failing assertion was recorded, and the file
 was restored with `git checkout --`. RT-01 to RT-08 are marked `n/a` because
 their before-state evidence already exists above.
 
-### RT-13 does not discriminate, and why
+### RT-13 now discriminates (guard added)
 
-Removing the hub's `current.owner != *from` check did **not** fail RT-13. The
-refusal the test observes comes from a different defense
-(`OwnerRegistry::check_write` / the epoch), so RT-13 passes for a reason other
-than the one it names. That is a real weakness in the test: it demonstrates that
-a second handoff cannot move ownership, but not that the *owner check* is what
-prevents it. Either the test should assert the refusal reason, or the row should
-be re-worded to the property actually enforced. Left as-is and recorded rather
-than quietly claimed.
+RT-13 previously did not discriminate: removing the hub's `current.owner != *from`
+check still passed, because the refusal came from a different defense
+(`OwnerRegistry::check_write` / the epoch). The row has an explicit guard now,
+and the mutation removes *that*:
+
+- **Guard**: `Hub::request_handoff` refuses a second request for a task that
+  already has a non-terminal attempt, before minting a token. It audits
+  `handoff_rejected` with `reason=one_active_handoff`.
+- **Mutation**: the lookup is replaced with `None`. The test fails with
+  "the second handoff was not refused by the one-active guard: ".
+- **HTTP**: the refusal maps to 409 Conflict, not 400, because the request is
+  well-formed and retryable. `handoff_error_status` is the single place that
+  decides this; `one_active_handoff_http` asserts both the 409 and that
+  unrelated policy refusals stay 400.
+
+**Why the guard is unit-tested rather than driven over HTTP**: `POST
+/api/v1/handoff` runs the driver to completion before responding, so two HTTP
+requests for one task never overlap. The guard protects the in-process path
+(`drive_handoff` spawned by the hub, or a future background driver), which is
+where a real overlap can happen.
 
 ### RT-09 to RT-14: no invented before-state
 

@@ -4,7 +4,7 @@ Secure Multi-Device AI Agent Orchestration — a zero-trust architecture for
 autonomous cross-device task execution, with an embodied 3D character.
 
 Repository: https://github.com/cy1ingachref/HIMAN
-Phase: 3 — Phone and handoff (in progress, 281 tests)
+Phase: 3 — Phone and handoff (in progress, 289 tests)
 
 ## What this is
 
@@ -72,12 +72,16 @@ On startup the audit chain is verified; a broken chain refuses to start unless
     cargo run -p himan-orchestrator --example handoff_metrics
 
 30 runs of the AC-1 scenario (~500 s), writing
-`orchestrator/results/handoff-metrics.csv` and a markdown summary with p50/p95
-for switch time, total time, replay lag, owner gap and inter-step gap. It is an
-example rather than a test so the per-commit gate stays fast; a nightly CI job
-runs it and uploads the CSV. The committed results, including the Linux CI run,
-are in `docs/METRICS.md`: switch p50 375 ms / p95 376 ms, owner gap 0,
-replay lag 0, 0 rollbacks of 30.
+`orchestrator/results/handoff-metrics.csv` and a markdown summary with p50/p95.
+It sweeps 3 event-log sizes (100, 1000, 10000) x 4 one-way latencies (0, 25,
+100, 250 ms) x 30 handoffs, with the agents connected through a portable TCP
+proxy that adds latency and jitter (no `tc`, no root). It is an example rather
+than a test so the per-commit gate stays fast; a nightly CI job runs it and
+uploads the CSV with 90-day retention.
+
+Committed results are in `docs/METRICS.md`, raw CSVs in `docs/data/`. The
+loopback baseline on Linux: switch p50 375 ms / p95 376 ms, owner gap 0,
+replay lag 0, 0 rollbacks of 30. The latency sweep is pending its first CI run.
 
 ## Running it
 

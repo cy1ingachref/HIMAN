@@ -70,6 +70,11 @@ impl HandoffState {
         )
     }
 
+    /// Not finished: a second handoff for the same task would race this one.
+    pub fn is_active(&self) -> bool {
+        !self.is_terminal()
+    }
+
     /// The commit point has passed, so rollback is no longer possible.
     pub fn is_committed(&self) -> bool {
         matches!(
