@@ -34,12 +34,12 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           components: rustfmt, clippy
 
       - name: Cache cargo registry and build
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/registry
@@ -109,10 +109,10 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
 
       - name: Cache cargo registry and build
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/registry
@@ -193,10 +193,10 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
 
       - name: Cache cargo registry and build
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/registry
@@ -234,7 +234,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
 
       - name: Install cargo-audit
         run: cargo install --locked cargo-audit
@@ -245,6 +245,50 @@ jobs:
         # 2026-09-14) with no fixed upgrade, and `chrono` is unchanged from
         # main. Any other advisory still fails the job.
         run: cargo audit --deny warnings --ignore RUSTSEC-2026-0543
+
+  # Verify every pinned action SHA against its upstream tag.
+  #
+  # A pinned SHA that does not match the tag it claims is either a typo or a
+  # supply-chain substitution. Two SHAs in this repo were invented by hand and
+  # only failed at "Set up job"; this catches that at review time instead.
+  action-pins:
+    name: verify action pins
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: "Check each pinned action SHA against its upstream tag"
+        run: |
+          set -euo pipefail
+          fail=0
+          # Every `uses:` line that pins a 40-hex SHA and names a tag.
+          while IFS= read -r line; do
+            repo=$(printf '%s' "$line" | sed -E 's/.*uses: *([^@]+)@.*/\1/')
+            sha=$(printf '%s' "$line" | sed -E 's/.*@([0-9a-f]{40}).*/\1/')
+            tag=$(printf '%s' "$line" | sed -E 's/.*# *([^ ]+).*/\1/')
+            printf '%-32s %-10s ' "$repo" "$tag"
+            # A tag may be annotated, so dereference it: refs/tags/T^{} is
+            # the commit the tag points at. Fall back to the tag itself.
+            remote=$(git ls-remote "https://github.com/$repo" \
+                       "refs/tags/$tag^{}" "refs/tags/$tag" 2>/dev/null \
+                     | awk '{print $1}' | head -1)
+            if [ -z "$remote" ]; then
+              echo "FAIL: tag $tag does not exist upstream"
+              fail=1
+            elif [ "$remote" != "$sha" ]; then
+              echo "FAIL: pinned $sha but tag $tag is $remote"
+              fail=1
+            else
+              echo "ok"
+            fi
+          done < <(grep -hE 'uses: *[^@]+@[0-9a-f]{40} *# ' .github/workflows/*.yml)
+          if [ "$fail" -ne 0 ]; then
+            echo "One or more action pins do not match their tag." >&2
+            exit 1
+          fi
 
   # Secret scan: fail if a key or token is committed.
   secrets:
@@ -259,7 +303,7 @@ jobs:
           fetch-depth: 0
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
 
       - name: Scan for secrets
         run: |
