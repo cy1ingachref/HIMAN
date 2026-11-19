@@ -4,11 +4,14 @@ on:
   push:
     branches: [main]
   pull_request:
-  # The AC-6 metrics job runs on this schedule (03:17 UTC, off the hour).
-  schedule:
-    - cron: "17 3 * * *"
-  # ...and can be started by hand.
+  # The metrics sweep is manual-only: 360 real-binary runs is hours of CI, so
+  # it runs when someone asks for it, not on a schedule.
   workflow_dispatch:
+    inputs:
+      runs_per_cell:
+        description: "Handoffs per sweep cell (12 cells; use 30 for a final run)"
+        required: false
+        default: "10"
 
 # Least privilege: the workflow only needs to read the repository.
 permissions:
@@ -182,15 +185,19 @@ jobs:
           cargo test -p himan-orchestrator --test durability -- --nocapture
           cargo test -p himan-orchestrator --test durable_audit -- --nocapture
           cargo test -p himan-orchestrator --test non_idempotent -- --nocapture
+          cargo test -p himan-orchestrator --test one_active_handoff_http -- --nocapture
+          cargo test -p himan-orchestrator --test production_router -- --nocapture
+          cargo test -p himan-orchestrator --test ollama_backend -- --nocapture
+          cargo test -p himan-orchestrator --test planner_exit -- --nocapture
 
-  # AC-6 handoff metrics: 12 cells (3 log sizes x 4 latencies) x 30 handoffs.
-  # Each run is a real-binary scenario, so this is a long job; it runs nightly
-  # rather than on every push. The CSV is uploaded as an artifact.
+  # AC-6 handoff metrics: 12 cells (3 log sizes x 4 latencies) x N handoffs.
+  # Manual dispatch only — hours of CI at N=30. The runs-per-cell input
+  # defaults to 10 for exploratory runs; use 30 for a final measurement.
   metrics:
-    name: handoff metrics (nightly)
+    name: handoff metrics (manual)
     runs-on: ubuntu-latest
     timeout-minutes: 300
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch'
 
     steps:
       - name: Checkout
@@ -214,7 +221,9 @@ jobs:
       - name: Build binaries
         run: cargo build --workspace
 
-      - name: Collect handoff metrics (30 runs)
+      - name: Collect handoff metrics
+        env:
+          HIMAN_METRICS_RUNS: ${{ inputs.runs_per_cell || '10' }}
         run: cargo run -p himan-orchestrator --example handoff_metrics
 
       - name: Upload metrics

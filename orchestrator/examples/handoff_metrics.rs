@@ -1,9 +1,9 @@
 //! AC-6: handoff metrics over repeated runs.
 //!
-//! Runs the AC-1 scenario `RUNS` times against the real binaries and writes
+//! Runs the AC-1 scenario N times per cell against the real binaries and writes
 //! `results/handoff-metrics.csv` plus a markdown summary with p50 and p95 for
 //! each metric. It is a manual/nightly job, not part of the per-commit gate:
-//! 30 runs of a multi-second scenario is too slow for every push.
+//! Hundreds of runs of a multi-second scenario is too slow for every push.
 //!
 //! Metrics recorded as audit events (see `hub.rs`):
 //!   handoff_switch_time_ms, handoff_total_time_ms, handoff_replay_lag,
@@ -14,7 +14,7 @@
 //!
 //!     cargo run -p himan-orchestrator --example handoff_metrics
 //!
-//! It is deliberately an example, not a test: 30 runs take about 500 s, which
+//! It is deliberately an example, not a test: the full sweep takes hours, which
 //! is why it runs in the nightly job rather than the per-commit gate.
 
 #[path = "../tests/common/mod.rs"]
@@ -25,7 +25,15 @@ use std::time::{Duration, Instant};
 
 const A: &str = "dev-a";
 const B: &str = "dev-b";
-const RUNS: usize = 30;
+/// Handoffs per cell. `HIMAN_METRICS_RUNS` overrides it (the manual CI job
+/// passes its runs-per-cell input); 30 is the setting for a final run.
+fn runs_per_cell() -> usize {
+    std::env::var("HIMAN_METRICS_RUNS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or(30)
+}
 
 /// One-way latencies the proxy adds, in ms. 0 is the loopback baseline, but it
 /// still goes through the proxy so the comparison is apples to apples.
@@ -40,6 +48,8 @@ async fn main() {
     let out_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("results");
     std::fs::create_dir_all(&out_dir).expect("create results dir");
 
+    let runs = runs_per_cell();
+    println!("runs per cell: {runs}");
     let mut rows: Vec<RunRow> = Vec::new();
     for &steps in &LOG_SIZES {
         for &latency in &LATENCIES {
@@ -49,13 +59,13 @@ async fn main() {
                 common::proxy::Impairment::latency(latency)
             };
             println!("=== steps={steps} latency={latency}ms ===");
-            for run in 0..RUNS {
+            for run in 0..runs {
                 let started = Instant::now();
                 let row = one_run(run, impairment, steps).await;
                 println!(
                     "  run {:>2}/{} switch={}ms rollback={} gap={}ms step_gap={}ms ({:.1}s)",
                     run + 1,
-                    RUNS,
+                    runs,
                     row.switch_ms,
                     row.rolled_back,
                     row.owner_gap_ms,
@@ -353,9 +363,13 @@ fn cell(rows: &[RunRow]) -> String {
 }
 
 fn write_summary(path: &std::path::Path, rows: &[RunRow]) {
-    let mut text = String::from(
+    let runs = rows
+        .iter()
+        .filter(|r| r.steps == LOG_SIZES[0] && r.latency_ms == LATENCIES[0])
+        .count();
+    let mut text = format!(
         "# Handoff metrics\n\n\
-         30 handoffs per cell, against the real binaries. The agents connect\
+         {runs} handoffs per cell, against the real binaries. The agents connect\
          through a TCP proxy that adds the stated one-way latency (with jitter\
          of a quarter of it); `steps` is the scenario length, so it is also the\
          event-log size the target shadow-replays.\n\n\

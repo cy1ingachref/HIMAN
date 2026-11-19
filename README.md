@@ -4,7 +4,7 @@ Secure Multi-Device AI Agent Orchestration — a zero-trust architecture for
 autonomous cross-device task execution, with an embodied 3D character.
 
 Repository: https://github.com/cy1ingachref/HIMAN
-Phase: 3 — Phone and handoff (in progress, 289 tests)
+Phase: 3 — Phone and handoff (in progress, 301 tests); Phase 2 planner exit check met
 
 ## What this is
 
@@ -129,9 +129,19 @@ Key material is never committed, logged or printed. Only public keys are.
 
 ## LLM backend
 
-`agent-core::llm::ChatBackend` is a trait. The shipped implementation is a
-deterministic scripted stub — no Ollama, no network, no API key required. Swap
-in a real backend later by implementing the same trait.
+`agent-core::llm::ChatBackend` is a trait with two implementations:
+
+- `ScriptedBackend` — deterministic, no network, no API key. The default.
+- `OllamaBackend` (`agent-core/src/ollama.rs`) — HTTP to a local Ollama
+  (`POST /api/chat`). Enable with `HIMAN_OLLAMA_URL`; configure
+  `HIMAN_OLLAMA_MODEL`, `HIMAN_OLLAMA_TIMEOUT_MS`, `HIMAN_OLLAMA_MAX_BYTES`.
+  Connect/request timeouts and a hard response-size cap are enforced.
+
+Model output is UNTRUSTED. A proposed tool call is checked against the
+orchestrator's whitelist and the tool's argument schema before the policy
+engine evaluates it; rejections are audited (`planner_rejected`). The model
+never decides policy. Natural-language prompts go through this planner;
+the deterministic scenario prompts used by the handoff tests do not.
 
 ## CI
 
