@@ -100,6 +100,21 @@ and report `applied_seq`). Until that lands, the e2e exit check
       (`orchestrator/tests/redteam.rs`, `docs/REDTEAM.md`)
 - [x] AC-6 metrics as audit events, CSV + p50/p95, nightly job
       (`orchestrator/examples/handoff_metrics.rs`)
+- [x] One active handoff per task, rejected at request time with HTTP 409;
+      RT-13's mutation now discriminates
+- [x] Durable task records: state, args and output survive a restart
+      (`task_records` table, `GET /api/v1/tasks/{id}/record`)
+- [x] Raw metrics CSV committed under `docs/data/` with the run id; the
+      nightly artifact is kept 90 days
+- [x] Every pinned action SHA verified against its upstream tag in CI
+      (`action-pins` job, `git ls-remote`, dereferences annotated tags)
+- [x] Metrics beyond loopback: a portable async TCP proxy adds latency and
+      jitter; the sweep covers 100/1000/10000 events x 0/25/100/250 ms x 30
+      handoffs (`orchestrator/tests/common/proxy.rs`)
+- [ ] Run the extended sweep on CI and fill in `docs/METRICS.md`. Only a
+      2-run local smoke test has been done; the 360-run sweep is pending.
+- [ ] Variable step durations and packet loss in the sweep. The proxy
+      supports loss, but the sweep does not exercise it yet.
 - [ ] Handoff state itself survives a restart *uncommitted* (rolls back, by
       design) and committed-unacked resumes — covered, but a target-side
       re-offer after the new owner dies is not implemented
