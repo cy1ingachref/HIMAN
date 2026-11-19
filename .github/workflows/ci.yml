@@ -180,12 +180,13 @@ jobs:
           cargo test -p himan-orchestrator --test durable_audit -- --nocapture
           cargo test -p himan-orchestrator --test non_idempotent -- --nocapture
 
-  # AC-6 handoff metrics: 30 real-binary runs take about 500 s, so this runs
-  # nightly rather than on every push. The CSV is uploaded as an artifact.
+  # AC-6 handoff metrics: 12 cells (3 log sizes x 4 latencies) x 30 handoffs.
+  # Each run is a real-binary scenario, so this is a long job; it runs nightly
+  # rather than on every push. The CSV is uploaded as an artifact.
   metrics:
     name: handoff metrics (nightly)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 300
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
 
     steps:

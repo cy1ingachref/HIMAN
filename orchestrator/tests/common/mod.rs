@@ -30,6 +30,9 @@
 
 #![allow(dead_code)] // helpers are used by whichever test target needs them
 
+/// A portable TCP proxy for measuring the handoff beyond loopback.
+pub mod proxy;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};

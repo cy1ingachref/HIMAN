@@ -692,7 +692,10 @@ impl Hub {
                 .map(str::parse::<u64>)
                 .find_map(Result::ok)
                 .unwrap_or(20)
-                .clamp(1, 200);
+                // The upper bound keeps a typo from dispatching an unbounded
+                // run. It is above the largest log size the metrics sweep
+                // measures (10000 events), so a sweep is not silently capped.
+                .clamp(1, 20000);
             {
                 let mut runs = self.scenarios.lock().await;
                 runs.insert(
