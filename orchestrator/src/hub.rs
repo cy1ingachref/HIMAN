@@ -560,27 +560,36 @@ impl Hub {
             )
         };
 
-        // Phase 1: the planner is a deterministic stub. A real LLM plugs in
-        // behind this branch, but the wire flow below is unchanged.
-        let (tool_name, args) = match prompt.to_lowercase() {
-            p if p.contains("diagnose") => ("run_diagnostic", serde_json::json!({})),
-            p if p.contains("status") => ("device_status", serde_json::json!({})),
+        // The planner. The deterministic stub is the default; a real model
+        // plugs in behind the same branch. The scenario prompts stay on the
+        // stub: they drive the handoff tests and must not depend on a model.
+        let (tool_name, args): (String, serde_json::Value) = match prompt.to_lowercase() {
             // The deterministic scenario task. The orchestrator drives it: it
             // issues one `scenario_step` tool call per step, so the step count
             // is exact and observable in the orchestrator's own event log.
             // The non-idempotent variant must be matched before the plain
             // scenario arm: a prompt can contain both words.
-            p if p.contains("effect") => ("scenario_effect", serde_json::json!({})),
-            p if p.contains("scenario") => ("scenario_step", serde_json::json!({})),
+            p if p.contains("effect") => ("scenario_effect".into(), serde_json::json!({})),
+            p if p.contains("scenario") => ("scenario_step".into(), serde_json::json!({})),
             _ => {
-                return Ok(DispatchResult {
-                    task_id: TaskId::new("none").to_string(),
-                    state: "no_tool".into(),
-                    output: "prompt did not match a known tool".into(),
-                    decision: "allow".into(),
-                })
+                // Natural language: ask the planner. With a model configured
+                // the answer is a proposed tool call, validated below against
+                // the whitelist and the schema; without one the scripted stub
+                // answers. Either way the model never decides policy.
+                match self.plan(device_id, prompt).await {
+                    Some((name, args)) => (name, args),
+                    None => {
+                        return Ok(DispatchResult {
+                            task_id: TaskId::new("none").to_string(),
+                            state: "no_tool".into(),
+                            output: "the planner proposed no tool for this prompt".into(),
+                            decision: "allow".into(),
+                        })
+                    }
+                }
             }
         };
+        let tool_name = tool_name.as_str();
 
         let task_id = TaskId::new(format!("task-{}", uuid::Uuid::new_v4().simple()));
 
@@ -1247,6 +1256,153 @@ impl Hub {
         owners
             .commit(task_id, DeviceId::new(owner), epoch)
             .expect("test commit must be accepted");
+    }
+
+    /// The planner: turn a natural-language prompt into a proposed tool call.
+    ///
+    /// With `HIMAN_OLLAMA_URL` set the proposal comes from the model; without
+    /// it, from the deterministic scripted stub. In both cases the proposal is
+    /// UNTRUSTED: it is checked against the orchestrator's tool whitelist and
+    /// the tool's argument schema here, and the policy engine decides after
+    /// this returns. The model never sees the policy decision and cannot
+    /// influence it.
+    async fn plan(
+        &self,
+        device_id: &DeviceId,
+        prompt: &str,
+    ) -> Option<(String, serde_json::Value)> {
+        use himan_agent_core::llm::{ChatMessage, ChatRequest, Role};
+
+        // The orchestrator-side whitelist and schemas. These mirror the PC
+        // agent's registry; the agent re-checks on its side, so a compromised
+        // orchestrator cannot widen what a device runs.
+        let schemas = vec![
+            serde_json::json!({
+                "name": "device_status",
+                "description": "Report CPU, memory and uptime of the device.",
+                "args": {"type": "object", "properties": {}, "additionalProperties": false}
+            }),
+            serde_json::json!({
+                "name": "run_diagnostic",
+                "description": "Run a network diagnostic. Destructive: needs approval.",
+                "args": {"type": "object", "properties": {
+                    "target": {"type": "string"}
+                }, "additionalProperties": false}
+            }),
+        ];
+        let request = ChatRequest {
+            messages: vec![
+                ChatMessage {
+                    role: Role::System,
+                    content: "You are the HIMAN planner. Propose exactly one tool call \
+                              for the user's request, or none. Never invent tools."
+                        .into(),
+                },
+                ChatMessage {
+                    role: Role::User,
+                    content: prompt.to_owned(),
+                },
+            ],
+            tools: schemas.clone(),
+            temperature: 0.0,
+        };
+
+        let (content, proposed) = if std::env::var("HIMAN_OLLAMA_URL").is_ok() {
+            let backend = match himan_agent_core::ollama::OllamaBackend::new(
+                himan_agent_core::ollama::OllamaConfig::from_env(),
+            ) {
+                Ok(b) => b,
+                Err(e) => {
+                    self.audit(
+                        "planner_error".to_string(),
+                        device_id.to_string(),
+                        format!("backend unavailable: {e}"),
+                    )
+                    .await;
+                    return None;
+                }
+            };
+            match backend.propose(request).await {
+                Ok(v) => v,
+                Err(e) => {
+                    self.audit(
+                        "planner_error".to_string(),
+                        device_id.to_string(),
+                        format!("model answer rejected: {e}"),
+                    )
+                    .await;
+                    return None;
+                }
+            }
+        } else {
+            // The deterministic stub: same trust boundary, no network.
+            use himan_agent_core::llm::ChatBackend;
+            let stub = himan_agent_core::llm::ScriptedBackend::demo();
+            match stub.chat(request).await {
+                Ok(resp) => (
+                    resp.content,
+                    resp.tool_calls
+                        .into_iter()
+                        .map(|name| himan_agent_core::ollama::ProposedToolCall {
+                            name,
+                            args: serde_json::json!({}),
+                        })
+                        .collect(),
+                ),
+                Err(e) => {
+                    self.audit(
+                        "planner_error".to_string(),
+                        device_id.to_string(),
+                        format!("stub failed: {e}"),
+                    )
+                    .await;
+                    return None;
+                }
+            }
+        };
+        let _ = content;
+
+        let call = proposed.into_iter().next()?;
+        // Whitelist: the model cannot introduce a tool.
+        let Some(schema) = schemas
+            .iter()
+            .find(|s| s["name"].as_str() == Some(call.name.as_str()))
+        else {
+            self.audit(
+                "planner_rejected".to_string(),
+                device_id.to_string(),
+                format!("tool={} reason=not_whitelisted", call.name),
+            )
+            .await;
+            return None;
+        };
+        // Schema: the model cannot smuggle arguments.
+        if let Err(reason) = himan_agent_core::ollama::validate_args(&schema["args"], &call.args) {
+            self.audit(
+                "planner_rejected".to_string(),
+                device_id.to_string(),
+                format!("tool={} reason=schema:{reason}", call.name),
+            )
+            .await;
+            return None;
+        }
+        self.audit(
+            "planner_proposed".to_string(),
+            device_id.to_string(),
+            format!("tool={}", call.name),
+        )
+        .await;
+        Some((call.name, call.args))
+    }
+
+    /// Test support: the policy decision for a tool call on a device.
+    pub async fn policy_evaluate_for_test(
+        &self,
+        call: &ToolCall,
+        device: &DeviceInfo,
+    ) -> crate::policy::Decision {
+        let policy = self.policy.lock().await;
+        policy.evaluate(call, device)
     }
 
     /// Test support: the policy decision for a handoff between two devices,

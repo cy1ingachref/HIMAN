@@ -11,6 +11,7 @@
 
 pub mod llm;
 pub mod logging;
+pub mod ollama;
 pub mod tool;
 pub mod transport;
 
