@@ -99,7 +99,7 @@ async fn durable_with_slow_target() -> (common::E2ETest, tempfile::TempDir, Stri
 
 #[tokio::test]
 async fn restart_mid_shadowing_rolls_back_and_the_source_keeps_ownership() {
-    let (mut harness, _dir, _state) = durable_with_slow_target().await;
+    let (mut harness, _dir, state) = durable_with_slow_target().await;
     let port = harness.port();
 
     // 40 steps so the run is still going when the orchestrator comes back.
@@ -135,13 +135,25 @@ async fn restart_mid_shadowing_rolls_back_and_the_source_keeps_ownership() {
             .map(|r| r.status())
     });
     let _ = started.1.await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    // Restart as soon as the request has reached the old orchestrator, without
-    // waiting for its response: the handoff is still in flight at that point.
-    // Waiting for the response first would mean the whole procedure finished
-    // (the handler drives it synchronously), and the restart would land after
-    // the commit rather than during it.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Wait until the attempt is really persisted, then restart immediately.
+    // The audit is only flushed when the driver finishes, so it cannot show
+    // "in flight"; the durable handoff row is written at request time and can.
+    // A fixed sleep is not enough: if the handoff times out before the restart,
+    // the rollback comes from the timeout rather than from recovery, which is a
+    // different code path and would let this test pass for the wrong reason.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let recorded =
+            himan_orchestrator::durable::DurableStore::open(std::path::Path::new(&state))
+                .ok()
+                .and_then(|s| s.handoffs().ok())
+                .map(|hs| hs.iter().any(|h| h.task_id == task_id))
+                .unwrap_or(false);
+        if recorded || std::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     harness.restart_orchestrator_nowait().await;
     let _ = request.await;
     harness.wait_for_agents().await;
@@ -165,6 +177,15 @@ async fn restart_mid_shadowing_rolls_back_and_the_source_keeps_ownership() {
     assert_eq!(owner["epoch"], json!(0), "the restart bumped the epoch");
 
     // The in-flight handoff was rolled back and the rollback is audited.
+    //
+    // NOTE: this asserts only that a rollback happened, not that it came from
+    // restart recovery. With the target's 30 s slow-ready and a 10 s handoff
+    // timeout, the timeout usually wins the race, so the observed cause is
+    // "target never sent HandoffReady" rather than "orchestrator restarted
+    // before the commit". Tightening this to require the recovery reason makes
+    // the test fail — the restart does not reliably land inside the window.
+    // That is a pre-existing weakness (main has the same timing), recorded here
+    // rather than hidden behind a passing assertion.
     let audit = common::http_get_json(port, "/api/v1/audit");
     let lines = audit.as_array().expect("audit array");
     assert!(
