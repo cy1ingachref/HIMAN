@@ -185,6 +185,10 @@ jobs:
           cargo test -p himan-orchestrator --test durability -- --nocapture
           cargo test -p himan-orchestrator --test durable_audit -- --nocapture
           cargo test -p himan-orchestrator --test non_idempotent -- --nocapture
+          cargo test -p himan-orchestrator --test one_active_handoff_http -- --nocapture
+          cargo test -p himan-orchestrator --test production_router -- --nocapture
+          cargo test -p himan-orchestrator --test ollama_backend -- --nocapture
+          cargo test -p himan-orchestrator --test planner_exit -- --nocapture
 
   # AC-6 handoff metrics: 12 cells (3 log sizes x 4 latencies) x N handoffs.
   # Manual dispatch only — hours of CI at N=30. The runs-per-cell input
