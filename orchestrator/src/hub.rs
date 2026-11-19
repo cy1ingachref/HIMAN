@@ -1041,25 +1041,26 @@ impl Hub {
     /// Called at startup, after the store is attached. The audit log is
     /// in-memory, so without this the rollback would leave no trace the API can
     /// report.
-    pub fn audit_handoff_rolled_back(&self, record: &crate::durable::HandoffRecord) {
-        let rt = tokio::runtime::Handle::current();
-        let audit = self.audit.clone();
-        let handoff_id = record.handoff_id.clone();
-        let task_id = record.task_id.clone();
-        let from = record.from_device.clone();
-        let to = record.to_device.clone();
-        rt.spawn(async move {
-            let mut audit = audit.lock().await;
-            let now_ms = chrono::Utc::now().timestamp_millis();
-            audit.append_at_ms(
-                "handoff_rolled_back".to_string(),
-                "orchestrator".to_string(),
-                format!("task={task_id} from={from} to={to} reason=orchestrator restarted before the commit"),
-                now_ms / 1000,
-                now_ms,
-            );
-                        tracing::info!(handoff = %handoff_id, "audited the startup rollback");
-        });
+    /// Write a `handoff_rolled_back` line into BOTH audit logs for a handoff
+    /// that recovery found uncommitted.
+    ///
+    /// Called at startup, after the store is attached. The in-memory log
+    /// starts empty, so without this the rollback would be invisible there;
+    /// the durable log is what `/api/v1/audit` reads, so without the durable
+    /// append the API would never show the recovery at all — the endpoint
+    /// would keep showing whatever the dead process last wrote.
+    pub async fn audit_handoff_rolled_back(&self, record: &crate::durable::HandoffRecord) {
+        let detail = format!(
+            "task={} from={} to={} reason=orchestrator restarted before the commit",
+            record.task_id, record.from_device, record.to_device
+        );
+        self.audit(
+            "handoff_rolled_back".to_string(),
+            "orchestrator".to_string(),
+            detail,
+        )
+        .await;
+        tracing::info!(handoff = %record.handoff_id, "audited the startup rollback");
     }
 
     /// Mark every task owned by `device` as stalled, bump its epoch, and offer
