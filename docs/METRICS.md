@@ -17,19 +17,80 @@ and uploads the CSV as an
 artifact (90-day retention); the committed copies in `docs/data/` are the
 permanent record.
 
-## Sweep (pending the next manual run)
+## Final sweep (360 runs, Linux, through the proxy)
 
-The extended sweep was added in this branch and has not yet run on CI. The
-table below is the shape it produces; the numbers are filled in from the run.
+| | |
+|---|---|
+| CI run | [44587040931](https://github.com/cy1ingachref/HIMAN/actions/runs/44587040931) |
+| Job | `handoff metrics (manual)`, `workflow_dispatch` with `runs_per_cell=30` |
+| Runner | `ubuntu-latest`, x86_64 |
+| Branch / commit | `feat/phase2-planner` @ `df846ca` |
+| Raw CSV | `docs/data/handoff-metrics-44587040931.csv` (360 rows) |
 
-| Latency | Switch time p50/p95/max (ms) | Longest inter-step gap p50/p95/max (ms) | Rollback rate |
+12 cells (3 log sizes x 4 one-way latencies) x 30 handoffs. Each cell is
+`p50 / p95 / max` in ms; jitter is a quarter of the stated latency.
+
+### 100 events
+
+| Latency | Switch time (ms) | Longest inter-step gap (ms) | Rollback rate |
 |---|---|---|---|
-| 0 ms | pending | pending | pending |
-| 25 ms | pending | pending | pending |
-| 100 ms | pending | pending | pending |
-| 250 ms | pending | pending | pending |
+| 0 ms | 363 / 365 / 471 | 102 / 102 / 102 | 0.0% (0/30) |
+| 25 ms | 484 / 489 / 489 | 101 / 102 / 102 | 0.0% (0/30) |
+| 100 ms | 1115 / 1199 / 1207 | 102 / 102 / 102 | 0.0% (0/30) |
+| 250 ms | 2388 / 2485 / 2727 | 101 / 102 / 102 | 0.0% (0/30) |
 
-One table per log size (100, 1000, 10000 events).
+### 1000 events
+
+| Latency | Switch time (ms) | Longest inter-step gap (ms) | Rollback rate |
+|---|---|---|---|
+| 0 ms | 364 / 365 / 473 | 102 / 102 / 102 | 0.0% (0/30) |
+| 25 ms | 482 / 488 / 490 | 101 / 102 / 102 | 0.0% (0/30) |
+| 100 ms | 1087 / 1183 / 1191 | 102 / 102 / 102 | 0.0% (0/30) |
+| 250 ms | 2417 / 2478 / 2501 | 102 / 102 / 102 | 0.0% (0/30) |
+
+### 10000 events
+
+| Latency | Switch time (ms) | Longest inter-step gap (ms) | Rollback rate |
+|---|---|---|---|
+| 0 ms | 363 / 365 / 365 | 101 / 102 / 102 | 0.0% (0/30) |
+| 25 ms | 481 / 487 / 488 | 101 / 102 / 102 | 0.0% (0/30) |
+| 100 ms | 1125 / 1180 / 1196 | 102 / 103 / 103 | 0.0% (0/30) |
+| 250 ms | 2386 / 2495 / 2503 | 101 / 102 / 102 | 0.0% (0/30) |
+
+Pooled over all 360 runs: owner gap 0/0/0 ms, replay lag 0/0/0 events,
+rollbacks 0 of 360.
+
+### Comparison with the loopback baseline
+
+The baseline (run 44283599775) was 30 runs at 100 events, direct loopback,
+no proxy: switch p50/p95/max 375/376/377 ms.
+
+- **0 ms through the proxy: 363/365/471.** The p50 is ~12 ms BELOW the
+  baseline, not above: the proxy's own overhead is not measurable at this
+  resolution, and the two runs are different CI instances, so a small shift
+  in either direction is runner noise, not a proxy effect. The honest claim
+  is "no measurable proxy overhead at p50", not "the proxy made it faster".
+- **Latency scales as expected.** The switch is several round trips:
+  +25 ms one-way adds ~120 ms (≈4-5 RTTs), +100 ms adds ~750 ms, +250 ms
+  adds ~2025 ms. The relationship is linear in the added latency, which is
+  what a multi-round-trip protocol should show.
+- **Log size does not move the switch time.** 100 vs 10000 events differ by
+  at most ~40 ms at p50 within the same latency — inside the run-to-run
+  spread. Shadow replay of 10000 events completes within the step cadence;
+  replay lag stayed 0 everywhere.
+- **Variance.** Two outliers above 1.2x their cell p95, both in the 0 ms
+  cells (471 and 473 ms vs ~365 typical, ~+108 ms). Every other cell's max
+  is within ~10% of its p95. The 0 ms cells have the widest relative spread
+  (stdev ~21-23 ms vs ~4 ms at 25 ms) because there is no added latency to
+  dominate scheduler noise. No cell is flaky in the correctness sense:
+  0 rollbacks, 0 owner gap, 0 replay lag in all 360 runs.
+- **No regression.** Nothing in the sweep is worse than the baseline beyond
+  runner noise, and the correctness invariants held in every run.
+
+What this does NOT show: behavior under packet loss (the proxy's loss knob
+exists but the sweep runs 0% loss), real WAN jitter beyond the modeled
+quarter-latency jitter, or handoff under concurrent load. Those are future
+measurements, not claims.
 
 **Local smoke test** (reduced sweep: 2 runs, 100 events, Windows, this machine):
 

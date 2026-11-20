@@ -40,6 +40,11 @@ Status of each phase. Mark a phase done only when its exit check passes.
       model output is validated against the whitelist and schema before the
       policy engine runs)
 
+Phase 2 exit checklist with evidence: `docs/PHASE2_EXIT.md`. Security review:
+`docs/SECURITY_REVIEW.md`. Production networking gate: `docs/PRODUCTION.md`.
+Multi-step planner is a PROPOSAL only (`docs/PLANNER_MULTISTEP_PROPOSAL.md`),
+not implemented; it follows the networking blockers, not precedes them.
+
 ## Phase 3: Phone and handoff
 
 - [ ] Android app shell: foreground service, Keystore, push wake-up
