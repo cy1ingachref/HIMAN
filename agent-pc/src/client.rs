@@ -825,10 +825,16 @@ pub async fn connect_ws(
     // device data. Plain ws:// is refused unless this is a debug build
     // explicitly compiled with the insecure-ws-dev feature for loopback use.
     if url.starts_with("ws://") && !crate::INSECURE_WS_ALLOWED {
+        // The marker string is compiled ONLY in debug builds. A release
+        // binary cannot carry the escape hatch text, so the CI grep is a
+        // real guard rather than a false positive on a cfg!() expression.
+        #[cfg(debug_assertions)]
         return Err("refusing insecure ws:// URL: TLS (wss://) is required; \
                     a debug build with the insecure-ws-dev feature may use \
                     plain ws:// for loopback development"
             .into());
+        #[cfg(not(debug_assertions))]
+        return Err("refusing insecure ws:// URL: TLS (wss://) is required".into());
     }
     if !url.starts_with("ws://") && !url.starts_with("wss://") {
         return Err(format!("unsupported WebSocket URL scheme: {url:?}").into());

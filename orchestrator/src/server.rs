@@ -710,14 +710,46 @@ pub async fn serve(hub: Arc<Hub>, port: u16) -> Result<(), std::io::Error> {
 /// Build a rustls server config from PEM cert and key paths.
 fn tls_config(cert_path: &str, key_path: &str) -> Result<rustls::ServerConfig, String> {
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-    let cert_pem = std::fs::read(cert_path).map_err(|e| format!("{cert_path}: {e}"))?;
-    let key_pem = std::fs::read(key_path).map_err(|e| format!("{key_path}: {e}"))?;
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_pem.as_slice())
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("parse certificate: {e}"))?;
-    let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut key_pem.as_slice())
-        .map_err(|e| format!("parse private key: {e}"))?
+
+    // Minimal PEM reader: take the body between the BEGIN/END markers of
+    // the right block and base64-decode it. Avoids rustls-pemfile, which
+    // is unmaintained (RUSTSEC-2025-0134).
+    fn pem_block(text: &str, label: &str) -> Option<Vec<u8>> {
+        let begin = format!("-----BEGIN {label}-----");
+        let end = format!("-----END {label}-----");
+        let rest = text.split_once(&begin)?.1;
+        let body = rest.split_once(&end)?.0;
+        let compact: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD
+            .decode(compact)
+            .ok()
+    }
+
+    let cert_pem = std::fs::read_to_string(cert_path).map_err(|e| format!("{cert_path}: {e}"))?;
+    let key_pem = std::fs::read_to_string(key_path).map_err(|e| format!("{key_path}: {e}"))?;
+    let certs: Vec<CertificateDer<'static>> = cert_pem
+        .split("-----BEGIN CERTIFICATE-----")
+        .skip(1)
+        .filter_map(|block| {
+            let body = block.split_once("-----END CERTIFICATE-----")?.0;
+            let compact: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD
+                .decode(compact)
+                .ok()
+                .map(CertificateDer::from)
+        })
+        .collect();
+    if certs.is_empty() {
+        return Err("no certificates in PEM".to_string());
+    }
+    let key_bytes = pem_block(&key_pem, "PRIVATE KEY")
+        .or_else(|| pem_block(&key_pem, "RSA PRIVATE KEY"))
+        .or_else(|| pem_block(&key_pem, "EC PRIVATE KEY"))
         .ok_or_else(|| "no private key in PEM".to_string())?;
+    let key =
+        PrivateKeyDer::try_from(key_bytes).map_err(|e| format!("invalid private key: {e}"))?;
     rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
