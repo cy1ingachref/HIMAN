@@ -153,6 +153,9 @@ fn starts_normally_with_both_protections() {
             ("HIMAN_API_TOKEN", TOKEN),
             ("HIMAN_ENROLLED_FILE", &enrolled),
             ("HIMAN_PORT", &port),
+            // Loopback test: permit plain HTTP/WS so this test stays about
+            // API token + enrollment, not TLS termination.
+            ("HIMAN_INSECURE_DEV", "1"),
         ],
         5,
     );

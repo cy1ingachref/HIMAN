@@ -674,12 +674,54 @@ pub async fn serve(hub: Arc<Hub>, port: u16) -> Result<(), std::io::Error> {
     let token = crate::api_auth::ApiToken::from_env();
     let app = production_router(hub, token);
     let listener = bind_reuse_addr(port).await?;
-    info!(port, "orchestrator listening on 127.0.0.1");
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .await
+    let service = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
+
+    // TLS/WSS is mandatory in production. When HIMAN_TLS_CERT and
+    // HIMAN_TLS_KEY are set the server validates the PEM material and
+    // refuses to start if it is unusable. Termination itself is performed
+    // by a TLS reverse proxy in front of this loopback listener (see
+    // docs/PRODUCTION.md); validating the material here ensures a bad
+    // certificate cannot be deployed unnoticed.
+    if let (Ok(cert), Ok(key)) = (
+        std::env::var("HIMAN_TLS_CERT"),
+        std::env::var("HIMAN_TLS_KEY"),
+    ) {
+        tls_config(&cert, &key).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("TLS config: {e}"))
+        })?;
+        info!(port, "TLS material validated; serving behind a TLS proxy");
+        axum::serve(listener, service).await
+    } else if std::env::var("HIMAN_INSECURE_DEV").as_deref() == Ok("1") {
+        tracing::warn!(
+            "HIMAN_INSECURE_DEV=1: serving PLAIN HTTP/WS on 127.0.0.1. \
+             No confidentiality; agents also need the insecure-ws-dev build."
+        );
+        info!(port, "orchestrator listening on 127.0.0.1 (no TLS)");
+        axum::serve(listener, service).await
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "refusing to serve without TLS: set HIMAN_TLS_CERT and HIMAN_TLS_KEY, \
+             or HIMAN_INSECURE_DEV=1 for loopback development",
+        ))
+    }
+}
+
+/// Build a rustls server config from PEM cert and key paths.
+fn tls_config(cert_path: &str, key_path: &str) -> Result<rustls::ServerConfig, String> {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    let cert_pem = std::fs::read(cert_path).map_err(|e| format!("{cert_path}: {e}"))?;
+    let key_pem = std::fs::read(key_path).map_err(|e| format!("{key_path}: {e}"))?;
+    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_pem.as_slice())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("parse certificate: {e}"))?;
+    let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut key_pem.as_slice())
+        .map_err(|e| format!("parse private key: {e}"))?
+        .ok_or_else(|| "no private key in PEM".to_string())?;
+    rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| format!("invalid TLS material: {e}"))
 }
 
 /// Bind the loopback listener with SO_REUSEADDR.

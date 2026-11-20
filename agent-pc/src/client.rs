@@ -821,6 +821,18 @@ pub async fn connect_ws(
     key: SigningKey,
     url: &str,
 ) -> Result<AgentClient, Box<dyn std::error::Error + Send + Sync>> {
+    // TLS is mandatory for agent<->orchestrator traffic: signatures prove
+    // device data. Plain ws:// is refused unless this is a debug build
+    // explicitly compiled with the insecure-ws-dev feature for loopback use.
+    if url.starts_with("ws://") && !crate::INSECURE_WS_ALLOWED {
+        return Err("refusing insecure ws:// URL: TLS (wss://) is required; \
+                    a debug build with the insecure-ws-dev feature may use \
+                    plain ws:// for loopback development"
+            .into());
+    }
+    if !url.starts_with("ws://") && !url.starts_with("wss://") {
+        return Err(format!("unsupported WebSocket URL scheme: {url:?}").into());
+    }
     let transport = Arc::new(himan_agent_core::WsTransport::connect(url).await?);
     let conn = himan_agent_core::transport::ws::connection_from_socket(transport, 64);
     Ok(AgentClient::new(device_id, key, conn))

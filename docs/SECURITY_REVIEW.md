@@ -52,7 +52,7 @@ impact or narrow window), Low (hardening), Informational (posture note).
   (RT-16). Mutation-checked: removing the id check advances the procedure
   and the test fails.
 
-### F-3 — MEDIUM (open): no device revocation
+### F-3 — MEDIUM (fixed): no device revocation
 
 - File/function: `orchestrator/src/enrollment.rs`, `check_enrollment`.
 - Scenario: enrollment is a static file read at startup. Removing a device
@@ -65,7 +65,7 @@ impact or narrow window), Low (hardening), Informational (posture note).
   Not implemented here: it changes the enrollment lifecycle and needs its
   own design and tests.
 
-### F-4 — MEDIUM (open): no API rate limiting or lockout
+### F-4 — MEDIUM (fixed): no API rate limiting or lockout
 
 - File/function: `orchestrator/src/api_auth.rs`, `require_token`.
 - Scenario: the token comparison is constant-time, but nothing limits
@@ -153,3 +153,24 @@ the constant-time token compare, supply-chain audit of dependencies beyond
 `cargo audit`, and any test under real packet loss or concurrent load.
 TLS, revocation, rate limiting and token rotation are MISSING features,
 not existing protections — see docs/PRODUCTION.md.
+
+
+## Fixes applied after the review (RT-17/18/19)
+
+- F-3 (device revocation) FIXED: POST /api/v1/devices/:id/revoke writes a
+  durable `revoked` table row plus a hash-chained `device_revoked` audit
+  event, drops the live session, and refuses future Hellos and messages.
+  Revocations load at startup before any agent registers. Evidence:
+  `revocation.rs` (2) + `revocation_e2e.rs` (1, real binaries), mutation-checked.
+- F-4 (HTTP rate limiting) FIXED: `RateLimiter` throttles failures per source
+  IP and per presented token (SHA-256 keyed), 10 failures lock for 60 s,
+  each map capped at 4096 with oldest-first eviction. Evidence:
+  `rate_limit.rs` (4), mutation-checked.
+- TLS/WSS (PRODUCTION.md item 1) PARTIALLY CLOSED: the agent now refuses
+  plain ws:// unless compiled with `insecure-ws-dev` in a debug build; a CI
+  guard greps the release binary for the escape hatch. The orchestrator
+  validates HIMAN_TLS_CERT/KEY PEM material and refuses to serve plain HTTP
+  without HIMAN_INSECURE_DEV. TERMINATION is still delegated to a TLS
+  reverse proxy — native rustls listeners on the orchestrator are NOT
+  implemented. Evidence: `tls_guard.rs` (2) + CI release-binary grep,
+  mutation-checked.

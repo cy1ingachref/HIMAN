@@ -13,6 +13,9 @@ not implemented and tested.
 | Bearer-token API auth | `api_auth.rs` | constant-time compare (SHA-256 + subtle); `production_router` test: every route 401 without/with-wrong token |
 | Device enrollment | `enrollment.rs` | unknown device + key mismatch refused; RT-03/RT-11 |
 | Signed envelopes | `proto/envelope.rs` | every hub message verified; agent verifies every post-Welcome message (RT-15) |
+| Plain ws:// refused by default | `agent-pc::connect_ws` | RT-19; release-binary CI guard |
+| Device revocation | `durable.rs::revoked`, Hub::revoke_device | RT-18 (real binaries, restart) |
+| HTTP rate limiting | `api_auth::RateLimiter` | RT-17 (4 tests, bounded memory) |
 | Orchestrator key pinning | `agent-pc` `HIMAN_ORCH_KEY` | RT-04 fake orchestrator refused |
 | Replay protection | hub seq tracking, agent nonce cache, stale-ts | RT-05; agent tests |
 | Handoff token binding | target + task + expiry | RT-10/RT-12 |
@@ -34,10 +37,10 @@ not implemented and tested.
 2. **Token rotation.** `HIMAN_API_TOKEN` is a static pre-shared secret.
    No rotation endpoint, no overlap window, no per-client tokens. A
    leaked token is valid until the operator changes the env and restarts.
-3. **Device revocation.** Enrollment is a static startup file (F-3). No
-   way to cut off a compromised device key without a restart.
-4. **Rate limiting / lockout on the HTTP API.** Constant-time compare
-   does not stop online brute force (F-4). WS has caps; HTTP does not.
+3. ~~**Device revocation.**~~ CLOSED (RT-18): durable revocation, live
+   session drop, restart-persistent deny-list.
+4. ~~**Rate limiting / lockout on the HTTP API.**~~ CLOSED (RT-17): per-IP
+   and per-token bounded lockout implemented.
 5. **Enrollment transport security.** The enrollment file is provisioned
    out of band; there is no authenticated enrollment protocol, so the
    initial key exchange relies on the operator copying keys safely.

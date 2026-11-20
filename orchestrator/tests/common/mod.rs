@@ -102,7 +102,7 @@ pub fn build_agent_with_faults() -> PathBuf {
             "-p",
             "himan-agent-pc",
             "--features",
-            "fault-injection",
+            "fault-injection,insecure-ws-dev",
             "--bin",
             "himan-agent-pc",
         ])
@@ -122,6 +122,35 @@ pub fn build_agent_with_faults() -> PathBuf {
     fault_target.join("debug").join(exe)
 }
 
+/// Build the loopback e2e agent: debug build with `insecure-ws-dev` so it
+/// may speak plain ws:// to the local orchestrator. Separate target dir so
+/// the release binary and the default (strict) build stay clean.
+pub fn build_loopback_agent() -> PathBuf {
+    let root = workspace_root();
+    let target = root.join("target/loopback-agent");
+    let status = Command::new("cargo")
+        .args([
+            "build",
+            "-p",
+            "himan-agent-pc",
+            "--features",
+            "insecure-ws-dev",
+            "--bin",
+            "himan-agent-pc",
+        ])
+        .env("CARGO_TARGET_DIR", &target)
+        .current_dir(&root)
+        .status()
+        .expect("run cargo build for the loopback agent");
+    assert!(status.success(), "failed to build the loopback agent");
+    let exe = if cfg!(windows) {
+        "himan-agent-pc.exe"
+    } else {
+        "himan-agent-pc"
+    };
+    target.join("debug").join(exe)
+}
+
 /// Ensure the default agent binary is built WITHOUT any feature, and return it.
 ///
 /// Cargo features are additive and share one artifact path, so a previous
@@ -130,8 +159,19 @@ pub fn build_agent_with_faults() -> PathBuf {
 /// hook" test hermetic rather than dependent on what ran before it.
 pub fn build_default_agent() -> PathBuf {
     let root = workspace_root();
+    // `insecure-ws-dev` is required for the loopback e2e agent to speak
+    // plain ws:// to the local orchestrator. `fault-injection` is NOT set,
+    // so this binary still proves the "default build has no hooks" test.
     let status = Command::new("cargo")
-        .args(["build", "-p", "himan-agent-pc", "--bin", "himan-agent-pc"])
+        .args([
+            "build",
+            "-p",
+            "himan-agent-pc",
+            "--features",
+            "insecure-ws-dev",
+            "--bin",
+            "himan-agent-pc",
+        ])
         .current_dir(&root)
         .status()
         .expect("run cargo build for himan-agent-pc");
@@ -489,6 +529,8 @@ impl E2ETest {
                 enrollment_file.display().to_string(),
             ),
             ("HIMAN_API_TOKEN".to_string(), API_TOKEN.to_string()),
+            // Loopback e2e: plain HTTP/WS is permitted only here.
+            ("HIMAN_INSECURE_DEV".to_string(), "1".to_string()),
         ];
         if let Some(path) = &self.state_file {
             envs.push(("HIMAN_STATE_FILE".to_string(), path.display().to_string()));
@@ -550,6 +592,8 @@ impl E2ETest {
                 enrollment_file.display().to_string(),
             ),
             ("HIMAN_API_TOKEN".to_string(), API_TOKEN.to_string()),
+            // Loopback e2e: plain HTTP/WS is permitted only here.
+            ("HIMAN_INSECURE_DEV".to_string(), "1".to_string()),
         ];
         if let Some(path) = &self.state_file {
             envs.push(("HIMAN_STATE_FILE".to_string(), path.display().to_string()));
@@ -607,6 +651,8 @@ impl E2ETest {
                 enrollment_file.display().to_string(),
             ),
             ("HIMAN_API_TOKEN".to_string(), API_TOKEN.to_string()),
+            // Loopback e2e: plain HTTP/WS is permitted only here.
+            ("HIMAN_INSECURE_DEV".to_string(), "1".to_string()),
         ];
         if let Some(path) = &self.state_file {
             envs.push(("HIMAN_STATE_FILE".to_string(), path.display().to_string()));
@@ -651,6 +697,8 @@ impl E2ETest {
                 enrollment_file.display().to_string(),
             ),
             ("HIMAN_API_TOKEN".to_string(), API_TOKEN.to_string()),
+            // Loopback e2e: plain HTTP/WS is permitted only here.
+            ("HIMAN_INSECURE_DEV".to_string(), "1".to_string()),
         ];
         if let Some(path) = &self.state_file {
             envs.push(("HIMAN_STATE_FILE".to_string(), path.display().to_string()));
@@ -693,10 +741,11 @@ impl E2ETest {
         ];
         // In dev mode the orchestrator needs no token, and the API routes are
         // open. Setting it anyway would hide a dev-mode regression.
+        // Loopback e2e always permits plain HTTP/WS at the transport layer;
+        // API auth is still controlled by insecure_dev below.
+        envs.push(("HIMAN_INSECURE_DEV".to_string(), "1".to_string()));
         if !insecure_dev {
             envs.push(("HIMAN_API_TOKEN".to_string(), API_TOKEN.to_string()));
-        } else {
-            envs.push(("HIMAN_INSECURE_DEV".to_string(), "1".to_string()));
         }
         envs.extend(extra_envs);
         let mut orch = Child::spawn(
@@ -733,10 +782,7 @@ impl E2ETest {
 
     /// The agent binary spawned by this harness.
     pub fn agent_binary(&self) -> PathBuf {
-        self.agent_bin
-            .clone()
-            .or_else(|| binary("himan-agent-pc"))
-            .expect("build himan-agent-pc first")
+        self.agent_bin.clone().unwrap_or_else(build_loopback_agent)
     }
 
     /// Drive the `fault-injection` agent build instead of the default one.

@@ -20,3 +20,12 @@ pub use key::{keygen, load_from_file, load_or_generate, save_to_file};
 pub use scenario::{step_request, RecordedStep, ScenarioBackend, ScenarioStepTool};
 pub use scenario_tool::{scenario_registry, scenario_registry_with_effect};
 pub use tools::{DeviceStatusTool, RunDiagnosticTool};
+
+/// Whether plain `ws://` is permitted.
+///
+/// False by default and ALWAYS false in a release build. Only a debug build
+/// compiled with the optional `insecure-ws-dev` feature can turn it on, for
+/// local development against a loopback orchestrator without a certificate.
+/// The release CI job greps the release binary for this constant's marker so
+/// a dev build cannot accidentally ship with the flag enabled.
+pub const INSECURE_WS_ALLOWED: bool = cfg!(all(debug_assertions, feature = "insecure-ws-dev"));

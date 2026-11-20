@@ -168,6 +168,20 @@ jobs:
           fi
           echo "release binary clean: none of ${HOOKS[*]} present"
 
+      - name: Release binary must not permit plain ws:// (RT-19)
+        run: |
+          set -euo pipefail
+          # The release binary must not carry the insecure-ws-dev escape hatch.
+          # The marker string is compiled in only when cfg!(debug_assertions)
+          # AND the feature are both true; grep the binary for the feature's
+          # error text to catch a regression that removes the cfg guard.
+          BIN="target/release/himan-agent-pc"
+          if grep -q "insecure-ws-dev feature may use" "$BIN"; then
+            echo "::error::a release binary contains the insecure-ws-dev escape hatch"
+            exit 1
+          fi
+          echo "release binary rejects plain ws://: no insecure-ws-dev path"
+
       # The real-binary targets, explicitly: the old `e2e` target was deleted
       # once its unique checks moved onto the shared harness.
       - name: Run end-to-end tests
