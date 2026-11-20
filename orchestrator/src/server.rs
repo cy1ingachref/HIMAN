@@ -144,7 +144,10 @@ pub fn router_with_auth(
         .route("/tasks/{task_id}/record", get(task_record))
         .route("/tasks/{task_id}/events", get(task_events))
         .route_layer(axum::middleware::from_fn_with_state(
-            token,
+            (
+                token,
+                std::sync::Arc::new(crate::api_auth::RateLimiter::new()),
+            ),
             crate::api_auth::require_token,
         ))
         .with_state(state.clone());
@@ -653,7 +656,11 @@ pub async fn serve(hub: Arc<Hub>, port: u16) -> Result<(), std::io::Error> {
     let app = production_router(hub, token);
     let listener = bind_reuse_addr(port).await?;
     info!(port, "orchestrator listening on 127.0.0.1");
-    axum::serve(listener, app).await
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await
 }
 
 /// Bind the loopback listener with SO_REUSEADDR.
