@@ -92,6 +92,9 @@ pub struct AgentClient {
     /// signature verifies with it. Without pinning, any server can sign its
     /// own Welcome and impersonate the orchestrator.
     pinned_orchestrator_key: Option<VerifyingKey>,
+    /// The orchestrator key the Welcome signature verified against. Used to
+    /// verify every later message when no out-of-band pin is configured.
+    session_orchestrator_key: Option<VerifyingKey>,
     /// Tool calls already executed, so a replayed call is not run twice.
     seen_nonces: std::sync::Mutex<NonceCache>,
     /// Keepalive interval; defaults to 60s when unset or invalid.
@@ -151,6 +154,7 @@ impl AgentClient {
             conn,
             seq: 0,
             pinned_orchestrator_key: None,
+            session_orchestrator_key: None,
             seen_nonces: std::sync::Mutex::new(NonceCache::new(1024)),
             keepalive_interval,
             keepalive_pings: 0,
@@ -276,6 +280,9 @@ impl AgentClient {
             .map_err(|e| RegisterError::BadSignature(e.to_string()))?;
         msg.verify_with(&vk)
             .map_err(|e| RegisterError::BadSignature(e.to_string()))?;
+        // Remember the key the Welcome proved, so every later message is
+        // verified against it even without an out-of-band pin.
+        self.session_orchestrator_key = Some(vk);
 
         info!(
             %device_id,
@@ -398,6 +405,32 @@ impl AgentClient {
                 return false;
             }
         };
+
+        // Every post-handshake message must be signed by the orchestrator key
+        // verified at registration. The Welcome check alone is not enough:
+        // without this, anything that can write to the socket after the
+        // handshake (a MITM on plain ws://, a hostile proxy) can inject tool
+        // calls, drains and commits that the agent would act on. The key is
+        // the one the Welcome proved — pinned out of band when configured,
+        // otherwise the advertised key the Welcome signature verified
+        // against. It is never taken from the incoming message itself.
+        let orch_key = self
+            .pinned_orchestrator_key
+            .as_ref()
+            .or(self.session_orchestrator_key.as_ref());
+        match orch_key {
+            Some(key) => {
+                if let Err(e) = msg.verify_with(key) {
+                    warn!(error = %e, from = %msg.meta.from, "message signature does not verify against the orchestrator key; dropping");
+                    return true;
+                }
+            }
+            None => {
+                warn!("no orchestrator key available; dropping message");
+                return true;
+            }
+        }
+
         // A test can ask for the non-idempotent effect tool, which is how a
         // non-idempotent call in flight at the switch is exercised.
         #[cfg(feature = "fault-injection")]
@@ -1068,7 +1101,10 @@ mod tests {
     async fn run_executes_tool_call_and_replies() {
         let (a, peer) = Connection::channel(8);
         let key = SigningKey::generate();
-        let mut client = AgentClient::new(DeviceId::new("pc-1"), key, a);
+        let orch_key = SigningKey::generate();
+        let mut client = AgentClient::new(DeviceId::new("pc-1"), key, a)
+            .with_pinned_orchestrator_key(&orch_key.verifying_key().to_b64())
+            .expect("pin");
 
         let handle = tokio::spawn(async move { client.run().await });
 
@@ -1089,7 +1125,7 @@ mod tests {
                 to: "pc-1".into(),
             },
             Payload::ToolCall(call),
-            &SigningKey::generate(),
+            &orch_key,
         )
         .unwrap();
         peer.send(msg).await.unwrap();
@@ -1119,7 +1155,10 @@ mod tests {
     async fn run_refuses_non_whitelisted_tool() {
         let (a, peer) = Connection::channel(8);
         let key = SigningKey::generate();
-        let mut client = AgentClient::new(DeviceId::new("pc-1"), key, a);
+        let orch_key = SigningKey::generate();
+        let mut client = AgentClient::new(DeviceId::new("pc-1"), key, a)
+            .with_pinned_orchestrator_key(&orch_key.verifying_key().to_b64())
+            .expect("pin");
 
         let handle = tokio::spawn(async move { client.run().await });
 
@@ -1139,7 +1178,7 @@ mod tests {
                 to: "pc-1".into(),
             },
             Payload::ToolCall(call),
-            &SigningKey::generate(),
+            &orch_key,
         )
         .unwrap();
         peer.send(msg).await.unwrap();
@@ -1159,6 +1198,130 @@ mod tests {
             other => panic!("expected ToolResult, got {other:?}"),
         }
 
+        handle.abort();
+    }
+
+    /// A post-handshake message signed by a DIFFERENT key must be dropped:
+    /// no tool runs, no reply is sent. This is the MITM-on-plain-ws case —
+    /// the Welcome was genuine, but a later frame is injected by something
+    /// that can write to the socket.
+    #[tokio::test]
+    async fn a_message_signed_by_another_key_is_dropped() {
+        let (a, peer) = Connection::channel(8);
+        let key = SigningKey::generate();
+        let orch_key = SigningKey::generate();
+        let mut client = AgentClient::new(DeviceId::new("pc-1"), key, a)
+            .with_pinned_orchestrator_key(&orch_key.verifying_key().to_b64())
+            .expect("pin");
+
+        let handle = tokio::spawn(async move { client.run().await });
+
+        let call = ToolCall {
+            task_id: TaskId::new("t-injected"),
+            tool: ToolName::new("device_status"),
+            args: json!({}),
+            risk_tier: himan_proto::RiskTier::ReadOnly,
+            target_device: DeviceId::new("pc-1"),
+            nonce: 7,
+        };
+        // Signed by the ATTACKER's key, not the pinned orchestrator key.
+        let msg = WireMessage::sign(
+            WireMeta {
+                seq: 1,
+                ts: Utc::now().timestamp(),
+                from: DeviceId::new("orchestrator"),
+                to: "pc-1".into(),
+            },
+            Payload::ToolCall(call),
+            &SigningKey::generate(),
+        )
+        .unwrap();
+        peer.send(msg).await.unwrap();
+
+        // Nothing may come back: the frame is dropped before any handler.
+        let silent = tokio::time::timeout(std::time::Duration::from_millis(500), peer.recv()).await;
+        assert!(
+            silent.is_err(),
+            "an injected message produced a reply: {:?}",
+            silent.ok()
+        );
+
+        // The session is still alive: a correctly signed call works after it.
+        let good = WireMessage::sign(
+            WireMeta {
+                seq: 2,
+                ts: Utc::now().timestamp(),
+                from: DeviceId::new("orchestrator"),
+                to: "pc-1".into(),
+            },
+            Payload::ToolCall(ToolCall {
+                task_id: TaskId::new("t-good"),
+                tool: ToolName::new("device_status"),
+                args: json!({}),
+                risk_tier: himan_proto::RiskTier::ReadOnly,
+                target_device: DeviceId::new("pc-1"),
+                nonce: 8,
+            }),
+            &orch_key,
+        )
+        .unwrap();
+        peer.send(good).await.unwrap();
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(5), peer.recv())
+            .await
+            .expect("the legitimate call should still be answered")
+            .expect("some message");
+        match reply.payload {
+            Payload::ToolResult { task_id, state, .. } => {
+                assert_eq!(task_id.as_str(), "t-good");
+                assert_eq!(state, TaskState::Succeeded);
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
+
+        peer.close().await;
+        handle.abort();
+    }
+
+    /// An unsigned-tampered commit is dropped too: the attacker must not be
+    /// able to make the device believe a handoff committed.
+    #[tokio::test]
+    async fn an_injected_handoff_commit_is_dropped() {
+        let (a, peer) = Connection::channel(8);
+        let key = SigningKey::generate();
+        let orch_key = SigningKey::generate();
+        let mut client = AgentClient::new(DeviceId::new("pc-1"), key, a)
+            .with_pinned_orchestrator_key(&orch_key.verifying_key().to_b64())
+            .expect("pin");
+
+        let handle = tokio::spawn(async move { client.run().await });
+
+        let msg = WireMessage::sign(
+            WireMeta {
+                seq: 1,
+                ts: Utc::now().timestamp(),
+                from: DeviceId::new("orchestrator"),
+                to: "pc-1".into(),
+            },
+            Payload::HandoffCommit {
+                handoff_id: "h-forged".into(),
+                new_epoch: 99,
+                final_seq: 0,
+            },
+            &SigningKey::generate(),
+        )
+        .unwrap();
+        peer.send(msg).await.unwrap();
+
+        // A real commit is acknowledged with HandoffSwitched; a forged one
+        // must produce nothing.
+        let silent = tokio::time::timeout(std::time::Duration::from_millis(500), peer.recv()).await;
+        assert!(
+            silent.is_err(),
+            "a forged commit was acknowledged: {:?}",
+            silent.ok()
+        );
+
+        peer.close().await;
         handle.abort();
     }
 }
