@@ -82,6 +82,9 @@ pub struct Hub {
     presence: Mutex<PresenceManager>,
     store: Mutex<StateStore>,
     audit: Arc<Mutex<AuditLog>>,
+    /// Device ids revoked durably. Checked before enrollment and before
+    /// any message is handled.
+    revoked: Mutex<std::collections::HashSet<String>>,
     orchestrator_key: SigningKey,
     config: HubConfig,
     enrollment: Option<EnrollmentFile>,
@@ -165,6 +168,7 @@ impl Hub {
             presence: Mutex::new(PresenceManager::new(PolicyEngine::default())),
             store: Mutex::new(StateStore::new()),
             audit: Arc::new(Mutex::new(AuditLog::new())),
+            revoked: Mutex::new(std::collections::HashSet::new()),
             orchestrator_key,
             config,
             enrollment: None,
@@ -216,6 +220,14 @@ impl Hub {
             }
         };
 
+        // A revoked device is refused before any signature work or session
+        // creation. Revocation is checked first so a revoked key cannot even
+        // attempt a re-registration.
+        if self.is_revoked(&info.id).await {
+            self.audit_rejection(&info.id, "device is revoked").await;
+            return Err(ProtoError::Policy("device is revoked".to_owned()));
+        }
+
         // The Hello must be signed by the key the agent claims.
         let claimed = himan_proto::VerifyingKey::from_b64(&info.verifying_key)?;
         hello.verify_with(&claimed)?;
@@ -224,11 +236,13 @@ impl Hub {
         match check_enrollment(self.enrollment.as_ref(), &info.id, &info.verifying_key) {
             EnrollmentDecision::Enrolled => {}
             EnrollmentDecision::UnknownDevice => {
-                self.audit_rejection(&info.id, "device is not enrolled");
+                self.audit_rejection(&info.id, "device is not enrolled")
+                    .await;
                 return Err(ProtoError::Policy("device is not enrolled".to_owned()));
             }
             EnrollmentDecision::KeyMismatch => {
-                self.audit_rejection(&info.id, "Hello key does not match enrolled key");
+                self.audit_rejection(&info.id, "Hello key does not match enrolled key")
+                    .await;
                 return Err(ProtoError::Policy(
                     "Hello key does not match enrolled key".to_owned(),
                 ));
@@ -249,7 +263,8 @@ impl Hub {
                 self.audit_rejection(
                     &info.id,
                     "a different key attempted to take over a connected device",
-                );
+                )
+                .await;
                 warn!(device = %info.id, "rejected registration from a different key");
                 return Err(ProtoError::Policy(
                     "device id is already connected with a different key".to_owned(),
@@ -357,15 +372,13 @@ impl Hub {
     }
 
     /// Record a registration rejection. Never includes key material.
-    fn audit_rejection(&self, device: &DeviceId, reason: &str) {
-        let audit = self.audit.try_lock();
-        if let Ok(mut log) = audit {
-            log.append(
-                "registration_rejected".into(),
-                device.to_string(),
-                reason.to_owned(),
-            );
-        }
+    async fn audit_rejection(&self, device: &DeviceId, reason: &str) {
+        self.audit(
+            "registration_rejected".to_string(),
+            device.to_string(),
+            reason.to_owned(),
+        )
+        .await;
     }
 
     /// Record a replay rejection. Never includes message contents.
@@ -387,6 +400,11 @@ impl Hub {
             warn!(from = %msg.meta.from, "stale message rejected");
             self.audit_replay(&msg.meta.from, "stale timestamp");
             return Err(ProtoError::Policy("message timestamp out of range".into()));
+        }
+
+        if self.is_revoked(&msg.meta.from).await {
+            self.audit_replay(&msg.meta.from, "message from a revoked device");
+            return Err(ProtoError::Policy("device is revoked".to_owned()));
         }
 
         let keys = self.keys.lock().await;
@@ -961,6 +979,48 @@ impl Hub {
     pub async fn agents(&self) -> Vec<DeviceInfo> {
         let agents = self.agents.lock().await;
         agents.values().map(|s| s.device.clone()).collect()
+    }
+
+    /// Load durable revocations at startup, before any agent registers.
+    pub async fn load_revocations(&self, ids: Vec<String>) {
+        let mut revoked = self.revoked.lock().await;
+        revoked.extend(ids);
+    }
+
+    /// Revoke a device: reject future Hellos and drop any live session.
+    /// Persisted durably and audited through the hash chain.
+    pub async fn revoke_device(&self, device: &DeviceId, reason: &str) {
+        let now = chrono::Utc::now().timestamp();
+        let mut revoked = self.revoked.lock().await;
+        revoked.insert(device.to_string());
+        drop(revoked);
+        {
+            let guard = self.durable.lock().expect("durable lock");
+            if let Some(store) = guard.as_ref() {
+                if let Err(e) = store.revoke_device(device.as_str(), now, reason) {
+                    tracing::error!(error = %e, "failed to persist the revocation");
+                }
+            }
+        }
+        self.unregister(device).await;
+        self.audit(
+            "device_revoked".to_string(),
+            "orchestrator".to_string(),
+            format!("device={device} reason={reason}"),
+        )
+        .await;
+    }
+
+    /// Whether a device id is revoked (in-memory mirror of the durable table).
+    pub async fn is_revoked(&self, device: &DeviceId) -> bool {
+        self.revoked.lock().await.contains(device.as_str())
+    }
+
+    /// Every revoked device id.
+    pub async fn revoked_devices(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.revoked.lock().await.iter().cloned().collect();
+        ids.sort();
+        ids
     }
 
     /// Snapshot of the audit log.

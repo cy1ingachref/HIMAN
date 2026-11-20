@@ -143,6 +143,8 @@ pub fn router_with_auth(
         .route("/tasks/{task_id}/owner", get(task_owner))
         .route("/tasks/{task_id}/record", get(task_record))
         .route("/tasks/{task_id}/events", get(task_events))
+        .route("/devices/revoked", get(revoked_devices))
+        .route("/devices/{device_id}/revoke", post(revoke_device))
         .route_layer(axum::middleware::from_fn_with_state(
             (
                 token,
@@ -313,6 +315,23 @@ async fn handoff(
                 .into_response()
         }
     }
+}
+
+/// List revoked device ids.
+async fn revoked_devices(State(state): State<AppState>) -> impl IntoResponse {
+    Json(state.hub.revoked_devices().await)
+}
+
+/// Revoke a device: refuse future Hellos, drop its live session, persist.
+async fn revoke_device(
+    State(state): State<AppState>,
+    axum::extract::Path(device_id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    state
+        .hub
+        .revoke_device(&himan_proto::DeviceId::new(device_id), "operator request")
+        .await;
+    (StatusCode::OK, Json(serde_json::json!({"revoked": true})))
 }
 
 /// Report the orchestrator's own event log for a task, with its continuity.

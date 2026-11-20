@@ -164,6 +164,11 @@ impl DurableStore {
                     key   TEXT PRIMARY KEY,
                     value TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS revoked (
+                    device_id   TEXT PRIMARY KEY,
+                    revoked_at  INTEGER NOT NULL,
+                    reason      TEXT NOT NULL DEFAULT ''
+                );
                 -- Tasks whose owner died and no device was available to take
                 -- them. They stay stalled and are offered when a device
                 -- connects.
@@ -457,6 +462,43 @@ impl DurableStore {
             prev_hash = event.hash;
         }
         Ok(())
+    }
+
+    /// Permanently revoke a device id, durably. Idempotent.
+    pub fn revoke_device(&self, device: &str, at_unix: i64, reason: &str) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO revoked (device_id, revoked_at, reason) VALUES (?1, ?2, ?3)",
+                params![device, at_unix, reason],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Whether a device id is revoked.
+    pub fn is_revoked(&self, device: &str) -> Result<bool, String> {
+        self.conn
+            .query_row(
+                "SELECT 1 FROM revoked WHERE device_id = ?1",
+                params![device],
+                |_| Ok(true),
+            )
+            .optional()
+            .map(|v| v.is_some())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Every revoked device id.
+    pub fn revoked_devices(&self) -> Result<Vec<String>, String> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT device_id FROM revoked ORDER BY device_id")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
     }
 
     /// Read or write a `meta` value.
@@ -833,16 +875,24 @@ pub async fn attach(hub: Arc<crate::hub::Hub>, path: &Path) -> Result<(), String
             "handoff was in flight at shutdown; rolled back"
         );
     }
+    // Load revocations BEFORE the store is moved into the hub and before
+    // any agent can register: a durable deny-list must refuse those ids
+    // from the first message onward.
+    let revoked_ids = store
+        .revoked_devices()
+        .map_err(|e| format!("failed to load revocations: {e}"))?;
+    hub.load_revocations(revoked_ids).await;
     hub.install_durable(store, rolled_back.len(), resume.is_some());
+    // Rebuild the in-memory task records, owners, epochs and event log from
+    // the attached store. This was previously done by attach() directly;
+    // it must run after install_durable so the store handle is in place.
+    let loaded = hub.load_durable_state().await;
     // Audit the rollbacks now, after the store is attached: the audit log is
     // in-memory and starts empty on every start, so a rollback discovered during
     // recovery has to be written into it here or it would be invisible.
     for record in &rolled_back {
         hub.audit_handoff_rolled_back(record).await;
     }
-    // Load owner/epoch/event log back into the live maps. The epoch is taken
-    // from the durable record, never recomputed.
-    let loaded = hub.load_durable_state().await;
     tracing::info!(
         rolled_back = rolled_back.len(),
         resume_pending = resume.is_some(),

@@ -976,6 +976,35 @@ impl E2ETest {
     /// `extra_envs` is how a test makes a device behave a specific way (for
     /// example `HIMAN_TEST_NEVER_READY=1` for the rollback scenario) without
     /// changing the agent's production defaults.
+    /// Spawn an agent and wait at most `timeout_secs` for registration.
+    /// For tests that expect registration to FAIL (revoked device), use a
+    /// short timeout instead of the 60 s hard timeout.
+    // Allow 8 args: the bounded variant intentionally mirrors spawn_agent_full
+    // plus one timeout. Keeping the signatures parallel is clearer than a
+    // parameter struct used by only these two helpers.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn spawn_agent_full_bounded(
+        &mut self,
+        orch_port: u16,
+        device_id: &str,
+        agent_key_file: &Path,
+        orch_key: &str,
+        extra_args: Vec<String>,
+        extra_envs: Vec<(String, String)>,
+        timeout_secs: u64,
+    ) -> Result<Value, String> {
+        self.spawn_agent_full_inner(
+            orch_port,
+            device_id,
+            agent_key_file,
+            orch_key,
+            extra_args,
+            extra_envs,
+            timeout_secs,
+        )
+        .await
+    }
+
     pub async fn spawn_agent_full(
         &mut self,
         orch_port: u16,
@@ -984,6 +1013,29 @@ impl E2ETest {
         orch_key: &str,
         extra_args: Vec<String>,
         extra_envs: Vec<(String, String)>,
+    ) -> Result<Value, String> {
+        self.spawn_agent_full_inner(
+            orch_port,
+            device_id,
+            agent_key_file,
+            orch_key,
+            extra_args,
+            extra_envs,
+            HARD_TIMEOUT.as_secs(),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn spawn_agent_full_inner(
+        &mut self,
+        orch_port: u16,
+        device_id: &str,
+        agent_key_file: &Path,
+        orch_key: &str,
+        extra_args: Vec<String>,
+        extra_envs: Vec<(String, String)>,
+        timeout_secs: u64,
     ) -> Result<Value, String> {
         let mut args = vec!["--ws".to_string(), format!("ws://127.0.0.1:{orch_port}/ws")];
         args.extend(extra_args);
@@ -999,7 +1051,13 @@ impl E2ETest {
         let mut child = Child::spawn(&self.agent_binary(), args, envs);
 
         let expected = self.agents.len() + 1;
-        match wait_for_registration(orch_port, expected, HARD_TIMEOUT).await {
+        match wait_for_registration(
+            orch_port,
+            expected,
+            std::time::Duration::from_secs(timeout_secs),
+        )
+        .await
+        {
             Ok(agents) => {
                 self.agent_ids.push(device_id.to_string());
                 self.agents.push(child);

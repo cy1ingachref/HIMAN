@@ -62,6 +62,14 @@ pub enum EnrollmentError {
     Parse(String),
 }
 
+/// Whether a device id is revoked. Checked before enrollment and before
+/// any message is handled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RevocationDecision {
+    Revoked,
+    Active,
+}
+
 /// Outcome of checking a Hello against the enrollment list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnrollmentDecision {
