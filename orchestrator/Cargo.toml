@@ -15,6 +15,7 @@ path = "src/bin/orchestrator.rs"
 [dependencies]
 himan-proto = { path = "../proto" }
 himan-agent-core = { path = "../agent-core" }
+socket2 = "0.6"
 async-trait = "0.1"
 serde.workspace = true
 serde_json.workspace = true

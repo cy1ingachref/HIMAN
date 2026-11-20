@@ -651,9 +651,33 @@ pub fn production_router(hub: Arc<Hub>, token: Option<crate::api_auth::ApiToken>
 pub async fn serve(hub: Arc<Hub>, port: u16) -> Result<(), std::io::Error> {
     let token = crate::api_auth::ApiToken::from_env();
     let app = production_router(hub, token);
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
+    let listener = bind_reuse_addr(port).await?;
     info!(port, "orchestrator listening on 127.0.0.1");
     axum::serve(listener, app).await
+}
+
+/// Bind the loopback listener with SO_REUSEADDR.
+///
+/// Root cause of the durable_audit CI flake (run 44587040931): after a
+/// restart the old process's accepted connections linger in TIME_WAIT on
+/// the same port. A plain bind then fails with EADDRINUSE, the child exits
+/// immediately, and the harness's health wait burns its whole deadline on
+/// a process that is already dead. SO_REUSEADDR lets the new listener bind
+/// over those lingering sockets — the standard, safe behavior for a server
+/// that owns its port (it does NOT allow two live listeners; that still
+/// fails, which is correct).
+async fn bind_reuse_addr(port: u16) -> Result<tokio::net::TcpListener, std::io::Error> {
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let socket = socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )?;
+    socket.set_reuse_address(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+    tokio::net::TcpListener::from_std(std::net::TcpListener::from(socket))
 }
 
 #[cfg(test)]

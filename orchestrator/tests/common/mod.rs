@@ -508,15 +508,14 @@ impl E2ETest {
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-        match wait_for_health(self.port).await {
+        match wait_for_health_child(self.port, Some(&mut orch)).await {
             Ok(key) => {
                 self.orch_key = key;
                 self.orch = orch;
             }
             Err(message) => {
-                let tail = orch.tail(LOG_TAIL_LINES);
                 orch.kill();
-                panic!("{message}\n{tail}");
+                panic!("{message}");
             }
         }
     }
@@ -562,7 +561,7 @@ impl E2ETest {
             envs,
         );
         tokio::time::sleep(std::time::Duration::from_millis(600)).await;
-        match wait_for_health(self.port).await {
+        match wait_for_health_child(self.port, Some(&mut orch)).await {
             Ok(key) => {
                 self.orch_key = key;
                 self.orch = orch;
@@ -621,15 +620,14 @@ impl E2ETest {
         // A process that refuses to start exits immediately; wait briefly so
         // the failure is observed rather than racing the health check.
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-        match wait_for_health(self.port).await {
+        match wait_for_health_child(self.port, Some(&mut orch)).await {
             Ok(key) => {
                 self.orch_key = key;
                 self.orch = orch;
             }
             Err(message) => {
-                let tail = orch.tail(LOG_TAIL_LINES);
                 orch.kill();
-                panic!("{message}\n{tail}");
+                panic!("{message}");
             }
         }
     }
@@ -708,7 +706,7 @@ impl E2ETest {
         );
 
         // Health must answer BEFORE any agent is spawned.
-        match wait_for_health(port).await {
+        match wait_for_health_child(port, Some(&mut orch)).await {
             Ok(orch_key) => Self {
                 orch,
                 agents: Vec::new(),
@@ -1082,8 +1080,33 @@ fn generate_agent_key(agent_bin: &Path, key_file: &Path) -> (String, PathBuf) {
 /// Poll `GET /health` every 100 ms until it answers 200, then return the
 /// orchestrator's advertised verifying key from the same response.
 async fn wait_for_health(port: u16) -> Result<String, String> {
+    wait_for_health_child(port, None).await
+}
+
+/// Poll `/health` with a bounded backoff until the orchestrator answers.
+///
+/// When the child handle is given, a process that has already exited is
+/// detected immediately instead of burning the whole deadline on a dead
+/// process (the durable_audit CI flake: the child died on EADDRINUSE and
+/// the wait polled nothing for 60 s). The backoff starts at 50 ms and caps
+/// at 500 ms, so a slow-but-alive startup is still given the full window.
+async fn wait_for_health_child(port: u16, child: Option<&mut Child>) -> Result<String, String> {
     let deadline = Instant::now() + HARD_TIMEOUT;
+    let mut delay = Duration::from_millis(50);
+    let mut attempts = 0u32;
+    let mut child = child;
     loop {
+        attempts += 1;
+        // A dead child will never answer: fail fast with its own output.
+        if let Some(c) = child.as_deref_mut() {
+            if let Some(code) = c.try_wait() {
+                return Err(format!(
+                    "orchestrator on port {port} exited with code {code:?} before answering \
+                     /health (after {attempts} attempts)\n{}",
+                    c.tail(LOG_TAIL_LINES)
+                ));
+            }
+        }
         let url = format!("http://127.0.0.1:{port}/health");
         if let Ok(response) = ureq::get(&url).call() {
             if response.status() == 200 {
@@ -1096,12 +1119,19 @@ async fn wait_for_health(port: u16) -> Result<String, String> {
             }
         }
         if Instant::now() >= deadline {
+            let tail = child
+                .as_deref_mut()
+                .map(|c| c.tail(LOG_TAIL_LINES))
+                .unwrap_or_default();
             return Err(format!(
-                "orchestrator on port {port} did not answer GET /health within {}s",
-                HARD_TIMEOUT.as_secs()
+                "orchestrator on port {port} did not answer GET /health within {}s \
+                 ({attempts} attempts, last backoff {}ms)\n{tail}",
+                HARD_TIMEOUT.as_secs(),
+                delay.as_millis()
             ));
         }
-        tokio::time::sleep(POLL_INTERVAL).await;
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(Duration::from_millis(500));
     }
 }
 
