@@ -126,8 +126,8 @@ fn rt20_unix_restart_over_time_wait_still_binds() {
     let listener = std::net::TcpListener::bind(addr).expect("bind");
     listener.set_nonblocking(false).ok();
     // Make a connection so the accepted side ends up in TIME_WAIT after close.
-    let mut client = std::net::TcpStream::connect(addr).expect("connect");
-    let (mut server_side, _) = listener.accept().expect("accept");
+    let client = std::net::TcpStream::connect(addr).expect("connect");
+    let (server_side, _) = listener.accept().expect("accept");
     client.shutdown(std::net::Shutdown::Both).ok();
     server_side.shutdown(std::net::Shutdown::Both).ok();
     drop(server_side);
