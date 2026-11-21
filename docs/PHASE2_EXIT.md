@@ -37,6 +37,7 @@ item is checked only when the evidence exists and was actually run.
   for 60 s. Fixed with SO_REUSEADDR + fail-fast health wait; a dedicated
   job now runs the test 20 consecutive times in CI (20/20 green in run
   44843418351).
-- Native TLS termination on the orchestrator is still a reverse-proxy
-  responsibility; only PEM validation and the plain-ws refusal are in-process.
-  PRODUCTION.md states this explicitly.
+- Native TLS termination (RT-21) and the port-hijack guard (RT-20) closed
+  the remaining blockers; see the RT-20/RT-21 rows in REDTEAM.md.
+- Still not production-ready: static API token (no rotation), no audit-log
+  access scoping, enrollment still an out-of-band file.

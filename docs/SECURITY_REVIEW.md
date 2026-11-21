@@ -166,11 +166,26 @@ not existing protections — see docs/PRODUCTION.md.
   IP and per presented token (SHA-256 keyed), 10 failures lock for 60 s,
   each map capped at 4096 with oldest-first eviction. Evidence:
   `rate_limit.rs` (4), mutation-checked.
-- TLS/WSS (PRODUCTION.md item 1) PARTIALLY CLOSED: the agent now refuses
+- TLS/WSS CLOSED (RT-19 refusal + RT-21 termination): the agent refuses
   plain ws:// unless compiled with `insecure-ws-dev` in a debug build; a CI
   guard greps the release binary for the escape hatch. The orchestrator
-  validates HIMAN_TLS_CERT/KEY PEM material and refuses to serve plain HTTP
-  without HIMAN_INSECURE_DEV. TERMINATION is still delegated to a TLS
-  reverse proxy — native rustls listeners on the orchestrator are NOT
-  implemented. Evidence: `tls_guard.rs` (2) + CI release-binary grep,
-  mutation-checked.
+  terminates TLS natively (rustls + tokio-rustls, HIMAN_TLS_CERT/KEY), and
+  the agent verifies the server certificate against HIMAN_TLS_CA_PEM —
+  verification is never disabled. A reverse proxy is now optional, not
+  required. Evidence: `tls_guard.rs` (2), `tls_roundtrip.rs` (3, real
+  binaries over wss:// with a throwaway CA), mutation-checked on both
+  sides. A reverse proxy remains a documented optional deployment choice.
+
+## RT-20 / RT-21 (native TLS phase)
+
+- RT-20 (port hijack) FIXED: `bind_loopback` is cfg-gated —
+  SO_EXCLUSIVEADDRUSE on Windows, SO_REUSEADDR on Unix. The Unix
+  restart-over-TIME_WAIT property is asserted directly, so the
+  durable_audit x20 job is unaffected. Mutation-checked.
+- RT-21 (native TLS) FIXED: real HTTPS/WSS round trip in CI with a
+  throwaway CA, plus wrong-CA and mismatched-hostname refusals.
+  Mutation-checked by removing the agent's certificate verification.
+
+Not production-ready, honestly: static API token with no rotation, no
+audit-log access scoping decision, and enrollment is still a file shipped
+out of band with no transport protection of its own.
