@@ -691,6 +691,7 @@ dependencies = [
  "himan-agent-core",
  "himan-agent-pc",
  "himan-proto",
+ "libc",
  "rand 0.8.8",
  "reqwest",
  "rusqlite",

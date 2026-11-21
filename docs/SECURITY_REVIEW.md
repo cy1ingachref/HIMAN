@@ -189,3 +189,11 @@ not existing protections — see docs/PRODUCTION.md.
 Not production-ready, honestly: static API token with no rotation, no
 audit-log access scoping decision, and enrollment is still a file shipped
 out of band with no transport protection of its own.
+
+## RT-24 (harness hygiene)
+
+Test children are now killed and reaped when the harness value is dropped,
+including on the panic path; on Windows each child is assigned to a Job
+Object with KILL_ON_JOB_CLOSE as a backstop for aborts. Evidence:
+`harness_orphans.rs` (3 tests), covering plain drop, drop without stop(),
+and a panicking test. This is test infrastructure, not a product control.
