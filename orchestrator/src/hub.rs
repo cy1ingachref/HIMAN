@@ -2158,29 +2158,34 @@ impl Hub {
         if !outcome.committed {
             if let Some(reason) = outcome.reason.clone() {
                 let now = Utc::now().timestamp();
-                let rolled_back = {
+                let rollback_line = {
                     let mut handoffs = self.handoffs.lock().await;
                     match handoffs.get_mut(&handoff_id) {
-                        Some(record) => {
-                            let line = record.apply(
-                                HandoffEvent::Rollback {
-                                    reason: reason.clone(),
-                                },
-                                now,
-                                &self.handoff_timeouts,
-                            );
-                            match line {
-                                Ok(l) => {
-                                    self.audit(l.action, from.to_string(), l.detail).await;
-                                    true
-                                }
-                                Err(e) => {
-                                    warn!(handoff = %handoff_id, error = %e, "rollback refused");
-                                    false
-                                }
-                            }
-                        }
-                        None => false,
+                        Some(record) => record.apply(
+                            HandoffEvent::Rollback {
+                                reason: reason.clone(),
+                            },
+                            now,
+                            &self.handoff_timeouts,
+                        ),
+                        None => Err(HandoffError::IllegalTransition {
+                            from: "missing",
+                            event: "rollback",
+                        }),
+                    }
+                };
+                // Audit AFTER dropping the handoffs lock. Holding it across
+                // an await stalls other handoff requests while the durable
+                // append waits on disk, which under parallel CI load can
+                // delay the rollback audit past its 20 s observer window.
+                let rolled_back = match rollback_line {
+                    Ok(l) => {
+                        self.audit(l.action, from.to_string(), l.detail).await;
+                        true
+                    }
+                    Err(e) => {
+                        warn!(handoff = %handoff_id, error = %e, "rollback refused");
+                        false
                     }
                 };
                 let mut drained = self.drained.lock().await;
