@@ -1335,7 +1335,11 @@ fn tls_agent(ca: &Path) -> ureq::Agent {
 }
 
 /// Verifies the handshake but not the hostname. Used ONLY by the test
-/// harness to probe a mismatched-hostname server.
+/// harness's own HTTP client (`orchestrator/tests/common/mod.rs`) so a
+/// negative test can stand up a mismatched-hostname server and still probe
+/// it; gated by HIMAN_TEST_TLS_LAX_HOSTNAME, which the agent never sets.
+/// The agent under test (agent-core / agent-pc) has no such path — its
+/// certificate verification is unconditional.
 #[derive(Debug)]
 struct LaxHostnameVerifier(std::sync::Arc<rustls::crypto::CryptoProvider>);
 
