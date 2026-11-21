@@ -672,30 +672,31 @@ pub fn production_router(hub: Arc<Hub>, token: Option<crate::api_auth::ApiToken>
 
 pub async fn serve(hub: Arc<Hub>, port: u16) -> Result<(), std::io::Error> {
     let token = crate::api_auth::ApiToken::from_env();
-    let app = production_router(hub, token);
     let listener = bind_reuse_addr(port).await?;
-    let service = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
 
-    // TLS/WSS is mandatory in production. When HIMAN_TLS_CERT and
-    // HIMAN_TLS_KEY are set the server validates the PEM material and
-    // refuses to start if it is unusable. Termination itself is performed
-    // by a TLS reverse proxy in front of this loopback listener (see
-    // docs/PRODUCTION.md); validating the material here ensures a bad
-    // certificate cannot be deployed unnoticed.
+    // TLS is the production path: HIMAN_TLS_CERT / HIMAN_TLS_KEY serve
+    // HTTPS/WSS natively. Without them, plain HTTP/WS is refused unless
+    // HIMAN_INSECURE_DEV=1 is set explicitly for loopback development.
     if let (Ok(cert), Ok(key)) = (
         std::env::var("HIMAN_TLS_CERT"),
         std::env::var("HIMAN_TLS_KEY"),
     ) {
-        tls_config(&cert, &key).map_err(|e| {
+        let config = std::sync::Arc::new(tls_config(&cert, &key).map_err(|e| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("TLS config: {e}"))
-        })?;
-        info!(port, "TLS material validated; serving behind a TLS proxy");
-        axum::serve(listener, service).await
+        })?);
+        let acceptor = tokio_rustls::TlsAcceptor::from(config);
+        let tls_listener = spawn_tls_accept(listener, acceptor);
+        let tls_service =
+            production_router(hub, token).into_make_service_with_connect_info::<TlsConnectInfo>();
+        info!(port, "orchestrator listening with native TLS (https/wss)");
+        axum::serve(tls_listener, tls_service).await
     } else if std::env::var("HIMAN_INSECURE_DEV").as_deref() == Ok("1") {
         tracing::warn!(
             "HIMAN_INSECURE_DEV=1: serving PLAIN HTTP/WS on 127.0.0.1. \
              No confidentiality; agents also need the insecure-ws-dev build."
         );
+        let service = production_router(hub, token)
+            .into_make_service_with_connect_info::<std::net::SocketAddr>();
         info!(port, "orchestrator listening on 127.0.0.1 (no TLS)");
         axum::serve(listener, service).await
     } else {
@@ -705,6 +706,96 @@ pub async fn serve(hub: Arc<Hub>, port: u16) -> Result<(), std::io::Error> {
              or HIMAN_INSECURE_DEV=1 for loopback development",
         ))
     }
+}
+
+/// A listener that terminates TLS and hands accepted connections to axum.
+///
+/// `TcpListener::accept` is synchronous in axum's `Listener::poll_accept`,
+/// so the async TLS handshake runs on a dedicated task that pushes results
+/// into an mpsc; `poll_accept` takes from that channel.
+struct TlsListener {
+    rx: tokio::sync::mpsc::Receiver<
+        std::io::Result<(
+            tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+            std::net::SocketAddr,
+        )>,
+    >,
+    addr: std::net::SocketAddr,
+}
+
+impl axum::serve::Listener for TlsListener {
+    type Io = tokio_rustls::server::TlsStream<tokio::net::TcpStream>;
+    type Addr = std::net::SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            match self.rx.recv().await {
+                Some(Ok(v)) => return v,
+                Some(Err(e)) => {
+                    tracing::warn!(error = %e, "TLS accept error");
+                    continue;
+                }
+                None => {
+                    // Channel closed: park rather than panic the server.
+                    std::future::pending().await
+                }
+            }
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        Ok(self.addr)
+    }
+}
+
+/// axum needs this to extract the peer address as ConnectInfo. The peer is
+/// recorded on accept, so it is returned from the listener's state rather
+/// than read off the TLS stream.
+/// Peer address extracted from a TLS connection. A local newtype because
+/// axum's `Connected` impl is orphan-restricted for the foreign
+/// `SocketAddr`/`IncomingStream` pair.
+#[derive(Debug, Clone, Copy)]
+pub struct TlsConnectInfo(pub std::net::SocketAddr);
+
+impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, TlsListener>>
+    for TlsConnectInfo
+{
+    fn connect_info(stream: axum::serve::IncomingStream<'_, TlsListener>) -> Self {
+        TlsConnectInfo(*stream.remote_addr())
+    }
+}
+
+/// Spawn the TLS accept loop: TCP accept, then handshake per connection.
+fn spawn_tls_accept(
+    inner: tokio::net::TcpListener,
+    acceptor: tokio_rustls::TlsAcceptor,
+) -> TlsListener {
+    let addr = inner.local_addr().expect("local addr");
+    let (tx, rx) = tokio::sync::mpsc::channel(64);
+    tokio::spawn(async move {
+        loop {
+            let (stream, peer) = match inner.accept().await {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = tx.send(Err(e)).await;
+                    continue;
+                }
+            };
+            let acceptor = acceptor.clone();
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                match acceptor.accept(stream).await {
+                    Ok(tls) => {
+                        let _ = tx.send(Ok((tls, peer))).await;
+                    }
+                    Err(e) => {
+                        tracing::warn!(peer = %peer, error = %e, "TLS handshake failed");
+                    }
+                }
+            });
+        }
+    });
+    TlsListener { rx, addr }
 }
 
 /// Build a rustls server config from PEM cert and key paths.

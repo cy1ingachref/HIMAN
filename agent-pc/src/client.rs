@@ -821,6 +821,22 @@ pub async fn connect_ws(
     key: SigningKey,
     url: &str,
 ) -> Result<AgentClient, Box<dyn std::error::Error + Send + Sync>> {
+    connect_ws_ca(device_id, key, url, None).await
+}
+
+/// Connect with optional TLS. `ca_pem` is the CA/certificate the agent
+/// verifies the server against; `None` means plain ws:// (only permitted by
+/// the insecure-ws-dev debug build, checked below).
+///
+/// TLS authenticates the transport. It does NOT replace the orchestrator
+/// signing-key pin or the per-frame signature verification (F-1/RT-15);
+/// those stay as defense in depth on top.
+pub async fn connect_ws_ca(
+    device_id: DeviceId,
+    key: SigningKey,
+    url: &str,
+    ca_pem: Option<&str>,
+) -> Result<AgentClient, Box<dyn std::error::Error + Send + Sync>> {
     // TLS is mandatory for agent<->orchestrator traffic: signatures prove
     // device data. Plain ws:// is refused unless this is a debug build
     // explicitly compiled with the insecure-ws-dev feature for loopback use.
@@ -839,7 +855,16 @@ pub async fn connect_ws(
     if !url.starts_with("ws://") && !url.starts_with("wss://") {
         return Err(format!("unsupported WebSocket URL scheme: {url:?}").into());
     }
-    let transport = Arc::new(himan_agent_core::WsTransport::connect(url).await?);
+    let transport = match (url.starts_with("wss://"), ca_pem) {
+        (true, Some(ca)) => {
+            Arc::new(himan_agent_core::WsTransport::connect_tls(url, ca).await?)
+        }
+        (true, None) => {
+            return Err("wss:// requires HIMAN_TLS_CA_PEM so the server certificate                         can be verified; certificate verification is never disabled"
+                .into())
+        }
+        (false, _) => Arc::new(himan_agent_core::WsTransport::connect(url).await?),
+    };
     let conn = himan_agent_core::transport::ws::connection_from_socket(transport, 64);
     Ok(AgentClient::new(device_id, key, conn))
 }

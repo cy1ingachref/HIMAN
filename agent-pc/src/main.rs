@@ -6,6 +6,8 @@ use himan_proto::{DeviceId, TaskId};
 
 #[tokio::main]
 async fn main() {
+    // Exactly one rustls provider must be installed (see orchestrator bin).
+    let _ = rustls::crypto::ring::default_provider().install_default();
     himan_agent_core::init_logging();
 
     let args: Vec<String> = std::env::args().collect();
@@ -137,7 +139,12 @@ async fn run_scenario(args: &[String], pos: usize) {
 /// The keepalive turns a silent peer into a visible failure, so a dropped
 /// connection should be retried rather than treated as a clean exit.
 async fn run_ws_with_reconnect(args: &[String]) {
-    let url = args[2].clone();
+    // HIMAN_WS_URL lets a test override the URL without disturbing arg
+    // order (the harness always passes --ws <url>).
+    let url = std::env::var("HIMAN_WS_URL")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| args[2].clone());
 
     // The orchestrator's public key, pinned out of band. A Welcome is accepted
     // only if it is signed by this key. Without pinning, any server can sign
@@ -182,7 +189,17 @@ async fn run_ws_with_reconnect(args: &[String]) {
         attempt += 1;
         tracing::info!(url = %url, attempt, "connecting to orchestrator");
 
-        let mut client = match himan_agent_pc::connect_ws(device.clone(), key.clone(), &url).await {
+        let ca_pem = std::env::var("HIMAN_TLS_CA_PEM")
+            .ok()
+            .filter(|v| !v.trim().is_empty());
+        let mut client = match himan_agent_pc::connect_ws_ca(
+            device.clone(),
+            key.clone(),
+            &url,
+            ca_pem.as_deref(),
+        )
+        .await
+        {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!(error = %e, "connection failed");
