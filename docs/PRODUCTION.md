@@ -56,10 +56,13 @@ segment. Before any untrusted-network use, in order:
 1. TLS/WSS termination with a verified certificate (blocker).
 2. Always pin the orchestrator key on every agent (`HIMAN_ORCH_KEY`).
 3. High-entropy API token, provisioned out of band, never committed.
-4. Enrollment file provisioned out of band; plan the revocation story.
-5. Rate limiting + lockout on the API (blocker for any exposed port).
+4. Enrollment file provisioned out of band; revocation is implemented
+   (RT-18) and must be exercised operationally.
+5. ~~Rate limiting + lockout on the API.~~ CLOSED (RT-17).
 6. Decide audit-log access scope.
 
-Items 1 and 5 are hard blockers; the rest are required operational
-practice. This list is the input to the next phase's networking work,
-not a claim that any of it is done.
+Remaining hard blocker: item 1. The agent now refuses plain ws:// by
+default and a CI guard keeps the release binary free of the dev escape
+hatch, but actual termination still sits with a reverse proxy. The rest
+is operational practice. This list is the input to the next phase's
+networking work, not a claim that any of it is done.
