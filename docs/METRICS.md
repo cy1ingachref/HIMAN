@@ -11,11 +11,13 @@ The sweep is 3 event-log sizes x 4 latencies x 30 handoffs = 360 runs. `steps` i
 the scenario length, and each step is one event, so it is also the log size the
 target shadow-replays.
 
-This file records the runs CI produced. The nightly job uploads the CSV as an
+This file records the runs CI produced. The metrics job is manual dispatch only
+(`workflow_dispatch`, input `runs_per_cell`, default 10; use 30 for a final run)
+and uploads the CSV as an
 artifact (90-day retention); the committed copies in `docs/data/` are the
 permanent record.
 
-## Sweep (pending the next nightly run)
+## Sweep (pending the next manual run)
 
 The extended sweep was added in this branch and has not yet run on CI. The
 table below is the shape it produces; the numbers are filled in from the run.

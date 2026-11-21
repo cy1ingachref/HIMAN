@@ -838,7 +838,7 @@ pub async fn attach(hub: Arc<crate::hub::Hub>, path: &Path) -> Result<(), String
     // in-memory and starts empty on every start, so a rollback discovered during
     // recovery has to be written into it here or it would be invisible.
     for record in &rolled_back {
-        hub.audit_handoff_rolled_back(record);
+        hub.audit_handoff_rolled_back(record).await;
     }
     // Load owner/epoch/event log back into the live maps. The epoch is taken
     // from the durable record, never recomputed.

@@ -29,10 +29,16 @@ Status of each phase. Mark a phase done only when its exit check passes.
 
 ## Phase 2: Agent loop
 
-- [ ] Tool schemas + registry exposed over the wire
-- [ ] Real LLM backend behind `ChatBackend`
-- [ ] Task state machine persisted (SQLite)
-- [ ] Exit check: text prompt becomes a tool call and a result, with persistence
+- [x] Tool schemas + registry exposed over the wire (`ToolRegistry::schemas`,
+      sent to the planner as function tools)
+- [x] Real LLM backend behind `ChatBackend` (`agent-core/src/ollama.rs`:
+      local Ollama, configurable model, timeouts, bounded response; the
+      scripted stub remains the no-network default)
+- [x] Task state machine persisted (SQLite `task_records`, restored at startup)
+- [x] Exit check: text prompt becomes a tool call and a result, with the audit
+      trail (`tests/planner_exit.rs`, real binaries + fake Ollama over HTTP;
+      model output is validated against the whitelist and schema before the
+      policy engine runs)
 
 ## Phase 3: Phone and handoff
 

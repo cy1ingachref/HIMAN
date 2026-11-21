@@ -5,6 +5,11 @@ matters more than the prose.
 
 | Date | Decision | Reason | Alternatives considered |
 |---|---|---|---|
+| 2026-11-19 | Ollama backend added behind `ChatBackend`; the 2026-11-12 "no Ollama" decision is superseded for Phase 2 | The Phase 2 exit check requires a real planner; the trait kept the swap cheap. The stub stays the default so tests and offline runs need no model | OpenAI-compatible cloud endpoint (needs a key, leaves the machine) |
+| 2026-11-19 | Model output is untrusted: whitelist + schema validation in `Hub::plan` before the policy engine; every rejection audited | A model can be prompt-injected through tool results; it must not introduce tools, smuggle arguments, or influence allow/deny | Trusting the model's tool choice (rejected: injection changes decisions) |
+| 2026-11-19 | Startup recovery audits through `Hub::audit` (both logs), awaited during attach | The old `rt.spawn` wrote only the in-memory log, so `/api/v1/audit` (durable) never showed the recovery rollback — `restart_mid_shadowing` passed on the dead process's timeout entry | Keeping the spawn and reading the in-memory log in the API (loses durability) |
+| 2026-11-19 | `production_router()` extracted from `serve`; route/auth test builds the same router | The /record route was once added to two routers and missed the production one; a test on a copy cannot catch that class of bug | Testing `router()` only (not what the binary serves) |
+| 2026-11-19 | Metrics sweep is manual dispatch only, runs-per-cell input (default 10, 30 for a final run) | 360 real-binary runs is hours of CI; a schedule would burn it nightly for no reader | Nightly schedule (removed), per-push (far too slow) |
 | 2026-11-12 | Device set frozen: PC (Windows) + Android phone, optional Pi/router | Two devices prove handoff; a third is scope creep | iOS, "all devices", Flutter |
 | 2026-11-12 | No Flutter. Phone shell is native Kotlin + Rust core | Flutter adds a full framework for a thin shell; Kotlin gives direct Keystore/foreground-service access | Flutter (user rejected), Tauri mobile (immature) |
 | 2026-11-12 | No Ollama. Pluggable `ChatBackend` trait + deterministic stub | De-risks the pipeline without a model download; real backend swaps in later | Ollama local model (user rejected) |

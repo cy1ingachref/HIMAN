@@ -156,7 +156,11 @@ async fn restart_mid_shadowing_rolls_back_and_the_source_keeps_ownership() {
     }
     harness.restart_orchestrator_nowait().await;
     let _ = request.await;
-    harness.wait_for_agents().await;
+    // Only the source needs to be back for the assertions below. Waiting for
+    // BOTH agents costs the target's reconnect backoff (tens of seconds) and
+    // buys nothing: the target is deliberately slow and plays no part in the
+    // recovery assertions.
+    harness.wait_for_registration(1, 15).await;
     eprintln!(
         "=== orch log ===
 {}",
@@ -176,21 +180,21 @@ async fn restart_mid_shadowing_rolls_back_and_the_source_keeps_ownership() {
     assert_eq!(owner["owner"], json!(A), "the restart moved ownership");
     assert_eq!(owner["epoch"], json!(0), "the restart bumped the epoch");
 
-    // The in-flight handoff was rolled back and the rollback is audited.
-    //
-    // NOTE: this asserts only that a rollback happened, not that it came from
-    // restart recovery. With the target's 30 s slow-ready and a 10 s handoff
-    // timeout, the timeout usually wins the race, so the observed cause is
-    // "target never sent HandoffReady" rather than "orchestrator restarted
-    // before the commit". Tightening this to require the recovery reason makes
-    // the test fail — the restart does not reliably land inside the window.
-    // That is a pre-existing weakness (main has the same timing), recorded here
-    // rather than hidden behind a passing assertion.
+    // The in-flight handoff was rolled back BY STARTUP RECOVERY, and the
+    // rollback is audited. The reason matters: a timeout rollback is a
+    // different code path and would let this test pass without exercising
+    // restart recovery at all.
     let audit = common::http_get_json(port, "/api/v1/audit");
     let lines = audit.as_array().expect("audit array");
+    let rollback = lines
+        .iter()
+        .rev()
+        .find(|l| l["action"] == "handoff_rolled_back")
+        .unwrap_or_else(|| panic!("the in-flight handoff was not rolled back"));
+    let detail = rollback["detail"].as_str().unwrap_or("");
     assert!(
-        lines.iter().any(|l| l["action"] == "handoff_rolled_back"),
-        "the in-flight handoff was not rolled back: {lines:?}"
+        detail.contains("restarted before the commit"),
+        "the rollback came from something other than startup recovery: {detail}"
     );
     let committed = lines.iter().any(|l| l["action"] == "handoff_committed");
     assert!(!committed, "an uncommitted handoff committed");
