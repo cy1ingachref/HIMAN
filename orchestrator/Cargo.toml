@@ -21,8 +21,6 @@ base64 = "0.22"
 tokio-rustls = "0.26"
 either = "1"
 
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock", "Win32_Foundation"] }
 async-trait = "0.1"
 serde.workspace = true
 serde_json.workspace = true
@@ -55,3 +53,6 @@ tempfile = "3"
 ureq = { version = "2", features = ["json", "tls"] }
 rustls = { version = "0.23", features = ["ring"] }
 base64 = "0.22"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock", "Win32_Foundation"] }
