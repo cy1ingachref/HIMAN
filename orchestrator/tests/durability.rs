@@ -324,7 +324,13 @@ async fn the_event_seq_continues_after_a_restart() {
         "too few events before restart: {seq_before:?}"
     );
 
-    harness.restart_orchestrator().await;
+    // Freeze the scenario: kill the device that is still issuing steps so
+    // no new event can land between this snapshot and the restart. Otherwise
+    // a step finishing in that window adds a seq and makes the comparison
+    // fail for a reason unrelated to durability (seen in CI 44844753055).
+    harness.kill_agent(A);
+    harness.restart_orchestrator_nowait().await;
+    harness.wait_for_registration(1, 15).await;
 
     // The durable log is loaded back, so the seq continues rather than resets.
     let after = common::http_get_json(port, &format!("/api/v1/tasks/{task_id}/events"));
