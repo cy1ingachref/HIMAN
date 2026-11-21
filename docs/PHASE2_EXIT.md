@@ -19,7 +19,9 @@ item is checked only when the evidence exists and was actually run.
 | 12 | Security review with ranked findings | [x] | `docs/SECURITY_REVIEW.md` (F-1..F-9); 2 fixed + mutation-checked, rest documented |
 | 13 | Production networking posture explicit | [x] | `docs/PRODUCTION.md` — existing vs missing, TLS/revocation/rate-limit named as NOT implemented |
 | 14 | Multi-step planner: design before code | [x] | `docs/PLANNER_MULTISTEP_PROPOSAL.md` — gates + test plan, NOT implemented |
-| 15 | Full workspace suite green | [x] | 304 passed, 0 failed, 0 ignored; fmt + clippy -D warnings clean |
+| 15 | Full workspace suite green | [x] | 313 passed, 0 failed, 0 ignored; fmt + clippy -D warnings clean |
+| 16 | Hard blockers closed (rate limit, revocation, TLS default) | [x] | RT-17/18/19 each red-first, mutation-checked; CI run 44843418351 all six jobs green |
+| 17 | Restart flake root-caused and proven | [x] | SO_REUSEADDR + fail-fast health wait; dedicated x20 job green 20/20 in CI run 44843418351 |
 
 ## Honest limits (not exit blockers, but stated)
 
@@ -29,8 +31,12 @@ item is checked only when the evidence exists and was actually run.
 - TLS, revocation, rate limiting, token rotation are MISSING — Phase 2
   exits with them documented as the next phase's blockers, not done.
 - The planner executes one call; multi-step is a proposal only.
-- One CI flake observed: `durable_audit::audit_entries_survive_a_restart`
-  timed out on a 60 s health wait in run 44587040931's per-commit job
-  (the metrics job in the same run was green). It passes locally and in
-  run 44573834587. Treated as runner slowness, not a code regression;
-  flagged for a retry rather than hidden.
+- The durable_audit CI flake was NOT runner slowness: the restarted child's
+  stderr showed `Address already in use (os error 98)` — a plain bind failed
+  over lingering TIME_WAIT sockets and the health wait polled a dead process
+  for 60 s. Fixed with SO_REUSEADDR + fail-fast health wait; a dedicated
+  job now runs the test 20 consecutive times in CI (20/20 green in run
+  44843418351).
+- Native TLS termination on the orchestrator is still a reverse-proxy
+  responsibility; only PEM validation and the plain-ws refusal are in-process.
+  PRODUCTION.md states this explicitly.
