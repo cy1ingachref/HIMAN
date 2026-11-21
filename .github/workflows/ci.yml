@@ -203,6 +203,8 @@ jobs:
           cargo test -p himan-orchestrator --test durable_audit -- --nocapture
           cargo test -p himan-orchestrator --test non_idempotent -- --nocapture
           cargo test -p himan-orchestrator --test one_active_handoff_http -- --nocapture
+          cargo test -p himan-orchestrator --test port_bind -- --nocapture
+          cargo test -p himan-orchestrator --test tls_roundtrip -- --nocapture
           cargo test -p himan-orchestrator --test production_router -- --nocapture
           cargo test -p himan-orchestrator --test ollama_backend -- --nocapture
           cargo test -p himan-orchestrator --test planner_exit -- --nocapture
