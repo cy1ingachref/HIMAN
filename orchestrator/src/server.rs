@@ -143,8 +143,13 @@ pub fn router_with_auth(
         .route("/tasks/{task_id}/owner", get(task_owner))
         .route("/tasks/{task_id}/record", get(task_record))
         .route("/tasks/{task_id}/events", get(task_events))
+        .route("/devices/revoked", get(revoked_devices))
+        .route("/devices/{device_id}/revoke", post(revoke_device))
         .route_layer(axum::middleware::from_fn_with_state(
-            token,
+            (
+                token,
+                std::sync::Arc::new(crate::api_auth::RateLimiter::new()),
+            ),
             crate::api_auth::require_token,
         ))
         .with_state(state.clone());
@@ -310,6 +315,23 @@ async fn handoff(
                 .into_response()
         }
     }
+}
+
+/// List revoked device ids.
+async fn revoked_devices(State(state): State<AppState>) -> impl IntoResponse {
+    Json(state.hub.revoked_devices().await)
+}
+
+/// Revoke a device: refuse future Hellos, drop its live session, persist.
+async fn revoke_device(
+    State(state): State<AppState>,
+    axum::extract::Path(device_id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    state
+        .hub
+        .revoke_device(&himan_proto::DeviceId::new(device_id), "operator request")
+        .await;
+    (StatusCode::OK, Json(serde_json::json!({"revoked": true})))
 }
 
 /// Report the orchestrator's own event log for a task, with its continuity.
@@ -651,9 +673,111 @@ pub fn production_router(hub: Arc<Hub>, token: Option<crate::api_auth::ApiToken>
 pub async fn serve(hub: Arc<Hub>, port: u16) -> Result<(), std::io::Error> {
     let token = crate::api_auth::ApiToken::from_env();
     let app = production_router(hub, token);
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
-    info!(port, "orchestrator listening on 127.0.0.1");
-    axum::serve(listener, app).await
+    let listener = bind_reuse_addr(port).await?;
+    let service = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
+
+    // TLS/WSS is mandatory in production. When HIMAN_TLS_CERT and
+    // HIMAN_TLS_KEY are set the server validates the PEM material and
+    // refuses to start if it is unusable. Termination itself is performed
+    // by a TLS reverse proxy in front of this loopback listener (see
+    // docs/PRODUCTION.md); validating the material here ensures a bad
+    // certificate cannot be deployed unnoticed.
+    if let (Ok(cert), Ok(key)) = (
+        std::env::var("HIMAN_TLS_CERT"),
+        std::env::var("HIMAN_TLS_KEY"),
+    ) {
+        tls_config(&cert, &key).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("TLS config: {e}"))
+        })?;
+        info!(port, "TLS material validated; serving behind a TLS proxy");
+        axum::serve(listener, service).await
+    } else if std::env::var("HIMAN_INSECURE_DEV").as_deref() == Ok("1") {
+        tracing::warn!(
+            "HIMAN_INSECURE_DEV=1: serving PLAIN HTTP/WS on 127.0.0.1. \
+             No confidentiality; agents also need the insecure-ws-dev build."
+        );
+        info!(port, "orchestrator listening on 127.0.0.1 (no TLS)");
+        axum::serve(listener, service).await
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "refusing to serve without TLS: set HIMAN_TLS_CERT and HIMAN_TLS_KEY, \
+             or HIMAN_INSECURE_DEV=1 for loopback development",
+        ))
+    }
+}
+
+/// Build a rustls server config from PEM cert and key paths.
+fn tls_config(cert_path: &str, key_path: &str) -> Result<rustls::ServerConfig, String> {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+    // Minimal PEM reader: take the body between the BEGIN/END markers of
+    // the right block and base64-decode it. Avoids rustls-pemfile, which
+    // is unmaintained (RUSTSEC-2025-0134).
+    fn pem_block(text: &str, label: &str) -> Option<Vec<u8>> {
+        let begin = format!("-----BEGIN {label}-----");
+        let end = format!("-----END {label}-----");
+        let rest = text.split_once(&begin)?.1;
+        let body = rest.split_once(&end)?.0;
+        let compact: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD
+            .decode(compact)
+            .ok()
+    }
+
+    let cert_pem = std::fs::read_to_string(cert_path).map_err(|e| format!("{cert_path}: {e}"))?;
+    let key_pem = std::fs::read_to_string(key_path).map_err(|e| format!("{key_path}: {e}"))?;
+    let certs: Vec<CertificateDer<'static>> = cert_pem
+        .split("-----BEGIN CERTIFICATE-----")
+        .skip(1)
+        .filter_map(|block| {
+            let body = block.split_once("-----END CERTIFICATE-----")?.0;
+            let compact: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD
+                .decode(compact)
+                .ok()
+                .map(CertificateDer::from)
+        })
+        .collect();
+    if certs.is_empty() {
+        return Err("no certificates in PEM".to_string());
+    }
+    let key_bytes = pem_block(&key_pem, "PRIVATE KEY")
+        .or_else(|| pem_block(&key_pem, "RSA PRIVATE KEY"))
+        .or_else(|| pem_block(&key_pem, "EC PRIVATE KEY"))
+        .ok_or_else(|| "no private key in PEM".to_string())?;
+    let key =
+        PrivateKeyDer::try_from(key_bytes).map_err(|e| format!("invalid private key: {e}"))?;
+    rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| format!("invalid TLS material: {e}"))
+}
+
+/// Bind the loopback listener with SO_REUSEADDR.
+///
+/// Root cause of the durable_audit CI flake (run 44587040931): after a
+/// restart the old process's accepted connections linger in TIME_WAIT on
+/// the same port. A plain bind then fails with EADDRINUSE, the child exits
+/// immediately, and the harness's health wait burns its whole deadline on
+/// a process that is already dead. SO_REUSEADDR lets the new listener bind
+/// over those lingering sockets — the standard, safe behavior for a server
+/// that owns its port (it does NOT allow two live listeners; that still
+/// fails, which is correct).
+async fn bind_reuse_addr(port: u16) -> Result<tokio::net::TcpListener, std::io::Error> {
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let socket = socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )?;
+    socket.set_reuse_address(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+    tokio::net::TcpListener::from_std(std::net::TcpListener::from(socket))
 }
 
 #[cfg(test)]

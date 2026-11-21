@@ -64,10 +64,21 @@ async fn a_stalled_task_with_no_device_is_offered_when_one_connects() {
     }
     assert!(stalled, "the task was not marked stalled");
 
-    // It is persisted as stalled, with no candidate.
-    let store = himan_orchestrator::durable::DurableStore::open(std::path::Path::new(&state_file))
-        .expect("reopen the store");
-    let stalled_rows = store.stalled().expect("read stalled");
+    // It is persisted as stalled, with no candidate. The SQLite write and
+    // the audit write are separate; under parallel CI load the durable row
+    // can land a little after the audit line, so poll with a bounded wait
+    // rather than reading once (CI run 44847910233).
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let stalled_rows = loop {
+        let store =
+            himan_orchestrator::durable::DurableStore::open(std::path::Path::new(&state_file))
+                .expect("reopen the store");
+        let rows = store.stalled().expect("read stalled");
+        if rows.iter().any(|r| r.task_id == task_id) || std::time::Instant::now() >= deadline {
+            break rows;
+        }
+        tokio::time::sleep(common::POLL_INTERVAL).await;
+    };
     assert!(
         stalled_rows.iter().any(|r| r.task_id == task_id),
         "the stall was not persisted: {stalled_rows:?}"

@@ -50,6 +50,20 @@ pub struct Mailbox {
     pub inbound: Box<dyn Inbound + Send + Sync>,
 }
 
+/// The handoff id a reply payload names, if it is a handoff reply.
+///
+/// Used to drop replies that belong to a different attempt before the
+/// predicate sees them.
+fn reply_handoff_id(payload: &Payload) -> Option<&str> {
+    match payload {
+        Payload::HandoffReady { handoff_id, .. }
+        | Payload::HandoffProgress { handoff_id, .. }
+        | Payload::HandoffDrained { handoff_id, .. }
+        | Payload::HandoffSwitched { handoff_id, .. } => Some(handoff_id),
+        _ => None,
+    }
+}
+
 /// The result of waiting for the next inbound message.
 #[derive(Debug)]
 pub enum InboundEvent {
@@ -232,6 +246,7 @@ impl HandoffDriver {
 
         match Self::wait_for(
             &mut self.target,
+            self.handoff.handoff_id.as_str(),
             |p| matches!(p, Payload::HandoffReady { .. }),
             self.timeouts.shadowing,
         )
@@ -275,6 +290,7 @@ impl HandoffDriver {
 
         match Self::wait_for(
             &mut self.source,
+            self.handoff.handoff_id.as_str(),
             |p| matches!(p, Payload::HandoffDrained { .. }),
             self.timeouts.shadowing,
         )
@@ -326,6 +342,7 @@ impl HandoffDriver {
 
             match Self::wait_for(
                 &mut self.target,
+                self.handoff.handoff_id.as_str(),
                 |p| matches!(p, Payload::HandoffSwitched { .. }),
                 self.timeouts.switching,
             )
@@ -416,7 +433,12 @@ impl HandoffDriver {
     ///
     /// A free function rather than a method so that `&mut mailbox` and the
     /// driver's other fields are never borrowed at the same time.
-    async fn wait_for<F>(mailbox: &mut Mailbox, predicate: F, limit: Duration) -> Reply
+    async fn wait_for<F>(
+        mailbox: &mut Mailbox,
+        expected_handoff_id: &str,
+        predicate: F,
+        limit: Duration,
+    ) -> Reply
     where
         F: Fn(&Payload) -> bool,
     {
@@ -433,6 +455,16 @@ impl HandoffDriver {
             }
             match tokio::time::timeout(remaining, mailbox.inbound.recv()).await {
                 Ok(InboundEvent::Message(msg)) => {
+                    // A handoff reply must name THIS handoff. A reply for a
+                    // different (older, aborted, or forged) attempt is not an
+                    // answer to this procedure: acting on it could commit a
+                    // handoff the peer never agreed to. Drop it and keep
+                    // waiting, like a keepalive.
+                    if let Some(id) = reply_handoff_id(&msg.payload) {
+                        if id != expected_handoff_id {
+                            continue;
+                        }
+                    }
                     if predicate(&msg.payload) {
                         return Reply::Matched;
                     }
