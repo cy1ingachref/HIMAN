@@ -102,7 +102,7 @@ pub fn build_agent_with_faults() -> PathBuf {
             "-p",
             "himan-agent-pc",
             "--features",
-            "fault-injection",
+            "fault-injection,insecure-ws-dev",
             "--bin",
             "himan-agent-pc",
         ])
@@ -122,6 +122,35 @@ pub fn build_agent_with_faults() -> PathBuf {
     fault_target.join("debug").join(exe)
 }
 
+/// Build the loopback e2e agent: debug build with `insecure-ws-dev` so it
+/// may speak plain ws:// to the local orchestrator. Separate target dir so
+/// the release binary and the default (strict) build stay clean.
+pub fn build_loopback_agent() -> PathBuf {
+    let root = workspace_root();
+    let target = root.join("target/loopback-agent");
+    let status = Command::new("cargo")
+        .args([
+            "build",
+            "-p",
+            "himan-agent-pc",
+            "--features",
+            "insecure-ws-dev",
+            "--bin",
+            "himan-agent-pc",
+        ])
+        .env("CARGO_TARGET_DIR", &target)
+        .current_dir(&root)
+        .status()
+        .expect("run cargo build for the loopback agent");
+    assert!(status.success(), "failed to build the loopback agent");
+    let exe = if cfg!(windows) {
+        "himan-agent-pc.exe"
+    } else {
+        "himan-agent-pc"
+    };
+    target.join("debug").join(exe)
+}
+
 /// Ensure the default agent binary is built WITHOUT any feature, and return it.
 ///
 /// Cargo features are additive and share one artifact path, so a previous
@@ -130,8 +159,19 @@ pub fn build_agent_with_faults() -> PathBuf {
 /// hook" test hermetic rather than dependent on what ran before it.
 pub fn build_default_agent() -> PathBuf {
     let root = workspace_root();
+    // `insecure-ws-dev` is required for the loopback e2e agent to speak
+    // plain ws:// to the local orchestrator. `fault-injection` is NOT set,
+    // so this binary still proves the "default build has no hooks" test.
     let status = Command::new("cargo")
-        .args(["build", "-p", "himan-agent-pc", "--bin", "himan-agent-pc"])
+        .args([
+            "build",
+            "-p",
+            "himan-agent-pc",
+            "--features",
+            "insecure-ws-dev",
+            "--bin",
+            "himan-agent-pc",
+        ])
         .current_dir(&root)
         .status()
         .expect("run cargo build for himan-agent-pc");
@@ -489,6 +529,8 @@ impl E2ETest {
                 enrollment_file.display().to_string(),
             ),
             ("HIMAN_API_TOKEN".to_string(), API_TOKEN.to_string()),
+            // Loopback e2e: plain HTTP/WS is permitted only here.
+            ("HIMAN_INSECURE_DEV".to_string(), "1".to_string()),
         ];
         if let Some(path) = &self.state_file {
             envs.push(("HIMAN_STATE_FILE".to_string(), path.display().to_string()));
@@ -508,15 +550,14 @@ impl E2ETest {
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-        match wait_for_health(self.port).await {
+        match wait_for_health_child(self.port, Some(&mut orch)).await {
             Ok(key) => {
                 self.orch_key = key;
                 self.orch = orch;
             }
             Err(message) => {
-                let tail = orch.tail(LOG_TAIL_LINES);
                 orch.kill();
-                panic!("{message}\n{tail}");
+                panic!("{message}");
             }
         }
     }
@@ -551,6 +592,8 @@ impl E2ETest {
                 enrollment_file.display().to_string(),
             ),
             ("HIMAN_API_TOKEN".to_string(), API_TOKEN.to_string()),
+            // Loopback e2e: plain HTTP/WS is permitted only here.
+            ("HIMAN_INSECURE_DEV".to_string(), "1".to_string()),
         ];
         if let Some(path) = &self.state_file {
             envs.push(("HIMAN_STATE_FILE".to_string(), path.display().to_string()));
@@ -562,7 +605,7 @@ impl E2ETest {
             envs,
         );
         tokio::time::sleep(std::time::Duration::from_millis(600)).await;
-        match wait_for_health(self.port).await {
+        match wait_for_health_child(self.port, Some(&mut orch)).await {
             Ok(key) => {
                 self.orch_key = key;
                 self.orch = orch;
@@ -608,6 +651,8 @@ impl E2ETest {
                 enrollment_file.display().to_string(),
             ),
             ("HIMAN_API_TOKEN".to_string(), API_TOKEN.to_string()),
+            // Loopback e2e: plain HTTP/WS is permitted only here.
+            ("HIMAN_INSECURE_DEV".to_string(), "1".to_string()),
         ];
         if let Some(path) = &self.state_file {
             envs.push(("HIMAN_STATE_FILE".to_string(), path.display().to_string()));
@@ -621,15 +666,14 @@ impl E2ETest {
         // A process that refuses to start exits immediately; wait briefly so
         // the failure is observed rather than racing the health check.
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-        match wait_for_health(self.port).await {
+        match wait_for_health_child(self.port, Some(&mut orch)).await {
             Ok(key) => {
                 self.orch_key = key;
                 self.orch = orch;
             }
             Err(message) => {
-                let tail = orch.tail(LOG_TAIL_LINES);
                 orch.kill();
-                panic!("{message}\n{tail}");
+                panic!("{message}");
             }
         }
     }
@@ -653,6 +697,8 @@ impl E2ETest {
                 enrollment_file.display().to_string(),
             ),
             ("HIMAN_API_TOKEN".to_string(), API_TOKEN.to_string()),
+            // Loopback e2e: plain HTTP/WS is permitted only here.
+            ("HIMAN_INSECURE_DEV".to_string(), "1".to_string()),
         ];
         if let Some(path) = &self.state_file {
             envs.push(("HIMAN_STATE_FILE".to_string(), path.display().to_string()));
@@ -695,10 +741,11 @@ impl E2ETest {
         ];
         // In dev mode the orchestrator needs no token, and the API routes are
         // open. Setting it anyway would hide a dev-mode regression.
+        // Loopback e2e always permits plain HTTP/WS at the transport layer;
+        // API auth is still controlled by insecure_dev below.
+        envs.push(("HIMAN_INSECURE_DEV".to_string(), "1".to_string()));
         if !insecure_dev {
             envs.push(("HIMAN_API_TOKEN".to_string(), API_TOKEN.to_string()));
-        } else {
-            envs.push(("HIMAN_INSECURE_DEV".to_string(), "1".to_string()));
         }
         envs.extend(extra_envs);
         let mut orch = Child::spawn(
@@ -708,7 +755,7 @@ impl E2ETest {
         );
 
         // Health must answer BEFORE any agent is spawned.
-        match wait_for_health(port).await {
+        match wait_for_health_child(port, Some(&mut orch)).await {
             Ok(orch_key) => Self {
                 orch,
                 agents: Vec::new(),
@@ -735,10 +782,7 @@ impl E2ETest {
 
     /// The agent binary spawned by this harness.
     pub fn agent_binary(&self) -> PathBuf {
-        self.agent_bin
-            .clone()
-            .or_else(|| binary("himan-agent-pc"))
-            .expect("build himan-agent-pc first")
+        self.agent_bin.clone().unwrap_or_else(build_loopback_agent)
     }
 
     /// Drive the `fault-injection` agent build instead of the default one.
@@ -978,6 +1022,35 @@ impl E2ETest {
     /// `extra_envs` is how a test makes a device behave a specific way (for
     /// example `HIMAN_TEST_NEVER_READY=1` for the rollback scenario) without
     /// changing the agent's production defaults.
+    /// Spawn an agent and wait at most `timeout_secs` for registration.
+    /// For tests that expect registration to FAIL (revoked device), use a
+    /// short timeout instead of the 60 s hard timeout.
+    // Allow 8 args: the bounded variant intentionally mirrors spawn_agent_full
+    // plus one timeout. Keeping the signatures parallel is clearer than a
+    // parameter struct used by only these two helpers.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn spawn_agent_full_bounded(
+        &mut self,
+        orch_port: u16,
+        device_id: &str,
+        agent_key_file: &Path,
+        orch_key: &str,
+        extra_args: Vec<String>,
+        extra_envs: Vec<(String, String)>,
+        timeout_secs: u64,
+    ) -> Result<Value, String> {
+        self.spawn_agent_full_inner(
+            orch_port,
+            device_id,
+            agent_key_file,
+            orch_key,
+            extra_args,
+            extra_envs,
+            timeout_secs,
+        )
+        .await
+    }
+
     pub async fn spawn_agent_full(
         &mut self,
         orch_port: u16,
@@ -986,6 +1059,29 @@ impl E2ETest {
         orch_key: &str,
         extra_args: Vec<String>,
         extra_envs: Vec<(String, String)>,
+    ) -> Result<Value, String> {
+        self.spawn_agent_full_inner(
+            orch_port,
+            device_id,
+            agent_key_file,
+            orch_key,
+            extra_args,
+            extra_envs,
+            HARD_TIMEOUT.as_secs(),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn spawn_agent_full_inner(
+        &mut self,
+        orch_port: u16,
+        device_id: &str,
+        agent_key_file: &Path,
+        orch_key: &str,
+        extra_args: Vec<String>,
+        extra_envs: Vec<(String, String)>,
+        timeout_secs: u64,
     ) -> Result<Value, String> {
         let mut args = vec!["--ws".to_string(), format!("ws://127.0.0.1:{orch_port}/ws")];
         args.extend(extra_args);
@@ -1001,7 +1097,13 @@ impl E2ETest {
         let mut child = Child::spawn(&self.agent_binary(), args, envs);
 
         let expected = self.agents.len() + 1;
-        match wait_for_registration(orch_port, expected, HARD_TIMEOUT).await {
+        match wait_for_registration(
+            orch_port,
+            expected,
+            std::time::Duration::from_secs(timeout_secs),
+        )
+        .await
+        {
             Ok(agents) => {
                 self.agent_ids.push(device_id.to_string());
                 self.agents.push(child);
@@ -1082,8 +1184,33 @@ fn generate_agent_key(agent_bin: &Path, key_file: &Path) -> (String, PathBuf) {
 /// Poll `GET /health` every 100 ms until it answers 200, then return the
 /// orchestrator's advertised verifying key from the same response.
 async fn wait_for_health(port: u16) -> Result<String, String> {
+    wait_for_health_child(port, None).await
+}
+
+/// Poll `/health` with a bounded backoff until the orchestrator answers.
+///
+/// When the child handle is given, a process that has already exited is
+/// detected immediately instead of burning the whole deadline on a dead
+/// process (the durable_audit CI flake: the child died on EADDRINUSE and
+/// the wait polled nothing for 60 s). The backoff starts at 50 ms and caps
+/// at 500 ms, so a slow-but-alive startup is still given the full window.
+async fn wait_for_health_child(port: u16, child: Option<&mut Child>) -> Result<String, String> {
     let deadline = Instant::now() + HARD_TIMEOUT;
+    let mut delay = Duration::from_millis(50);
+    let mut attempts = 0u32;
+    let mut child = child;
     loop {
+        attempts += 1;
+        // A dead child will never answer: fail fast with its own output.
+        if let Some(c) = child.as_deref_mut() {
+            if let Some(code) = c.try_wait() {
+                return Err(format!(
+                    "orchestrator on port {port} exited with code {code:?} before answering \
+                     /health (after {attempts} attempts)\n{}",
+                    c.tail(LOG_TAIL_LINES)
+                ));
+            }
+        }
         let url = format!("http://127.0.0.1:{port}/health");
         if let Ok(response) = ureq::get(&url).call() {
             if response.status() == 200 {
@@ -1096,12 +1223,19 @@ async fn wait_for_health(port: u16) -> Result<String, String> {
             }
         }
         if Instant::now() >= deadline {
+            let tail = child
+                .as_deref_mut()
+                .map(|c| c.tail(LOG_TAIL_LINES))
+                .unwrap_or_default();
             return Err(format!(
-                "orchestrator on port {port} did not answer GET /health within {}s",
-                HARD_TIMEOUT.as_secs()
+                "orchestrator on port {port} did not answer GET /health within {}s \
+                 ({attempts} attempts, last backoff {}ms)\n{tail}",
+                HARD_TIMEOUT.as_secs(),
+                delay.as_millis()
             ));
         }
-        tokio::time::sleep(POLL_INTERVAL).await;
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(Duration::from_millis(500));
     }
 }
 

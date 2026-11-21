@@ -35,3 +35,6 @@ tempfile = "3"
 # must not contain the switches that make a real device refuse to answer a
 # handoff. The e2e tests and the CI e2e job enable it explicitly.
 fault-injection = []
+# Debug-only escape hatch for loopback development against a plain ws://
+# orchestrator. NEVER enabled in a release build (see INSECURE_WS_ALLOWED).
+insecure-ws-dev = []

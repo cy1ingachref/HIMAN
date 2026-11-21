@@ -4,7 +4,7 @@ Secure Multi-Device AI Agent Orchestration — a zero-trust architecture for
 autonomous cross-device task execution, with an embodied 3D character.
 
 Repository: https://github.com/cy1ingachref/HIMAN
-Phase: 3 — Phone and handoff (in progress, 301 tests); Phase 2 planner exit check met
+Phase: 3 — Phone and handoff (in progress, 304 tests); Phase 2 exit checklist met (docs/PHASE2_EXIT.md)
 
 ## What this is
 

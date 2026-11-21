@@ -324,16 +324,32 @@ async fn the_event_seq_continues_after_a_restart() {
         "too few events before restart: {seq_before:?}"
     );
 
-    harness.restart_orchestrator().await;
+    // Freeze the scenario: kill the device that is still issuing steps so
+    // no new event can land between this snapshot and the restart. Otherwise
+    // a step finishing in that window adds a seq and makes the comparison
+    // fail for a reason unrelated to durability (seen in CI 44844753055).
+    harness.kill_agent(A);
+    harness.restart_orchestrator_nowait().await;
+    harness.wait_for_registration(1, 15).await;
 
     // The durable log is loaded back, so the seq continues rather than resets.
+    // A step already in flight when the agent was killed may commit one more
+    // event just after the snapshot; that is legitimate. What must hold is
+    // that NOTHING was lost (every pre-restart seq is still present) and the
+    // reloaded log is contiguous and starts where it did before.
     let after = common::http_get_json(port, &format!("/api/v1/tasks/{task_id}/events"));
     let seqs_after = after["seqs"].as_array().expect("seqs").to_vec();
-    assert_eq!(
-        seqs_after.len(),
-        seq_before.len(),
-        "the event log was lost across the restart: {seq_before:?} -> {seqs_after:?}"
+    assert!(
+        seqs_after.len() >= seq_before.len(),
+        "the event log lost entries across the restart: {seq_before:?} -> {seqs_after:?}"
     );
+    for (i, seq) in seq_before.iter().enumerate() {
+        assert_eq!(
+            seqs_after.get(i),
+            Some(seq),
+            "a pre-restart event was lost or reordered: {seq_before:?} -> {seqs_after:?}"
+        );
+    }
     assert_eq!(seqs_after[0], seq_before[0], "the seq restarted at 1");
     assert_eq!(
         after["contiguous"],

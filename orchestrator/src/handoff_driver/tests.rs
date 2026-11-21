@@ -200,6 +200,65 @@ async fn a_silent_target_never_sends_ready_so_the_handoff_does_not_commit() {
 }
 
 #[tokio::test]
+async fn a_ready_for_a_different_handoff_does_not_advance_this_one() {
+    // The target answers with a HandoffReady naming ANOTHER handoff (an old
+    // aborted attempt, or a forged frame). The driver must not treat it as
+    // agreement to this procedure: it keeps waiting and times out.
+    let key = SigningKey::generate();
+    let (drv_target, peer_target) = Mailbox::pair(4);
+    let (drv_source, _peer_source) = Mailbox::pair(4);
+    tokio::spawn(async move {
+        let mut m = peer_target;
+        while let crate::handoff_driver::InboundEvent::Message(msg) = m.inbound.recv().await {
+            if msg.payload.kind_name() == "handoff_prepare" {
+                let meta = WireMeta {
+                    seq: 1,
+                    ts: 1_700_000_000,
+                    from: DeviceId::new("phone-1"),
+                    to: "orchestrator".into(),
+                };
+                let out = WireMessage::sign(
+                    meta,
+                    Payload::HandoffReady {
+                        handoff_id: "h-OTHER".into(),
+                        applied_seq: 5,
+                        capabilities: "full".into(),
+                    },
+                    &SigningKey::generate(),
+                )
+                .unwrap();
+                let _ = m.outbound.send(out).await;
+            }
+        }
+    });
+
+    let outcome = HandoffDriver::new(
+        Handoff::prepared(
+            "h-mine",
+            TaskId::new("t1"),
+            DeviceId::new("pc-1"),
+            DeviceId::new("phone-1"),
+            0,
+            0,
+            0,
+        ),
+        drv_source,
+        drv_target,
+        fast_timeouts(),
+        RetryPolicy::default(),
+    )
+    .run(&token("t1", "pc-1", "phone-1"), 5, signer(&key), || 0)
+    .await;
+
+    assert_ne!(outcome.state, HandoffState::Active);
+    assert!(
+        !outcome.committed,
+        "a ready for another handoff advanced this one"
+    );
+    assert!(outcome.reason.unwrap().contains("HandoffReady"));
+}
+
+#[tokio::test]
 async fn a_silent_target_after_the_commit_is_retried_then_failed() {
     let key = SigningKey::generate();
     let (drv_target, peer_target) = Mailbox::pair(4);
