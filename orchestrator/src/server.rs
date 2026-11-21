@@ -756,7 +756,7 @@ fn tls_config(cert_path: &str, key_path: &str) -> Result<rustls::ServerConfig, S
         .map_err(|e| format!("invalid TLS material: {e}"))
 }
 
-/// Bind the loopback listener with SO_REUSEADDR.
+/// Bind the loopback listener with the platform-appropriate reuse option.
 ///
 /// Root cause of the durable_audit CI flake (run 44587040931): after a
 /// restart the old process's accepted connections linger in TIME_WAIT on
@@ -766,18 +766,64 @@ fn tls_config(cert_path: &str, key_path: &str) -> Result<rustls::ServerConfig, S
 /// over those lingering sockets — the standard, safe behavior for a server
 /// that owns its port (it does NOT allow two live listeners; that still
 /// fails, which is correct).
-async fn bind_reuse_addr(port: u16) -> Result<tokio::net::TcpListener, std::io::Error> {
+///
+/// Bind a loopback std listener with the platform's safe reuse option.
+///
+/// Unix: SO_REUSEADDR, so a restart binds over lingering TIME_WAIT sockets.
+/// Windows: SO_EXCLUSIVEADDRUSE, so a second live process CANNOT bind the
+/// port (Windows' SO_REUSEADDR would allow exactly that hijack).
+pub fn bind_loopback(port: u16) -> std::io::Result<std::net::TcpListener> {
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     let socket = socket2::Socket::new(
         socket2::Domain::IPV4,
         socket2::Type::STREAM,
         Some(socket2::Protocol::TCP),
     )?;
-    socket.set_reuse_address(true)?;
     socket.set_nonblocking(true)?;
+    set_platform_reuse(&socket)?;
     socket.bind(&addr.into())?;
     socket.listen(1024)?;
-    tokio::net::TcpListener::from_std(std::net::TcpListener::from(socket))
+    Ok(std::net::TcpListener::from(socket))
+}
+
+/// The socket reuse option for this platform.
+///
+/// Unix: SO_REUSEADDR — a restart binds over lingering TIME_WAIT sockets.
+/// Windows: SO_EXCLUSIVEADDRUSE — a second live process CANNOT bind the
+/// port. Windows' SO_REUSEADDR would allow exactly that hijack, so it is
+/// deliberately not used there.
+#[cfg(unix)]
+fn set_platform_reuse(socket: &socket2::Socket) -> std::io::Result<()> {
+    socket.set_reuse_address(true)
+}
+
+#[cfg(windows)]
+fn set_platform_reuse(socket: &socket2::Socket) -> std::io::Result<()> {
+    // SO_EXCLUSIVEADDRUSE = 0x0000000B. Windows' SO_REUSEADDR would let a
+    // second live process steal the port; this option refuses that.
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{
+        setsockopt, SOCKET, SOCKET_ERROR, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+    };
+    let opt: i32 = 1;
+    let rc = unsafe {
+        setsockopt(
+            socket.as_raw_socket() as SOCKET,
+            SOL_SOCKET,
+            SO_EXCLUSIVEADDRUSE,
+            &opt as *const i32 as *const u8,
+            std::mem::size_of::<i32>() as i32,
+        )
+    };
+    if rc == SOCKET_ERROR {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+async fn bind_reuse_addr(port: u16) -> Result<tokio::net::TcpListener, std::io::Error> {
+    let listener = bind_loopback(port)?;
+    tokio::net::TcpListener::from_std(listener)
 }
 
 #[cfg(test)]
