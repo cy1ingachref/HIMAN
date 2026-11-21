@@ -67,6 +67,53 @@ fn workspace_root() -> PathBuf {
 /// Resolve a workspace binary, returning `None` when it has not been built
 /// yet. The tests require `cargo build --workspace` first; a missing binary is
 /// a broken setup, and the caller decides how to report it.
+/// Is a process with this pid alive?
+#[cfg(windows)]
+pub fn pid_is_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle == INVALID_HANDLE_VALUE || handle.is_null() {
+            return false;
+        }
+        let _ = CloseHandle(handle);
+        true
+    }
+}
+
+/// Is a process with this pid alive?
+#[cfg(unix)]
+pub fn pid_is_alive(pid: u32) -> bool {
+    unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+/// Count live orchestrator processes, so a test can assert a child died.
+#[cfg(windows)]
+pub fn count_orchestrators() -> usize {
+    use std::process::Command;
+    let out = Command::new("tasklist")
+        .args(["/FI", "IMAGENAME eq himan-orchestrator.exe", "/NH"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default();
+    out.lines()
+        .filter(|l| l.contains("himan-orchestrator"))
+        .count()
+}
+
+#[cfg(unix)]
+pub fn count_orchestrators() -> usize {
+    use std::process::Command;
+    let out = Command::new("pgrep")
+        .arg("-f")
+        .arg("himan-orchestrator")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default();
+    out.lines().filter(|l| !l.trim().is_empty()).count()
+}
+
 pub fn binary(name: &str) -> Option<PathBuf> {
     let exe = if cfg!(windows) {
         format!("{name}.exe")
@@ -261,6 +308,21 @@ pub struct Child {
     out: PathBuf,
     err: PathBuf,
     _dir: tempfile::TempDir,
+    /// Windows Job Object that kills the child when the last handle closes,
+    /// so a panicking or timed-out test cannot leak an orchestrator.
+    #[cfg(windows)]
+    job: std::os::windows::raw::HANDLE,
+}
+
+impl Drop for Child {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        #[cfg(windows)]
+        if !self.job.is_null() {
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(self.job) };
+        }
+    }
 }
 
 impl Child {
@@ -293,11 +355,45 @@ impl Child {
                 std::fs::File::create(&err).expect("create child stderr file"),
             ));
         let child = cmd.spawn().expect("spawn child process");
+        #[cfg(windows)]
+        let job = unsafe {
+            use std::os::windows::io::AsRawHandle;
+            let job = windows_sys::Win32::System::JobObjects::CreateJobObjectW(
+                std::ptr::null(),
+                std::ptr::null(),
+            );
+            if job.is_null() {
+                std::ptr::null_mut()
+            } else {
+                let mut info: windows_sys::Win32::System::JobObjects::JOBOBJECT_EXTENDED_LIMIT_INFORMATION =
+                    std::mem::zeroed();
+                info.BasicLimitInformation.LimitFlags =
+                    windows_sys::Win32::System::JobObjects::JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                let ok = windows_sys::Win32::System::JobObjects::SetInformationJobObject(
+                    job,
+                    windows_sys::Win32::System::JobObjects::JobObjectExtendedLimitInformation,
+                    &info as *const _ as *const _,
+                    std::mem::size_of_val(&info) as u32,
+                );
+                let assigned = windows_sys::Win32::System::JobObjects::AssignProcessToJobObject(
+                    job,
+                    child.as_raw_handle(),
+                );
+                if ok == 0 || assigned == 0 {
+                    windows_sys::Win32::Foundation::CloseHandle(job);
+                    std::ptr::null_mut()
+                } else {
+                    job
+                }
+            }
+        };
         Self {
             child,
             out,
             err,
             _dir: dir,
+            #[cfg(windows)]
+            job,
         }
     }
 
