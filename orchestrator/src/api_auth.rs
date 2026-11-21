@@ -92,7 +92,13 @@ pub async fn require_token(
     let ip = request
         .extensions()
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-        .map(|c| c.0.ip());
+        .map(|c| c.0.ip())
+        .or_else(|| {
+            request
+                .extensions()
+                .get::<axum::extract::ConnectInfo<crate::server::TlsConnectInfo>>()
+                .map(|c| c.0 .0.ip())
+        });
     let presented = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())

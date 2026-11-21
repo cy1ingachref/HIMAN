@@ -2,6 +2,10 @@ use himan_orchestrator::{serve, Hub, HubConfig};
 
 #[tokio::main]
 async fn main() {
+    // Exactly one rustls provider must be installed: feature unification
+    // with tokio-tungstenite/reqwest enables both ring and aws-lc-rs, which
+    // makes rustls' automatic selection ambiguous.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     himan_orchestrator::init_logging();
 
     // Fail closed: refuse to start with the API open or no enrollment unless

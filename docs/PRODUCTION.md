@@ -26,14 +26,11 @@ not implemented and tested.
 
 ## Missing features (NOT implemented — do not claim these)
 
-1. **TLS / WSS.** The transport is plain `ws://` and HTTP. There is no
-   TLS listener, no certificate handling, no `wss://` support. On an
-   untrusted network the signatures prove authenticity but NOT
-   confidentiality: tool args, results, device status and audit content
-   are readable by any observer. Required: a TLS terminator (reverse
-   proxy with a real certificate) or native rustls listeners on both
-   ends, plus `wss://` in the agent URL. Until then, HIMAN is
-   loopback-only by design.
+1. ~~**TLS / WSS.**~~ CLOSED (RT-21): the orchestrator terminates TLS
+   natively (HIMAN_TLS_CERT / HIMAN_TLS_KEY) and the agent connects over
+   `wss://`, verifying the server certificate against HIMAN_TLS_CA_PEM.
+   Plain HTTP/WS is refused unless HIMAN_INSECURE_DEV=1. A reverse proxy is
+   now an optional deployment choice, not a requirement.
 2. **Token rotation.** `HIMAN_API_TOKEN` is a static pre-shared secret.
    No rotation endpoint, no overlap window, no per-client tokens. A
    leaked token is valid until the operator changes the env and restarts.
@@ -61,8 +58,8 @@ segment. Before any untrusted-network use, in order:
 5. ~~Rate limiting + lockout on the API.~~ CLOSED (RT-17).
 6. Decide audit-log access scope.
 
-Remaining hard blocker: item 1. The agent now refuses plain ws:// by
-default and a CI guard keeps the release binary free of the dev escape
-hatch, but actual termination still sits with a reverse proxy. The rest
-is operational practice. This list is the input to the next phase's
-networking work, not a claim that any of it is done.
+No hard blockers remain: TLS termination, device revocation and API rate
+limiting are all closed and mutation-checked. What is still not
+production-ready: static API token with no rotation, no audit-log access
+scoping decision, and enrollment is still an out-of-band file. This list is
+operational practice, not a claim that the networking phase is done.

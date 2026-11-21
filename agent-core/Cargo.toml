@@ -20,6 +20,8 @@ tracing-subscriber.workspace = true
 futures-util = "0.3"
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rustls = { version = "0.23", features = ["ring"] }
+base64 = "0.22"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "macros"] }

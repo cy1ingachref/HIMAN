@@ -20,6 +20,56 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use crate::transport::{Connection, Shutdown, TransportError};
 use himan_proto::WireMessage;
 
+/// Minimal PEM block reader: base64-decode the body between BEGIN/END.
+///
+/// Kept in-tree so `rustls-pemfile` (unmaintained, RUSTSEC-2025-0134) is
+/// not a dependency.
+fn pem_blocks(text: &str, label: &str) -> Vec<Vec<u8>> {
+    use base64::Engine;
+    let begin = format!("-----BEGIN {label}-----");
+    let end = format!("-----END {label}-----");
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find(&begin) {
+        let after = &rest[start + begin.len()..];
+        let Some(stop) = after.find(&end) else { break };
+        let compact: String = after[..stop]
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(compact) {
+            out.push(bytes);
+        }
+        rest = &after[stop + end.len()..];
+    }
+    out
+}
+
+/// rustls client config that trusts exactly the supplied CA certificate.
+fn tls_client_config(ca_pem_path: &str) -> Result<rustls::ClientConfig, TransportError> {
+    use rustls::pki_types::CertificateDer;
+    let pem = std::fs::read_to_string(ca_pem_path)
+        .map_err(|e| TransportError::WebSocket(format!("read CA {ca_pem_path}: {e}")))?;
+    let certs: Vec<CertificateDer<'static>> = pem_blocks(&pem, "CERTIFICATE")
+        .into_iter()
+        .map(CertificateDer::from)
+        .collect();
+    if certs.is_empty() {
+        return Err(TransportError::WebSocket(format!(
+            "no CA certificate in {ca_pem_path}"
+        )));
+    }
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in certs {
+        roots
+            .add(cert)
+            .map_err(|e| TransportError::WebSocket(format!("invalid CA certificate: {e}")))?;
+    }
+    Ok(rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth())
+}
+
 /// A WebSocket connection to an orchestrator.
 ///
 /// `sink` is mutex-guarded because writes are serialized. `stream` is not
@@ -42,6 +92,33 @@ pub type SocketStream = futures_util::stream::SplitStream<
 >;
 
 impl WsTransport {
+    /// Connect over TLS (wss://), verifying the server certificate against
+    /// the CA/certificate PEM at `ca_pem_path`.
+    ///
+    /// Verification is NEVER disabled: the roots are exactly the supplied
+    /// CA, so a certificate from any other CA is refused. Pinning (the
+    /// orchestrator signing key) and enrollment are separate layers and
+    /// remain in force on top of TLS.
+    pub async fn connect_tls(url: &str, ca_pem_path: &str) -> Result<Self, TransportError> {
+        if !url.starts_with("wss://") {
+            return Err(TransportError::WebSocket(format!(
+                "connect_tls requires a wss:// URL, got {url:?}"
+            )));
+        }
+        let config = tls_client_config(ca_pem_path)?;
+        let connector = tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(config));
+        let (socket, _response) = tokio_tungstenite::connect_async_tls_with_config(
+            tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(url)
+                .map_err(|e| TransportError::WebSocket(e.to_string()))?,
+            None,
+            false,
+            Some(connector),
+        )
+        .await
+        .map_err(|e| TransportError::WebSocket(e.to_string()))?;
+        Ok(Self::from_socket(socket))
+    }
+
     /// Connect to `url` (e.g. `ws://127.0.0.1:8787/ws`) and split the socket.
     pub async fn connect(url: &str) -> Result<Self, TransportError> {
         let (socket, _response) = tokio_tungstenite::connect_async(url)

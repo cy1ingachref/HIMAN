@@ -1211,8 +1211,8 @@ async fn wait_for_health_child(port: u16, child: Option<&mut Child>) -> Result<S
                 ));
             }
         }
-        let url = format!("http://127.0.0.1:{port}/health");
-        if let Ok(response) = ureq::get(&url).call() {
+        let url = format!("{}://127.0.0.1:{port}/health", base_scheme());
+        if let Ok(response) = agent().get(&url).call() {
             if response.status() == 200 {
                 let body = response.into_string().unwrap_or_default();
                 let value: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
@@ -1244,8 +1244,9 @@ async fn wait_for_health_child(port: u16, child: Option<&mut Child>) -> Result<S
 async fn wait_for_registration(port: u16, count: usize, hard: Duration) -> Result<Value, String> {
     let deadline = Instant::now() + hard;
     loop {
-        let url = format!("http://127.0.0.1:{port}/api/v1/agents");
-        if let Ok(response) = ureq::get(&url)
+        let url = format!("{}://127.0.0.1:{port}/api/v1/agents", base_scheme());
+        if let Ok(response) = agent()
+            .get(&url)
             .set("Authorization", &format!("Bearer {API_TOKEN}"))
             .call()
         {
@@ -1269,8 +1270,9 @@ async fn wait_for_registration(port: u16, count: usize, hard: Duration) -> Resul
 
 /// `GET` a JSON route on the test orchestrator with the harness token.
 pub fn http_get_json(port: u16, path: &str) -> Value {
-    let url = format!("http://127.0.0.1:{port}{path}");
-    let body = ureq::get(&url)
+    let url = format!("{}://127.0.0.1:{port}{path}", base_scheme());
+    let body = agent()
+        .get(&url)
         .set("Authorization", &format!("Bearer {API_TOKEN}"))
         .call()
         .expect("GET")
@@ -1281,9 +1283,134 @@ pub fn http_get_json(port: u16, path: &str) -> Value {
 
 /// `GET` a JSON route and return `(status, body)`, so a test can assert a
 /// refusal without panicking.
+/// The CA the harness uses for TLS, if the orchestrator was started with
+/// HIMAN_TLS_CERT/KEY. HTTP helpers then speak https:// with this CA.
+pub fn test_ca() -> Option<PathBuf> {
+    std::env::var("HIMAN_TEST_TLS_CA")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .map(PathBuf::from)
+}
+
+/// When set, the harness's own HTTP client (test infrastructure, NOT the
+/// agent) accepts a server certificate whose hostname does not match, so a
+/// negative test can stand up a mismatched-hostname orchestrator and still
+/// probe it. The agent under test never gets this latitude: its verification
+/// is unconditional.
+fn harness_lax_hostname() -> bool {
+    std::env::var("HIMAN_TEST_TLS_LAX_HOSTNAME").as_deref() == Ok("1")
+}
+
+fn tls_agent(ca: &Path) -> ureq::Agent {
+    use rustls::pki_types::CertificateDer;
+    // Feature unification (reqwest/tokio-tungstenite enable aws-lc-rs too)
+    // makes rustls' automatic provider selection ambiguous; pick ring.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let pem = std::fs::read_to_string(ca).expect("CA PEM");
+    let mut roots = rustls::RootCertStore::empty();
+    for block in pem.split("-----BEGIN CERTIFICATE-----").skip(1) {
+        let body = block
+            .split("-----END CERTIFICATE-----")
+            .next()
+            .unwrap_or("");
+        let compact: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+        use base64::Engine;
+        if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(compact) {
+            let _ = roots.add(CertificateDer::from(bytes));
+        }
+    }
+    let config = if harness_lax_hostname() {
+        rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(std::sync::Arc::new(LaxHostnameVerifier::new()))
+            .with_no_client_auth()
+    } else {
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth()
+    };
+    ureq::AgentBuilder::new()
+        .tls_config(std::sync::Arc::new(config))
+        .build()
+}
+
+/// Verifies the handshake but not the hostname. Used ONLY by the test
+/// harness's own HTTP client (`orchestrator/tests/common/mod.rs`) so a
+/// negative test can stand up a mismatched-hostname server and still probe
+/// it; gated by HIMAN_TEST_TLS_LAX_HOSTNAME, which the agent never sets.
+/// The agent under test (agent-core / agent-pc) has no such path — its
+/// certificate verification is unconditional.
+#[derive(Debug)]
+struct LaxHostnameVerifier(std::sync::Arc<rustls::crypto::CryptoProvider>);
+
+impl LaxHostnameVerifier {
+    fn new() -> Self {
+        Self(std::sync::Arc::new(rustls::crypto::ring::default_provider()))
+    }
+}
+
+impl rustls::client::danger::ServerCertVerifier for LaxHostnameVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+/// The base URL scheme the harness should use for this orchestrator.
+pub fn base_scheme() -> &'static str {
+    if test_ca().is_some() {
+        "https"
+    } else {
+        "http"
+    }
+}
+
+fn agent() -> ureq::Agent {
+    match test_ca() {
+        Some(ca) => tls_agent(&ca),
+        None => ureq::AgentBuilder::new().build(),
+    }
+}
+
 pub fn http_get(port: u16, path: &str) -> (u16, Value) {
-    let url = format!("http://127.0.0.1:{port}{path}");
-    match ureq::get(&url)
+    let url = format!("{}://127.0.0.1:{port}{path}", base_scheme());
+    match agent()
+        .get(&url)
         .set("Authorization", &format!("Bearer {API_TOKEN}"))
         .call()
     {
@@ -1303,8 +1430,9 @@ pub fn http_get(port: u16, path: &str) -> (u16, Value) {
 /// `POST` a JSON body to a route on the test orchestrator with the harness
 /// token and return the parsed response.
 pub fn http_post_json(port: u16, path: &str, body: Value) -> Value {
-    let url = format!("http://127.0.0.1:{port}{path}");
-    match ureq::post(&url)
+    let url = format!("{}://127.0.0.1:{port}{path}", base_scheme());
+    match agent()
+        .post(&url)
         .set("Authorization", &format!("Bearer {API_TOKEN}"))
         .send_json(body)
     {
@@ -1322,8 +1450,9 @@ pub fn http_post_json(port: u16, path: &str, body: Value) -> Value {
 /// `POST` a JSON body and return `(status, body)`, so a test can assert a
 /// refusal without panicking.
 pub fn http_post(port: u16, path: &str, body: Value) -> (u16, Value) {
-    let url = format!("http://127.0.0.1:{port}{path}");
-    match ureq::post(&url)
+    let url = format!("{}://127.0.0.1:{port}{path}", base_scheme());
+    match agent()
+        .post(&url)
         .set("Authorization", &format!("Bearer {API_TOKEN}"))
         .send_json(body)
     {
