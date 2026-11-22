@@ -39,7 +39,10 @@ fn harness_abort_helper() {
         std::fs::write(path, child.id().to_string()).expect("write pid");
     }
     // Bounded idle: a failing parent assertion must not hang the suite.
+    #[cfg(windows)]
     std::thread::sleep(Duration::from_secs(15));
+    #[cfg(not(windows))]
+    std::thread::sleep(std::time::Duration::from_secs(15));
     child.kill();
 }
 
