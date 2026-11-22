@@ -19,7 +19,7 @@ async-trait = "0.1"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-sysinfo = "0.32"
+sysinfo = "0.40"
 chrono.workspace = true
 rand.workspace = true
 tokio = { workspace = true, features = ["full"] }
