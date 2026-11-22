@@ -38,6 +38,8 @@ pub struct AppState {
     pub ws_limits: WsLimits,
     /// Caps concurrent WebSocket connections.
     pub ws_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Shared rate limiter, also applied to tokenless routes (RT-22).
+    pub limiter: std::sync::Arc<crate::api_auth::RateLimiter>,
 }
 
 #[derive(Debug, Serialize)]
@@ -103,6 +105,7 @@ pub fn router(hub: Arc<Hub>, _config: HubConfig) -> Router {
         ws_semaphore: Arc::new(tokio::sync::Semaphore::new(
             WsLimits::default().max_connections,
         )),
+        limiter: std::sync::Arc::new(crate::api_auth::RateLimiter::new()),
     };
     Router::new()
         .route("/health", get(health))
@@ -110,6 +113,10 @@ pub fn router(hub: Arc<Hub>, _config: HubConfig) -> Router {
         .route("/api/v1/audit", get(audit_log))
         .route("/api/v1/prompt", post(prompt))
         .route("/api/v1/handoff", post(handoff))
+        // Pairing is deliberately unauthenticated: the device has no token
+        // yet. It is rate-limited like every other HTTP route and the code
+        // is single-use, short-lived and stored only as a hash.
+        .route("/api/v1/enroll/redeem", post(redeem_enroll_code))
         .route("/api/v1/tasks/{task_id}/owner", get(task_owner))
         .route("/api/v1/tasks/{task_id}/record", get(task_record))
         .route("/api/v1/tasks/{task_id}/events", get(task_events))
@@ -133,6 +140,7 @@ pub fn router_with_auth(
         ws_semaphore: Arc::new(tokio::sync::Semaphore::new(
             WsLimits::default().max_connections,
         )),
+        limiter: std::sync::Arc::new(crate::api_auth::RateLimiter::new()),
     };
 
     let api = Router::new()
@@ -144,6 +152,8 @@ pub fn router_with_auth(
         .route("/tasks/{task_id}/record", get(task_record))
         .route("/tasks/{task_id}/events", get(task_events))
         .route("/devices/revoked", get(revoked_devices))
+        .route("/admin/enroll-codes", post(create_enroll_code))
+        .route("/enroll/redeem", post(redeem_enroll_code))
         .route("/devices/{device_id}/revoke", post(revoke_device))
         .route_layer(axum::middleware::from_fn_with_state(
             (
@@ -170,6 +180,7 @@ pub fn router_with_limits(hub: Arc<Hub>, limits: WsLimits) -> Router {
         hub,
         ws_limits: limits.clone(),
         ws_semaphore: Arc::new(tokio::sync::Semaphore::new(limits.max_connections)),
+        limiter: std::sync::Arc::new(crate::api_auth::RateLimiter::new()),
     };
     Router::new()
         .route("/health", get(health))
@@ -177,6 +188,10 @@ pub fn router_with_limits(hub: Arc<Hub>, limits: WsLimits) -> Router {
         .route("/api/v1/audit", get(audit_log))
         .route("/api/v1/prompt", post(prompt))
         .route("/api/v1/handoff", post(handoff))
+        // Pairing is deliberately unauthenticated: the device has no token
+        // yet. It is rate-limited like every other HTTP route and the code
+        // is single-use, short-lived and stored only as a hash.
+        .route("/api/v1/enroll/redeem", post(redeem_enroll_code))
         .route("/api/v1/tasks/{task_id}/owner", get(task_owner))
         .route("/api/v1/tasks/{task_id}/record", get(task_record))
         .route("/api/v1/tasks/{task_id}/events", get(task_events))
@@ -315,6 +330,96 @@ async fn handoff(
                 .into_response()
         }
     }
+}
+
+/// Mint a single-use pairing code (RT-22). Authenticated admin route.
+async fn create_enroll_code(
+    State(state): State<AppState>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let device = body["device"].as_str().unwrap_or("").to_string();
+    let role = body["role"].as_str().unwrap_or("pc").to_string();
+    let ttl = body["ttl_secs"]
+        .as_u64()
+        .unwrap_or(crate::enrollment_codes::DEFAULT_TTL_SECS);
+    if device.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "device is required"})),
+        );
+    }
+    let code = state.hub.create_enrollment_code(&device, &role, ttl).await;
+    // What a phone pins: the orchestrator signing key and the TLS CA
+    // fingerprint, so a QR/deep link carries {url, code, fingerprint}.
+    let fingerprint = state.hub.fingerprint().await;
+    let link = format!(
+        "himan://pair?device={}&code={}&fingerprint={}",
+        urlencode(&device),
+        urlencode(&code),
+        urlencode(&fingerprint)
+    );
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "code": code,
+            "link": link,
+            "fingerprint": fingerprint,
+            "device": device,
+            "role": role,
+            "ttl_secs": ttl,
+            "used": false,
+        })),
+    )
+}
+
+/// Redeem a pairing code and enroll the device's key (RT-22).
+async fn redeem_enroll_code(
+    State(state): State<AppState>,
+    connect: axum::extract::ConnectInfo<std::net::SocketAddr>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    // The rate limiter applies to pairing too (RT-22): a tokenless route must
+    // not be an unlimited oracle for code guessing.
+    let ip = connect.0.ip();
+    if state.limiter.is_ip_locked(ip) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({"error": "too many failed attempts; locked out"})),
+        );
+    }
+    let code = body["code"].as_str().unwrap_or("").to_string();
+    let device = body["device"].as_str().unwrap_or("").to_string();
+    let hello_key = body["hello_key"].as_str().unwrap_or("").to_string();
+    match state
+        .hub
+        .redeem_enrollment_code(&code, &device, &hello_key)
+        .await
+    {
+        Ok(()) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({"enrolled": device, "ok": true})),
+        ),
+        Err(e) => {
+            state.limiter.record_pairing_failure(ip);
+            (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+        }
+    }
+}
+
+fn urlencode(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 /// List revoked device ids.
