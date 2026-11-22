@@ -403,6 +403,11 @@ impl Child {
         let _ = self.child.wait();
     }
 
+    /// The child's pid, for tests that assert liveness.
+    pub fn id(&self) -> u32 {
+        self.child.id()
+    }
+
     /// The exit code once the process has exited, or `None` if it is still
     /// running.
     pub fn try_wait(&mut self) -> Option<i32> {
