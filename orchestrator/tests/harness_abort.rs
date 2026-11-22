@@ -16,7 +16,9 @@
 
 mod common;
 
+#[cfg(windows)]
 use std::process::Command;
+#[cfg(windows)]
 use std::time::{Duration, Instant};
 
 /// Helper: spawn a long-lived child through the harness `Child`, record its
@@ -121,10 +123,11 @@ fn kill_pid(pid: u32) -> std::io::Result<()> {
 #[test]
 fn rt25_unix_has_no_kill_on_death_backstop() {
     // PR_SET_PDEATHSIG would need a per-child syscall and still does not fire
-    // for SIGKILL of the parent. Assert the honest negative so the gap is
-    // visible rather than hidden.
+    // when the parent is SIGKILLed, so there is no backstop to test here.
+    // Record the gap explicitly rather than asserting a vacuous truth.
+    let backstop_available = cfg!(windows);
     assert!(
-        true,
-        "Unix: no kill-on-death backstop available; documented as a limitation"
+        !backstop_available,
+        "if a Unix kill-on-death backstop is ever added, give it a real test"
     );
 }
