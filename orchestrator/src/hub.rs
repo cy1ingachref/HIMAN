@@ -85,9 +85,13 @@ pub struct Hub {
     /// Device ids revoked durably. Checked before enrollment and before
     /// any message is handled.
     revoked: Mutex<std::collections::HashSet<String>>,
+    /// Single-use pairing codes (RT-22).
+    enrollment_codes: Mutex<crate::enrollment_codes::EnrollmentCodes>,
     orchestrator_key: SigningKey,
     config: HubConfig,
     enrollment: Option<EnrollmentFile>,
+    /// Device keys enrolled through the pairing flow (RT-22).
+    paired_keys: Mutex<HashMap<String, String>>,
     /// Last accepted seq per device session.
     ///
     /// A replayed message has a seq the hub has already seen, so this is what
@@ -169,9 +173,11 @@ impl Hub {
             store: Mutex::new(StateStore::new()),
             audit: Arc::new(Mutex::new(AuditLog::new())),
             revoked: Mutex::new(std::collections::HashSet::new()),
+            enrollment_codes: Mutex::new(crate::enrollment_codes::EnrollmentCodes::new()),
             orchestrator_key,
             config,
             enrollment: None,
+            paired_keys: Mutex::new(HashMap::new()),
             last_seq: Mutex::new(HashMap::new()),
             handoffs: Mutex::new(HashMap::new()),
             owners: Mutex::new(OwnerRegistry::new()),
@@ -232,13 +238,19 @@ impl Hub {
         let claimed = himan_proto::VerifyingKey::from_b64(&info.verifying_key)?;
         hello.verify_with(&claimed)?;
 
-        // Enrollment: the device must be listed and the key must match.
+        // Enrollment: the device must be listed (file or pairing flow) and
+        // the key must match.
         match check_enrollment(self.enrollment.as_ref(), &info.id, &info.verifying_key) {
             EnrollmentDecision::Enrolled => {}
             EnrollmentDecision::UnknownDevice => {
-                self.audit_rejection(&info.id, "device is not enrolled")
-                    .await;
-                return Err(ProtoError::Policy("device is not enrolled".to_owned()));
+                // Pairing flow (RT-22): a code-redeemed key is also valid.
+                let paired = self.paired_keys.lock().await.get(info.id.as_str()).cloned();
+                let paired_ok = paired.as_deref() == Some(info.verifying_key.as_str());
+                if !paired_ok {
+                    self.audit_rejection(&info.id, "device is not enrolled")
+                        .await;
+                    return Err(ProtoError::Policy("device is not enrolled".to_owned()));
+                }
             }
             EnrollmentDecision::KeyMismatch => {
                 self.audit_rejection(&info.id, "Hello key does not match enrolled key")
@@ -1021,6 +1033,89 @@ impl Hub {
         let mut ids: Vec<String> = self.revoked.lock().await.iter().cloned().collect();
         ids.sort();
         ids
+    }
+
+    /// Mint a single-use pairing code for a device (RT-22).
+    pub async fn create_enrollment_code(&self, device: &str, role: &str, ttl_secs: u64) -> String {
+        let mut codes = self.enrollment_codes.lock().await;
+        let plaintext = codes.create(device, role, ttl_secs);
+        self.audit(
+            "enrollment_code_created".to_string(),
+            device.to_string(),
+            format!("role={role} ttl_secs={ttl_secs}"),
+        )
+        .await;
+        plaintext
+    }
+
+    /// Redeem a pairing code and enroll the presented key (RT-22).
+    pub async fn redeem_enrollment_code(
+        &self,
+        plaintext: &str,
+        device: &str,
+        hello_key_b64: &str,
+    ) -> Result<(), ProtoError> {
+        let role = {
+            let mut codes = self.enrollment_codes.lock().await;
+            match codes.redeem(plaintext, device) {
+                Ok(role) => role,
+                Err(e) => {
+                    drop(codes);
+                    let reason = e.to_string();
+                    self.audit(
+                        "enrollment_code_rejected".to_string(),
+                        device.to_string(),
+                        format!("code={}", &plaintext[..plaintext.len().min(8)]),
+                    )
+                    .await;
+                    return Err(ProtoError::Policy(reason));
+                }
+            }
+        };
+        // A revoked device cannot re-enroll, even with a valid code.
+        if self.is_revoked(&himan_proto::DeviceId::new(device)).await {
+            self.audit(
+                "enrollment_code_rejected".to_string(),
+                device.to_string(),
+                "device is revoked".to_string(),
+            )
+            .await;
+            return Err(ProtoError::Policy("device is revoked".to_owned()));
+        }
+        // Register the device key in the live store.
+        self.enroll_device_key(device, hello_key_b64).await;
+        self.audit(
+            "enrollment_code_redeemed".to_string(),
+            device.to_string(),
+            format!("role={role}"),
+        )
+        .await;
+        Ok(())
+    }
+
+    /// Fingerprint of what a device pins (RT-22): the orchestrator signing
+    /// key plus the TLS CA fingerprint, so a QR/deep link can carry it.
+    pub async fn fingerprint(&self) -> String {
+        let key = self.orchestrator_key.seed_b64();
+        let tls = std::env::var("HIMAN_TLS_CA_PEM")
+            .ok()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .map(|pem| {
+                use sha2::{Digest, Sha256};
+                let mut h = Sha256::new();
+                h.update(pem.as_bytes());
+                hex::encode(h.finalize())
+            })
+            .unwrap_or_else(|| "none".to_string());
+        format!("{key}:{tls}")
+    }
+
+    /// Record a device's verifying key from the pairing flow (RT-22).
+    pub async fn enroll_device_key(&self, device: &str, key_b64: &str) {
+        self.paired_keys
+            .lock()
+            .await
+            .insert(device.to_string(), key_b64.to_string());
     }
 
     /// Snapshot of the audit log.

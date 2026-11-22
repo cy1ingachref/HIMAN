@@ -251,7 +251,46 @@ jobs:
           done
           echo "20/20 green"
 
-  # AC-6 handoff metrics: 12 cells (3 log sizes x 4 latencies) x N handoffs.
+  # RT-22 enrollment suite, 20 consecutive runs in parallel mode. The expiry
+  # truncation bug was only visible under parallel scheduling, so it gets a
+  # dedicated flake job like durable_audit.
+  enrollment:
+    name: enrollment (RT-22) x20
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-enrollment-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-enrollment-
+
+      - name: Build binaries
+        run: cargo build --workspace
+
+      - name: enrollment suite, 20 consecutive runs
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 20); do
+            echo "=== run $i/20 ==="
+            cargo test -p himan-orchestrator --test enrollment -- --nocapture
+          done
+          echo "20/20 green"
+
+  # AC-6 handoff metrics
   # Manual dispatch only — hours of CI at N=30. The runs-per-cell input
   # defaults to 10 for exploratory runs; use 30 for a final measurement.
   metrics:

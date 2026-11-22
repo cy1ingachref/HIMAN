@@ -64,6 +64,16 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
+/// The directory the harness should look for binaries in. Honours
+/// CARGO_TARGET_DIR so an isolated build (used when the default target dir is
+/// locked by running children) is picked up.
+fn target_dir() -> PathBuf {
+    match std::env::var("CARGO_TARGET_DIR") {
+        Ok(dir) if !dir.trim().is_empty() => PathBuf::from(dir),
+        _ => workspace_root().join("target"),
+    }
+}
+
 /// Resolve a workspace binary, returning `None` when it has not been built
 /// yet. The tests require `cargo build --workspace` first; a missing binary is
 /// a broken setup, and the caller decides how to report it.
@@ -120,10 +130,9 @@ pub fn binary(name: &str) -> Option<PathBuf> {
     } else {
         name.to_string()
     };
-    let root = workspace_root();
     [
-        root.join(format!("target/debug/{exe}")),
-        root.join(format!("target/release/{exe}")),
+        target_dir().join(format!("debug/{exe}")),
+        target_dir().join(format!("release/{exe}")),
     ]
     .into_iter()
     .find(|candidate| candidate.exists())
@@ -142,7 +151,7 @@ pub fn binary(name: &str) -> Option<PathBuf> {
 /// A separate `CARGO_TARGET_DIR` gives the two builds distinct binaries.
 pub fn build_agent_with_faults() -> PathBuf {
     let root = workspace_root();
-    let fault_target = root.join("target/fault-injection");
+    let fault_target = target_dir().join("fault-injection");
     let status = Command::new("cargo")
         .args([
             "build",
@@ -174,7 +183,7 @@ pub fn build_agent_with_faults() -> PathBuf {
 /// the release binary and the default (strict) build stay clean.
 pub fn build_loopback_agent() -> PathBuf {
     let root = workspace_root();
-    let target = root.join("target/loopback-agent");
+    let target = target_dir().join("loopback-agent");
     let status = Command::new("cargo")
         .args([
             "build",
@@ -231,7 +240,7 @@ pub fn build_default_agent() -> PathBuf {
     } else {
         "himan-agent-pc"
     };
-    root.join("target/debug").join(exe)
+    target_dir().join("debug").join(exe)
 }
 
 /// Whether something is still accepting TCP connections on `port`.
@@ -248,9 +257,35 @@ fn port_is_open(port: u16) -> bool {
 /// The listener is dropped before the caller binds it, so a fast restart can
 /// reuse the port; every test here starts its own orchestrator, so collisions
 /// are not expected.
-pub fn free_port() -> u16 {
+/// A reserved loopback port.
+///
+/// The socket stays bound so no other test can take the port between
+/// selection and the orchestrator's own bind — but it MUST be released
+/// immediately before the child starts, because the orchestrator binds with
+/// SO_EXCLUSIVEADDRUSE on Windows (and a LISTEN socket blocks a bind on Unix
+/// too). Holding it across the spawn is what hung the RT-22 suite.
+pub struct ReservedPort {
+    port: u16,
+    listener: std::net::TcpListener,
+}
+
+impl ReservedPort {
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// Drop the reservation so the child can bind.
+    pub fn release(self) -> u16 {
+        let port = self.port;
+        drop(self.listener);
+        port
+    }
+}
+
+pub fn free_port() -> ReservedPort {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
-    listener.local_addr().expect("local addr").port()
+    let port = listener.local_addr().expect("local addr").port();
+    ReservedPort { port, listener }
 }
 
 /// One named phase, reported with its wall time at the end of the test.
@@ -827,10 +862,10 @@ impl E2ETest {
         insecure_dev: bool,
         extra_envs: Vec<(String, String)>,
     ) -> Self {
-        let port = free_port();
+        let reserved = free_port();
         let _log_dir = tempfile::tempdir().expect("log dir");
         let mut envs: Vec<(String, String)> = vec![
-            ("HIMAN_PORT".to_string(), port.to_string()),
+            ("HIMAN_PORT".to_string(), reserved.port().to_string()),
             (
                 "HIMAN_ORCH_KEY_FILE".to_string(),
                 key_file.display().to_string(),
@@ -849,6 +884,10 @@ impl E2ETest {
             envs.push(("HIMAN_API_TOKEN".to_string(), API_TOKEN.to_string()));
         }
         envs.extend(extra_envs);
+        // Release the reservation immediately before the child binds: the
+        // orchestrator uses SO_EXCLUSIVEADDRUSE on Windows, so a still-open
+        // listener would make its bind fail.
+        let port = reserved.release();
         let mut orch = Child::spawn(
             &binary("himan-orchestrator").expect("build himan-orchestrator first"),
             Vec::<String>::new(),
@@ -1550,6 +1589,23 @@ pub fn http_post_json(port: u16, path: &str, body: Value) -> Value {
 
 /// `POST` a JSON body and return `(status, body)`, so a test can assert a
 /// refusal without panicking.
+/// `POST` without a bearer token, for auth-negative tests.
+pub fn http_post_no_auth(port: u16, path: &str, body: Value) -> (u16, Value) {
+    let url = format!("{}://127.0.0.1:{port}{path}", base_scheme());
+    match agent().post(&url).send_json(body) {
+        Ok(response) => {
+            let status = response.status();
+            let text = response.into_string().unwrap_or_default();
+            (status, serde_json::from_str(&text).unwrap_or(Value::Null))
+        }
+        Err(ureq::Error::Status(code, response)) => {
+            let text = response.into_string().unwrap_or_default();
+            (code, serde_json::from_str(&text).unwrap_or(Value::Null))
+        }
+        Err(e) => (0, serde_json::json!({"error": e.to_string()})),
+    }
+}
+
 pub fn http_post(port: u16, path: &str, body: Value) -> (u16, Value) {
     let url = format!("{}://127.0.0.1:{port}{path}", base_scheme());
     match agent()

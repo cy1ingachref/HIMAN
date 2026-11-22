@@ -248,6 +248,28 @@ impl RateLimiter {
         }
     }
 
+    /// Record a failed pairing attempt from an IP, for routes with no bearer
+    /// token (the redeem endpoint). Uses the same per-IP state as the
+    /// authenticated routes, so a source cannot be throttled on one path and
+    /// unlimited on another.
+    pub fn record_pairing_failure(&self, ip: std::net::IpAddr) {
+        Self::bump(&mut self.by_ip.lock().expect("ip map"), ip);
+    }
+
+    /// Is this IP currently locked out, for tokenless routes too?
+    pub fn is_ip_locked(&self, ip: std::net::IpAddr) -> bool {
+        self.by_ip
+            .lock()
+            .expect("ip map")
+            .get(&ip)
+            .map(|e| {
+                e.locked_until
+                    .map(|u| std::time::Instant::now() < u)
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false)
+    }
+
     fn record_failure_opt(&self, ip: Option<std::net::IpAddr>, token: &str) {
         if let Some(ip) = ip {
             self.record_failure(ip, token);

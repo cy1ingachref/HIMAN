@@ -7,6 +7,7 @@ pub mod api_auth;
 pub mod audit;
 pub mod durable;
 pub mod enrollment;
+pub mod enrollment_codes;
 pub mod eventlog;
 pub mod handoff;
 pub mod handoff_driver;
