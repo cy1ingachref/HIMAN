@@ -217,3 +217,19 @@ Two defects found while proving it, both fixed at the root:
 - the harness reserved a port and held it LISTENing across the child spawn,
   which the orchestrator's SO_EXCLUSIVEADDRUSE bind then refused, hanging the
   suite. The reservation is released immediately before the spawn.
+
+## RT-23 (token rotation)
+
+The admin API token can be rotated without a restart. The new value is
+accepted immediately and the previous value stays valid for a bounded grace
+window (default 60s, overridable with HIMAN_TOKEN_GRACE_SECS for tests).
+Rotation requires the current token, is audited in the hash-chained log, and
+the new hash is persisted so it survives a restart. Tokens are stored and
+compared only as SHA-256 hashes, in constant time.
+
+Root cause found while proving the restart case: the non-TLS (dev) path of
+production_router passed an empty persisted hash, so a restarted server
+re-seeded from HIMAN_API_TOKEN and kept the old token.
+
+Evidence: token_rotation.rs (4) + token_store.rs (5 unit tests); the grace
+guard is mutation-checked.
