@@ -15,6 +15,7 @@ not implemented and tested.
 | Signed envelopes | `proto/envelope.rs` | every hub message verified; agent verifies every post-Welcome message (RT-15) |
 | Plain ws:// refused by default | `agent-pc::connect_ws` | RT-19; release-binary CI guard |
 | Device revocation | `durable.rs::revoked`, Hub::revoke_device | RT-18 (real binaries, restart) |
+| Pairing / enrollment codes | `enrollment_codes.rs`, `/api/v1/enroll/redeem` | RT-22 (single-use, hash-only, audited) |
 | HTTP rate limiting | `api_auth::RateLimiter` | RT-17 (4 tests, bounded memory) |
 | Orchestrator key pinning | `agent-pc` `HIMAN_ORCH_KEY` | RT-04 fake orchestrator refused |
 | Replay protection | hub seq tracking, agent nonce cache, stale-ts | RT-05; agent tests |
@@ -53,8 +54,9 @@ segment. Before any untrusted-network use, in order:
 1. TLS/WSS termination with a verified certificate (blocker).
 2. Always pin the orchestrator key on every agent (`HIMAN_ORCH_KEY`).
 3. High-entropy API token, provisioned out of band, never committed.
-4. Enrollment file provisioned out of band; revocation is implemented
-   (RT-18) and must be exercised operationally.
+4. ~~Enrollment file provisioned out of band.~~ Pairing codes are implemented
+   (RT-22); the static file remains a fallback path, so keep it out of band
+   and exercise revocation (RT-18) operationally.
 5. ~~Rate limiting + lockout on the API.~~ CLOSED (RT-17).
 6. Decide audit-log access scope.
 

@@ -197,3 +197,23 @@ including on the panic path; on Windows each child is assigned to a Job
 Object with KILL_ON_JOB_CLOSE as a backstop for aborts. Evidence:
 `harness_orphans.rs` (3 tests), covering plain drop, drop without stop(),
 and a panicking test. This is test infrastructure, not a product control.
+
+## RT-22 (pairing / enrollment)
+
+- Enrollment no longer requires editing a file out of band: an authenticated
+  admin mints a single-use, short-lived code (default 300s), stored only as a
+  SHA-256 hash and bound to a device name and role. A device redeems it over
+  TLS with its public key; the response carries what the phone pins
+  (orchestrator signing key + TLS CA fingerprint).
+- Failures are audited: reuse, expiry, wrong device name, unknown code, and a
+  revoked device attempting to re-enroll.
+- The tokenless redeem route is rate-limited per source IP, sharing state with
+  the authenticated routes.
+- Evidence: `enrollment.rs` (7 integration tests) and 4 unit tests in
+  `enrollment_codes.rs`. Every guard mutation-checked.
+
+Two defects found while proving it, both fixed at the root:
+- a 1s TTL could live 2s (second-truncation plus a `>` comparison);
+- the harness reserved a port and held it LISTENing across the child spawn,
+  which the orchestrator's SO_EXCLUSIVEADDRUSE bind then refused, hanging the
+  suite. The reservation is released immediately before the spawn.
