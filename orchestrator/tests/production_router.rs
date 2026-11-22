@@ -27,7 +27,7 @@ const API_ROUTES: &[(&str, &str)] = &[
 fn app() -> axum::Router {
     let hub = Hub::new(HubConfig::default());
     let token = ApiToken::from_raw("test-token-for-the-production-router").expect("token");
-    production_router(hub, Some(token))
+    production_router(hub, Some(token), String::new())
 }
 
 async fn response(method: &str, path: &str, auth: Option<&str>) -> (StatusCode, String) {

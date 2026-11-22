@@ -19,7 +19,7 @@ const TOKEN: &str = "the-real-token";
 
 fn app() -> axum::Router {
     let hub = Hub::new(HubConfig::default());
-    production_router(hub, ApiToken::from_raw(TOKEN))
+    production_router(hub, ApiToken::from_raw(TOKEN), String::new())
 }
 
 fn ip(last: u8) -> SocketAddr {

@@ -483,6 +483,11 @@ impl Child {
         log
     }
 
+    /// The stdout/stderr log paths of this child.
+    pub fn log_paths(&self) -> (std::path::PathBuf, std::path::PathBuf) {
+        (self.out.clone(), self.err.clone())
+    }
+
     /// The last `n` lines of the child's stdout and stderr, for failure output.
     pub fn tail(&self, n: usize) -> String {
         let mut text = String::new();
@@ -918,6 +923,16 @@ impl E2ETest {
                 panic!("{message}\n{tail}");
             }
         }
+    }
+
+    /// The orchestrator's recent stderr, for diagnosing a failed assertion.
+    pub fn orch_tail(&self) -> String {
+        self.orch.tail(30)
+    }
+
+    /// The orchestrator child log paths.
+    pub fn orch_log_paths(&self) -> (std::path::PathBuf, std::path::PathBuf) {
+        self.orch.log_paths()
     }
 
     /// The agent binary spawned by this harness.
@@ -1540,7 +1555,8 @@ pub fn base_scheme() -> &'static str {
     }
 }
 
-fn agent() -> ureq::Agent {
+/// The harness HTTP agent, for tests that need a custom bearer token.
+pub fn agent() -> ureq::Agent {
     match test_ca() {
         Some(ca) => tls_agent(&ca),
         None => ureq::AgentBuilder::new().build(),
@@ -1589,6 +1605,48 @@ pub fn http_post_json(port: u16, path: &str, body: Value) -> Value {
 
 /// `POST` a JSON body and return `(status, body)`, so a test can assert a
 /// refusal without panicking.
+/// `GET` with a specific bearer token, for token-rotation tests.
+pub fn http_get_with_token(port: u16, path: &str, token: &str) -> (u16, Value) {
+    let url = format!("{}://127.0.0.1:{port}{path}", base_scheme());
+    match agent()
+        .get(&url)
+        .set("Authorization", &format!("Bearer {token}"))
+        .call()
+    {
+        Ok(response) => {
+            let status = response.status();
+            let text = response.into_string().unwrap_or_default();
+            (status, serde_json::from_str(&text).unwrap_or(Value::Null))
+        }
+        Err(ureq::Error::Status(code, response)) => {
+            let text = response.into_string().unwrap_or_default();
+            (code, serde_json::from_str(&text).unwrap_or(Value::Null))
+        }
+        Err(e) => (0, serde_json::json!({"error": e.to_string()})),
+    }
+}
+
+/// `POST` with a specific bearer token, for token-rotation tests.
+pub fn http_post_with_token(port: u16, path: &str, body: Value, token: &str) -> (u16, Value) {
+    let url = format!("{}://127.0.0.1:{port}{path}", base_scheme());
+    match agent()
+        .post(&url)
+        .set("Authorization", &format!("Bearer {token}"))
+        .send_json(body)
+    {
+        Ok(response) => {
+            let status = response.status();
+            let text = response.into_string().unwrap_or_default();
+            (status, serde_json::from_str(&text).unwrap_or(Value::Null))
+        }
+        Err(ureq::Error::Status(code, response)) => {
+            let text = response.into_string().unwrap_or_default();
+            (code, serde_json::from_str(&text).unwrap_or(Value::Null))
+        }
+        Err(e) => (0, serde_json::json!({"error": e.to_string()})),
+    }
+}
+
 /// `POST` without a bearer token, for auth-negative tests.
 pub fn http_post_no_auth(port: u16, path: &str, body: Value) -> (u16, Value) {
     let url = format!("{}://127.0.0.1:{port}{path}", base_scheme());

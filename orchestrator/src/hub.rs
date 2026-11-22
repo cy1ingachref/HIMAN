@@ -999,6 +999,19 @@ impl Hub {
         revoked.extend(ids);
     }
 
+    /// Persist a meta value through the durable store, when one is attached.
+    pub async fn persist_meta(&self, key: &str, value: &str) {
+        let path = {
+            let durable = self.durable.lock().expect("durable lock");
+            durable.as_ref().map(|s| s.path().to_path_buf())
+        };
+        if let Some(path) = path {
+            if let Ok(store) = crate::durable::DurableStore::open(&path) {
+                let _ = store.meta_set(key, value);
+            }
+        }
+    }
+
     /// Revoke a device: reject future Hellos and drop any live session.
     /// Persisted durably and audited through the hash chain.
     pub async fn revoke_device(&self, device: &DeviceId, reason: &str) {
@@ -1091,6 +1104,19 @@ impl Hub {
         )
         .await;
         Ok(())
+    }
+
+    /// The persisted admin-token hash, empty when durable state is off.
+    pub async fn persisted_token_hash(&self) -> String {
+        let durable = self.durable.lock().expect("durable lock");
+        match durable.as_ref() {
+            Some(store) => store
+                .meta_get("api_token_hash")
+                .ok()
+                .flatten()
+                .unwrap_or_default(),
+            None => String::new(),
+        }
     }
 
     /// Fingerprint of what a device pins (RT-22): the orchestrator signing

@@ -19,6 +19,7 @@ pub mod presence;
 pub mod server;
 pub mod startup;
 pub mod state;
+pub mod token_store;
 
 pub use startup::{enforce_startup, insecure_dev_enabled, log_posture, StartupRequirements};
 

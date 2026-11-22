@@ -77,6 +77,7 @@ pub struct HandoffRecord {
 /// The durable store. One connection, one file.
 pub struct DurableStore {
     conn: Connection,
+    path: std::path::PathBuf,
 }
 
 impl DurableStore {
@@ -89,7 +90,10 @@ impl DurableStore {
             .map_err(|e| e.to_string())?;
         conn.pragma_update(None, "synchronous", "FULL")
             .map_err(|e| e.to_string())?;
-        let store = Self { conn };
+        let store = Self {
+            conn,
+            path: path.to_path_buf(),
+        };
         store.create_schema()?;
         Ok(store)
     }
@@ -97,7 +101,10 @@ impl DurableStore {
     /// In-memory store, for tests that do not need durability.
     pub fn open_in_memory() -> Result<Self, String> {
         let conn = Connection::open_in_memory().map_err(|e| e.to_string())?;
-        let store = Self { conn };
+        let store = Self {
+            conn,
+            path: std::path::PathBuf::from(":memory:"),
+        };
         store.create_schema()?;
         Ok(store)
     }
@@ -499,6 +506,11 @@ impl DurableStore {
             .map_err(|e| e.to_string())?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())
+    }
+
+    /// The state file this store is bound to.
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
     }
 
     /// Read or write a `meta` value.

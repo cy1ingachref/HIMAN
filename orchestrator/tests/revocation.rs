@@ -17,7 +17,7 @@ const TOKEN: &str = "revocation-test-token";
 
 fn app() -> axum::Router {
     let hub = Hub::new(HubConfig::default());
-    production_router(hub, ApiToken::from_raw(TOKEN))
+    production_router(hub, ApiToken::from_raw(TOKEN), String::new())
 }
 
 async fn call(router: &axum::Router, method: &str, path: &str, body: &str) -> (StatusCode, String) {
