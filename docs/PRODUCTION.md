@@ -16,6 +16,7 @@ not implemented and tested.
 | Plain ws:// refused by default | `agent-pc::connect_ws` | RT-19; release-binary CI guard |
 | Device revocation | `durable.rs::revoked`, Hub::revoke_device | RT-18 (real binaries, restart) |
 | Pairing / enrollment codes | `enrollment_codes.rs`, `/api/v1/enroll/redeem` | RT-22 (single-use, hash-only, audited) |
+| API token rotation | `token_store.rs`, `/api/v1/admin/token` | RT-23 (grace window, durable, audited) |
 | HTTP rate limiting | `api_auth::RateLimiter` | RT-17 (4 tests, bounded memory) |
 | Orchestrator key pinning | `agent-pc` `HIMAN_ORCH_KEY` | RT-04 fake orchestrator refused |
 | Replay protection | hub seq tracking, agent nonce cache, stale-ts | RT-05; agent tests |
@@ -32,9 +33,9 @@ not implemented and tested.
    `wss://`, verifying the server certificate against HIMAN_TLS_CA_PEM.
    Plain HTTP/WS is refused unless HIMAN_INSECURE_DEV=1. A reverse proxy is
    now an optional deployment choice, not a requirement.
-2. **Token rotation.** `HIMAN_API_TOKEN` is a static pre-shared secret.
-   No rotation endpoint, no overlap window, no per-client tokens. A
-   leaked token is valid until the operator changes the env and restarts.
+2. ~~**Token rotation.**~~ CLOSED (RT-23): POST /api/v1/admin/token rotates
+   without a restart, with a bounded grace window, audit, and durable
+   persistence. Per-client tokens remain out of scope.
 3. ~~**Device revocation.**~~ CLOSED (RT-18): durable revocation, live
    session drop, restart-persistent deny-list.
 4. ~~**Rate limiting / lockout on the HTTP API.**~~ CLOSED (RT-17): per-IP

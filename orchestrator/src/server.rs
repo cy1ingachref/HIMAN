@@ -40,6 +40,8 @@ pub struct AppState {
     pub ws_semaphore: Arc<tokio::sync::Semaphore>,
     /// Shared rate limiter, also applied to tokenless routes (RT-22).
     pub limiter: std::sync::Arc<crate::api_auth::RateLimiter>,
+    /// The token store, so the rotation endpoint can mutate it (RT-23).
+    pub token_store: std::sync::Arc<tokio::sync::Mutex<crate::token_store::TokenStore>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -106,6 +108,9 @@ pub fn router(hub: Arc<Hub>, _config: HubConfig) -> Router {
             WsLimits::default().max_connections,
         )),
         limiter: std::sync::Arc::new(crate::api_auth::RateLimiter::new()),
+        token_store: std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::token_store::TokenStore::new(""),
+        )),
     };
     Router::new()
         .route("/health", get(health))
@@ -132,8 +137,18 @@ pub fn router_with_auth(
     hub: Arc<Hub>,
     _config: HubConfig,
     token: crate::api_auth::ApiToken,
+    persisted_token_hash: String,
 ) -> Router {
     // One state instance, cloned into both routers, so the semaphore is shared.
+    let shared_store = if persisted_token_hash.trim().is_empty() {
+        // No persisted hash: the caller-provided token store is authoritative
+        // (and tests never touch the process environment).
+        token.0.clone()
+    } else {
+        std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::token_store::TokenStore::from_persisted(&persisted_token_hash, &token.env_raw()),
+        ))
+    };
     let state = AppState {
         hub: hub.clone(),
         ws_limits: WsLimits::default(),
@@ -141,6 +156,7 @@ pub fn router_with_auth(
             WsLimits::default().max_connections,
         )),
         limiter: std::sync::Arc::new(crate::api_auth::RateLimiter::new()),
+        token_store: shared_store.clone(),
     };
 
     let api = Router::new()
@@ -153,11 +169,12 @@ pub fn router_with_auth(
         .route("/tasks/{task_id}/events", get(task_events))
         .route("/devices/revoked", get(revoked_devices))
         .route("/admin/enroll-codes", post(create_enroll_code))
+        .route("/admin/token", post(rotate_token))
         .route("/enroll/redeem", post(redeem_enroll_code))
         .route("/devices/{device_id}/revoke", post(revoke_device))
         .route_layer(axum::middleware::from_fn_with_state(
             (
-                token,
+                shared_store.clone(),
                 std::sync::Arc::new(crate::api_auth::RateLimiter::new()),
             ),
             crate::api_auth::require_token,
@@ -181,6 +198,9 @@ pub fn router_with_limits(hub: Arc<Hub>, limits: WsLimits) -> Router {
         ws_limits: limits.clone(),
         ws_semaphore: Arc::new(tokio::sync::Semaphore::new(limits.max_connections)),
         limiter: std::sync::Arc::new(crate::api_auth::RateLimiter::new()),
+        token_store: std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::token_store::TokenStore::new(""),
+        )),
     };
     Router::new()
         .route("/health", get(health))
@@ -420,6 +440,29 @@ fn urlencode(s: &str) -> String {
         }
     }
     out
+}
+
+/// Rotate the admin API token (RT-23). Requires the current token.
+async fn rotate_token(State(state): State<AppState>) -> impl IntoResponse {
+    // The auth middleware has already accepted the presented token.
+    let mut store = state.token_store.lock().await;
+    let new_token = store.rotate();
+    // Persist the new hash so a restart keeps it.
+    let hash = store.persist_current();
+    drop(store);
+    state.hub.persist_meta("api_token_hash", &hash).await;
+    state
+        .hub
+        .audit(
+            "api_token_rotated".to_string(),
+            "admin".to_string(),
+            "the previous token is valid for the grace window".to_string(),
+        )
+        .await;
+    Json(serde_json::json!({
+        "token": new_token,
+        "grace_secs": crate::token_store::GRACE.as_secs(),
+    }))
 }
 
 /// List revoked device ids.
@@ -759,11 +802,17 @@ fn build_welcome(hub: &Hub, device: &DeviceId, nonce: &str) -> Result<WireMessag
 /// Extracted so a test can build THE production router rather than a copy:
 /// the route table and the auth layer under test are the same code the
 /// binary runs.
-pub fn production_router(hub: Arc<Hub>, token: Option<crate::api_auth::ApiToken>) -> Router {
+pub fn production_router(
+    hub: Arc<Hub>,
+    token: Option<crate::api_auth::ApiToken>,
+    persisted_token_hash: String,
+) -> Router {
     match token {
         Some(t) => {
             tracing::info!("API authentication enabled");
-            router_with_auth(hub, HubConfig::default(), t)
+            // The store is seeded from the persisted hash when durable state
+            // exists, so a rotated token survives a restart.
+            router_with_auth(hub, HubConfig::default(), t, persisted_token_hash)
         }
         None => {
             tracing::warn!(
@@ -777,6 +826,9 @@ pub fn production_router(hub: Arc<Hub>, token: Option<crate::api_auth::ApiToken>
 
 pub async fn serve(hub: Arc<Hub>, port: u16) -> Result<(), std::io::Error> {
     let token = crate::api_auth::ApiToken::from_env();
+    // The persisted hash wins over the env value, so a rotated token survives
+    // a restart (RT-23). When nothing was persisted the env value seeds it.
+    let persisted = hub.persisted_token_hash().await;
     let listener = bind_reuse_addr(port).await?;
 
     // TLS is the production path: HIMAN_TLS_CERT / HIMAN_TLS_KEY serve
@@ -791,8 +843,8 @@ pub async fn serve(hub: Arc<Hub>, port: u16) -> Result<(), std::io::Error> {
         })?);
         let acceptor = tokio_rustls::TlsAcceptor::from(config);
         let tls_listener = spawn_tls_accept(listener, acceptor);
-        let tls_service =
-            production_router(hub, token).into_make_service_with_connect_info::<TlsConnectInfo>();
+        let tls_service = production_router(hub, token, persisted)
+            .into_make_service_with_connect_info::<TlsConnectInfo>();
         info!(port, "orchestrator listening with native TLS (https/wss)");
         axum::serve(tls_listener, tls_service).await
     } else if std::env::var("HIMAN_INSECURE_DEV").as_deref() == Ok("1") {
@@ -800,7 +852,7 @@ pub async fn serve(hub: Arc<Hub>, port: u16) -> Result<(), std::io::Error> {
             "HIMAN_INSECURE_DEV=1: serving PLAIN HTTP/WS on 127.0.0.1. \
              No confidentiality; agents also need the insecure-ws-dev build."
         );
-        let service = production_router(hub, token)
+        let service = production_router(hub, token, persisted)
             .into_make_service_with_connect_info::<std::net::SocketAddr>();
         info!(port, "orchestrator listening on 127.0.0.1 (no TLS)");
         axum::serve(listener, service).await
@@ -1208,7 +1260,7 @@ mod tests {
         hub_with_device(&hub, "pc-1").await;
         hub_with_device(&hub, "phone-1").await;
         let token = crate::api_auth::ApiToken::from_raw("test-token").expect("non-empty token");
-        let app = router_with_auth(hub.clone(), HubConfig::default(), token);
+        let app = router_with_auth(hub.clone(), HubConfig::default(), token, String::new());
 
         let unauth = app
             .clone()

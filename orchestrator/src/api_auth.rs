@@ -13,8 +13,8 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 
 /// The shared API token.
-#[derive(Debug, Clone)]
-pub struct ApiToken(pub String);
+#[derive(Clone)]
+pub struct ApiToken(pub std::sync::Arc<tokio::sync::Mutex<crate::token_store::TokenStore>>);
 
 impl ApiToken {
     /// Build from an explicit value, treating empty as absent.
@@ -24,7 +24,9 @@ impl ApiToken {
         if value.trim().is_empty() {
             None
         } else {
-            Some(Self(value.to_owned()))
+            Some(Self(std::sync::Arc::new(tokio::sync::Mutex::new(
+                crate::token_store::TokenStore::new(value),
+            ))))
         }
     }
 
@@ -38,6 +40,15 @@ impl ApiToken {
             .ok()
             .as_deref()
             .and_then(Self::from_raw)
+    }
+
+    /// The original raw value, used only to seed the store when nothing was
+    /// persisted. Never compared directly.
+    pub fn env_raw(&self) -> String {
+        // Seed from the built store's current hash is not possible; use the
+        // process env (the canonical source at startup). Tests that call
+        // from_raw directly must pass a persisted hash instead.
+        std::env::var("HIMAN_API_TOKEN").unwrap_or_default()
     }
 
     /// Whether the presented headers carry this token.
@@ -54,7 +65,7 @@ impl ApiToken {
         let Some(presented) = value.strip_prefix("Bearer ") else {
             return false;
         };
-        tokens_equal(presented, &self.0)
+        self.0.blocking_lock().matches(presented)
     }
 }
 
@@ -81,7 +92,10 @@ pub fn tokens_equal(a: &str, b: &str) -> bool {
 /// (RT-17): the constant-time compare stops timing attacks, not online
 /// guessing.
 pub async fn require_token(
-    State((token, limiter)): State<(ApiToken, std::sync::Arc<RateLimiter>)>,
+    State((store, limiter)): State<(
+        std::sync::Arc<tokio::sync::Mutex<crate::token_store::TokenStore>>,
+        std::sync::Arc<RateLimiter>,
+    )>,
     headers: HeaderMap,
     request: axum::extract::Request,
     next: axum::middleware::Next,
@@ -114,7 +128,7 @@ pub async fn require_token(
             .into_response();
     }
 
-    if !token.matches(&headers) {
+    if !store.lock().await.matches(presented) {
         tracing::warn!(path = %request.uri().path(), "rejected API request without a valid token");
         limiter.record_failure_opt(ip, presented);
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
@@ -306,7 +320,7 @@ mod tests {
 
     #[test]
     fn matches_a_correct_token() {
-        let token = ApiToken("secret".into());
+        let token = ApiToken::from_raw("secret").unwrap();
         let mut headers = HeaderMap::new();
         headers.insert(header::AUTHORIZATION, "Bearer secret".parse().unwrap());
         assert!(token.matches(&headers));
@@ -314,13 +328,13 @@ mod tests {
 
     #[test]
     fn rejects_a_missing_header() {
-        let token = ApiToken("secret".into());
+        let token = ApiToken::from_raw("secret").unwrap();
         assert!(!token.matches(&HeaderMap::new()));
     }
 
     #[test]
     fn rejects_a_wrong_token() {
-        let token = ApiToken("secret".into());
+        let token = ApiToken::from_raw("secret").unwrap();
         let mut headers = HeaderMap::new();
         headers.insert(header::AUTHORIZATION, "Bearer wrong".parse().unwrap());
         assert!(!token.matches(&headers));
@@ -328,7 +342,7 @@ mod tests {
 
     #[test]
     fn rejects_a_missing_bearer_prefix() {
-        let token = ApiToken("secret".into());
+        let token = ApiToken::from_raw("secret").unwrap();
         let mut headers = HeaderMap::new();
         headers.insert(header::AUTHORIZATION, "secret".parse().unwrap());
         assert!(!token.matches(&headers));
@@ -336,7 +350,7 @@ mod tests {
 
     #[test]
     fn rejects_an_empty_token() {
-        let token = ApiToken("secret".into());
+        let token = ApiToken::from_raw("secret").unwrap();
         let mut headers = HeaderMap::new();
         headers.insert(header::AUTHORIZATION, "Bearer ".parse().unwrap());
         assert!(!token.matches(&headers));

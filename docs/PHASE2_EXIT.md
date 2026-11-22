@@ -41,5 +41,6 @@ item is checked only when the evidence exists and was actually run.
   the remaining blockers; see the RT-20/RT-21 rows in REDTEAM.md.
 - Pairing codes (RT-22) close the out-of-band enrollment gap; the static
   file remains a fallback.
-- Still not production-ready: static API token (no rotation), no audit-log
-  access scoping.
+- Token rotation is implemented (RT-23); per-client tokens remain out of
+  scope.
+- Still not production-ready: no audit-log access scoping.

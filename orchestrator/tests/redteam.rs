@@ -66,7 +66,8 @@ async fn spawn_hub_with_limits_and_token(
         Some(t) => router_with_auth(
             hub.clone(),
             HubConfig::default(),
-            himan_orchestrator::ApiToken(t.to_string()),
+            himan_orchestrator::api_auth::ApiToken::from_raw(t).unwrap(),
+            String::new(),
         ),
         None => router_with_limits(hub.clone(), limits),
     };
