@@ -44,3 +44,10 @@ item is checked only when the evidence exists and was actually run.
 - Token rotation is implemented (RT-23); per-client tokens remain out of
   scope.
 - Still not production-ready: no audit-log access scoping.
+
+## Phone phase (proposal only)
+
+The phone runtime is designed but not implemented: see
+`docs/PHONE_PHASE_PROPOSAL.md` for secure key storage, WSS pinning using the
+RT-22 enrollment fingerprint, background execution limits, flaky-network
+handoff, gates and a test plan. ROADMAP.md and DECISIONS.md are unchanged.
